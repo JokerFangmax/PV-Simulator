@@ -122,8 +122,16 @@ class SimulationPipeline:
         guidance_scale: float = 1.0,     # reserved for future CFG
         generator: Optional[torch.Generator] = None,
         show_progress: bool = True,
+        point_mask: Optional[torch.Tensor] = None,    # (B, N) bool — valid points (padded batch)
+        valid_seq_mask: Optional[torch.Tensor] = None,  # (B, T*N) bool — valid tokens (padded batch)
     ):
         """Run simulation denoising from noise.
+
+        Args:
+            point_mask: Optional (B, N) bool tensor marking valid (non-padded) points.
+                Pass when using padded batch mode to zero out padding in conditions.
+            valid_seq_mask: Optional (B, T*N) bool tensor marking valid tokens.
+                Pass when using padded batch mode to mask padding in self-attention.
 
         Returns:
             dict with:
@@ -145,6 +153,10 @@ class SimulationPipeline:
         c_force_raw = c_force_raw.to(device, dtype=dtype)
         c_init = c_init.to(device, dtype=dtype)
         point_obj_idx = point_obj_idx.to(device)
+        if point_mask is not None:
+            point_mask = point_mask.to(device)
+        if valid_seq_mask is not None:
+            valid_seq_mask = valid_seq_mask.to(device)
 
         # --- Encode conditions (constant across timesteps) ---
         c_sim = self.sim_cond_embedder(
@@ -157,6 +169,7 @@ class SimulationPipeline:
             c_init=c_init,
             point_obj_idx=point_obj_idx,
             T=T,
+            point_mask=point_mask,
         )  # (B, T, N, d_cond)
 
         # --- Start from pure noise in latent space ---
@@ -175,13 +188,14 @@ class SimulationPipeline:
 
             pred = self.sim_transformer(
                 latents, c_sim, t_batch, dtype=dtype,
-            )  # (1, T, N, d_state)
+                valid_seq_mask=valid_seq_mask,
+            )  # (B, T, N, d_state)
 
             # Scheduler step
             latents = self.scheduler.step(pred, t, latents).prev_sample
 
         # --- Decode latents back to raw state space ---
-        x_s = self.x_s_decoder(latents, T_raw)  # (1, T_raw, N, 6)
+        x_s = self.x_s_decoder(latents, T_raw)  # (B, T_raw, N, 6)
 
         return {
             'x_s': x_s,

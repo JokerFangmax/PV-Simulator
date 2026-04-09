@@ -4,6 +4,8 @@
 #
 # Per-object properties are expanded to per-point via point_obj_idx (N,) mapping.
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
@@ -85,6 +87,7 @@ class SimConditionEmbedder(nn.Module):
         c_init: torch.Tensor,          # (B, n_objects, 7) float — initial state + mask
         point_obj_idx: torch.Tensor,   # (B, N) int — maps each point to its object
         T: int,                        # Number of latent time frames
+        point_mask: Optional[torch.Tensor] = None,  # (B, N) bool — valid points (padded batch mode)
     ) -> torch.Tensor:
         """Encode all conditions and return (B, T, N, d_cond)."""
         B = c_floor.shape[0]
@@ -138,5 +141,10 @@ class SimConditionEmbedder(nn.Module):
             [e_floor, e_id, e_mat, e_mass, e_static, e_force, e_init],
             dim=-1,
         )  # (B, T, N, d_cond)
+
+        # Zero out embeddings at padded point positions (padded batch mode)
+        if point_mask is not None:
+            # point_mask: (B, N) → (B, 1, N, 1); cast to c_sim dtype to avoid fp32 promotion
+            c_sim = c_sim * point_mask.to(dtype=c_sim.dtype).unsqueeze(1).unsqueeze(-1)
 
         return c_sim

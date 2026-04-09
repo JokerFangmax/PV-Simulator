@@ -62,18 +62,29 @@ There are **no automated tests** in this repository.
 | `videox_fun/models/sim_transformer.py` | `SimTransformer`: 10-block DiT for physics simulation (d=512, 8 heads) |
 | `videox_fun/models/joint_attention.py` | `JointAttention`: gated cross-modal attention between video and sim branches |
 | `videox_fun/models/mot_wrapper.py` | `MoTWrapper`: orchestrates paired forward pass of both branches |
-| `videox_fun/data/dataset_simulation.py` | `SimulationDataset`: loads physics trajectory data (variable shapes, bs=1) |
+| `videox_fun/data/dataset_simulation.py` | `SimulationDataset`/`MoviSimulationDataset`: loads physics trajectory data; `sim_collate_fn` (bs=1) and `sim_collate_fn_padded` (bs>1 with zero-padding) |
 | `videox_fun/pipeline/pipeline_simulation.py` | Stage 1 inference: standalone sim branch denoising |
 | `videox_fun/pipeline/pipeline_mot.py` | Stage 2 inference: joint video + sim denoising |
 | `scripts/pv_simulator/train_stage1.py` | Stage 1 training script (SimDiT only) |
 | `scripts/pv_simulator/train_stage2.py` | Stage 2 training script (joint MoT + LoRA) |
+| `scripts/pv_simulator/infer_stage1.py` | Stage 1 inference script |
+| `scripts/pv_simulator/visualize.py` | Visualize point cloud motion |
 
 ### Key Conventions
 
-- **bs=1**: T_raw, n_objects, and N_i (points per object) all vary per sample. Always batch_size=1. Use multi-GPU DDP + gradient accumulation for effective batch size.
-- **max_objects=16**: Maximum number of objects per scene.
+- **Default bs=1**: T_raw, n_objects, and N_i (points per object) all vary per sample. Default mode uses `sim_collate_fn` which requires identical shapes across the batch → always bs=1 in practice. Use multi-GPU DDP + gradient accumulation for effective batch size.
+- **Padded batch mode** (`--padded_batch`): Opt-in mode that enables bs>1 by zero-padding samples to fixed caps:
+  - `max_T_raw` (default 21): raw frames clipped/padded to this (must be 4k+1)
+  - `max_objects` (default 5): objects clipped/padded to this count
+  - `max_points_per_object` (default 200): surface points per object, clipped/padded
+  - `max_N = max_objects × max_points_per_object`: fixed total points per sample
+  - Each object occupies a contiguous block of `max_points_per_object` slots in the flattened point array; `point_obj_idx[i*MPO:(i+1)*MPO] = i` regardless of padding
+  - `point_mask (B, N)` bool: True for non-padded points; zeroes condition embeddings and masks attention
+  - `valid_seq_mask (B, T*N)` bool: True for valid (t, n) pairs; used as additive attention key bias (padded tokens → −∞)
+  - Loss is averaged only over valid positions (sum / n_valid instead of .mean())
+- **max_objects=5**: Default cap on objects per scene (used in both modes).
 - **4x causal temporal compression**: Encoder compresses T_raw=4(T-1)+1 raw frames to T latent frames via 2 stride-2 causal conv layers (kernel=3). Matches video VAE's temporal compression ratio.
-- **Variable N**: Objects have different numbers of surface points N_i. All points are concatenated: N = ΣN_i. Per-object properties are expanded to per-point via `point_obj_idx`.
+- **Variable N**: Objects have different numbers of surface points N_i. All points are concatenated: N = ΣN_i. Per-object properties are expanded to per-point via `point_obj_idx` (gather-based, works in both modes).
 - **Flow matching diffusion**: Noise added in latent point-state space. Encoder/decoder wrap the compressed DiT. Target = noise - x_s (same as video branch).
 
 ### Block Pairing (Video ↔ Sim)

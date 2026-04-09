@@ -5,6 +5,8 @@
 # Input: encoded point states (B, T, N, d_state) + conditions (B, T, N, d_cond)
 # Output: predicted noise in latent space (B, T, N, d_state)
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.cuda.amp as amp
@@ -43,11 +45,12 @@ class SimSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, dtype=torch.bfloat16):
+    def forward(self, x, dtype=torch.bfloat16, attn_mask: Optional[torch.Tensor] = None):
         """
         Args:
             x: (B, L, C) where L = T*N.
             dtype: Dtype for the attention kernel (FlashAttention needs bf16/fp16).
+            attn_mask: Optional additive attention bias (B, 1, 1, L) or (B, 1, L, L).
         Returns:
             (B, L, C)
         """
@@ -62,7 +65,7 @@ class SimSelfAttention(nn.Module):
         v = self.v(x.to(w_dtype)).view(b, s, n, d)
 
         # No RoPE for simulation tokens
-        x = attention(q.to(dtype), k.to(dtype), v=v.to(dtype))
+        x = attention(q.to(dtype), k.to(dtype), v=v.to(dtype), attn_mask=attn_mask)
         x = x.to(w_dtype).flatten(2)
         x = self.o(x)
         return x
@@ -110,11 +113,12 @@ class SimAttentionBlock(nn.Module):
         # 6-vector timestep modulation (matching WanAttentionBlock)
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim ** 0.5)
 
-    def forward(self, x, e, dtype=torch.bfloat16):
+    def forward(self, x, e, dtype=torch.bfloat16, attn_mask: Optional[torch.Tensor] = None):
         """
         Args:
             x: (B, L, C) where L = T*N.
             e: (B, 6, C) timestep modulation embedding.
+            attn_mask: Optional additive attention bias forwarded to self-attention.
         Returns:
             (B, L, C)
         """
@@ -123,7 +127,7 @@ class SimAttentionBlock(nn.Module):
         # Self-attention with modulation
         h = self.norm1(x) * (1 + e[1]) + e[0]
         h = h.to(dtype)
-        y = self.self_attn(h, dtype)
+        y = self.self_attn(h, dtype, attn_mask=attn_mask)
         x = x + y * e[2]
 
         # FFN with modulation
@@ -205,13 +209,17 @@ class SimTransformer(nn.Module):
         nn.init.zeros_(self.head_proj.weight)
         nn.init.zeros_(self.head_proj.bias)
 
-    def forward(self, x_enc, c_sim, t, dtype=torch.bfloat16):
+    def forward(self, x_enc, c_sim, t, dtype=torch.bfloat16,
+                valid_seq_mask: Optional[torch.Tensor] = None):
         """
         Args:
             x_enc: (B, T, N, d_state) — encoded noisy point states.
             c_sim: (B, T, N, d_cond) — condition embeddings.
             t: (B,) — diffusion timestep.
             dtype: Compute dtype for attention.
+            valid_seq_mask: Optional (B, T*N) bool — True for valid (non-padded) tokens.
+                If provided, padded tokens are masked out in self-attention via an
+                additive key bias of -inf. Used in padded batch mode.
         Returns:
             (B, T, N, d_state) — predicted value in latent space.
         """
@@ -231,9 +239,19 @@ class SimTransformer(nn.Module):
             # e0: (B, 6, d_sim)
         e0 = e0.to(dtype)   # cast back so modulation arithmetic stays in model dtype
 
+        # Build additive attention bias to mask padding tokens (padded batch mode)
+        attn_mask = None
+        if valid_seq_mask is not None:
+            L = T * N
+            # key_bias: (B, 1, 1, L) — 0 for valid tokens, -inf for padding
+            key_bias = torch.zeros(B, 1, 1, L, device=x.device, dtype=dtype)
+            key_bias.masked_fill_(~valid_seq_mask.unsqueeze(1).unsqueeze(2),
+                                  torch.finfo(dtype).min)
+            attn_mask = key_bias
+
         # Transformer blocks
         for block in self.blocks:
-            x = block(x, e0, dtype)
+            x = block(x, e0, dtype, attn_mask=attn_mask)
 
         # Output head
         x = x.view(B, T, N, self.d_sim)

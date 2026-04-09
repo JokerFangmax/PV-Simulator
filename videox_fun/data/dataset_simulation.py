@@ -286,3 +286,148 @@ def sim_collate_fn(batch):
             # int/scalar metadata — keep as list; caller can index [0] if needed
             result[key] = vals
     return result
+
+
+def sim_collate_fn_padded(batch, max_T_raw: int, max_objects: int, max_points_per_object: int):
+    """Padded collate function enabling batch_size > 1 with variable-length samples.
+
+    Pads (or truncates) all samples to fixed shapes:
+      - T_raw  → max_T_raw  (largest valid 4k+1 ≤ max_T_raw, then zero-pad to max_T_raw)
+      - n_obj  → max_objects (truncate or pad with zeros)
+      - N_i    → max_points_per_object per object (truncate or zero-pad)
+      → max_N  = max_objects × max_points_per_object (total points)
+
+    Each object occupies a fixed block of max_points_per_object slots so that the
+    gather-based SimConditionEmbedder continues to work without modification.
+
+    Returns additional keys:
+      point_mask  (B, max_N)       — True for valid (non-padded) points
+      obj_mask    (B, max_objects) — True for valid (non-padded) objects
+      T_raw       (B,)             — actual T_raw per sample (int tensor)
+      N           (B,)             — actual total valid points per sample (int tensor)
+      n_objects   (B,)             — actual object count per sample (int tensor)
+
+    Args:
+        batch: List of sample dicts from SimulationDataset or MoviSimulationDataset.
+        max_T_raw: Maximum raw frame count (must satisfy 4k+1 for some k ≥ 1).
+        max_objects: Maximum number of objects per scene.
+        max_points_per_object: Maximum surface points per object.
+    """
+    max_N = max_objects * max_points_per_object
+    r = 4  # temporal compression ratio
+
+    processed = []
+    for sample in batch:
+        x_s_raw = sample['x_s_raw']           # (T_raw, N, 6)
+        c_force_raw = sample['c_force_raw']    # (T_raw, N, 6)
+        point_obj_idx_orig = sample['point_obj_idx']  # (N,) int
+
+        T_orig = x_s_raw.shape[0]
+        N_orig = x_s_raw.shape[1]
+        n_obj_orig = sample['n_objects']
+
+        # --- Clip T_raw to largest valid 4k+1 ≤ max_T_raw ---
+        k_max = (max_T_raw - 1) // r
+        k_cur = (T_orig - 1) // r
+        k_clip = min(k_max, k_cur)
+        T_clip = k_clip * r + 1
+
+        x_s_raw = x_s_raw[:T_clip]             # (T_clip, N_orig, 6)
+        c_force_raw = c_force_raw[:T_clip]
+
+        # --- Clip n_objects ---
+        n_obj_clip = min(n_obj_orig, max_objects)
+
+        # --- Per-object: gather, truncate, pad points to max_points_per_object ---
+        # Outputs: new_x_s_raw (T_clip, max_N, 6), new_c_force (T_clip, max_N, 6)
+        # new_point_obj_idx (max_N,), point_mask (max_N,)
+        new_x_s_raw = torch.zeros(T_clip, max_N, 6, dtype=x_s_raw.dtype)
+        new_c_force = torch.zeros(T_clip, max_N, 6, dtype=c_force_raw.dtype)
+        new_point_obj_idx = torch.zeros(max_N, dtype=torch.long)
+        point_mask = torch.zeros(max_N, dtype=torch.bool)
+
+        total_valid_N = 0
+        for obj_i in range(n_obj_clip):
+            slot_start = obj_i * max_points_per_object
+            slot_end = slot_start + max_points_per_object
+
+            # Find indices of this object's points in the original flat array
+            obj_pt_indices = (point_obj_idx_orig == obj_i).nonzero(as_tuple=True)[0]
+            n_pts = obj_pt_indices.shape[0]
+            n_keep = min(n_pts, max_points_per_object)
+
+            if n_keep > 0:
+                keep_idx = obj_pt_indices[:n_keep]
+                new_x_s_raw[:, slot_start:slot_start + n_keep, :] = x_s_raw[:, keep_idx, :]
+                new_c_force[:, slot_start:slot_start + n_keep, :] = c_force_raw[:, keep_idx, :]
+                point_mask[slot_start:slot_start + n_keep] = True
+                total_valid_N += n_keep
+
+            # point_obj_idx for the entire block (including padding) points to obj_i
+            new_point_obj_idx[slot_start:slot_end] = obj_i
+
+        # --- Pad T_raw dim to max_T_raw ---
+        if T_clip < max_T_raw:
+            pad_T = max_T_raw - T_clip
+            x_pad = torch.zeros(pad_T, max_N, 6, dtype=x_s_raw.dtype)
+            new_x_s_raw = torch.cat([new_x_s_raw, x_pad], dim=0)
+            new_c_force = torch.cat([new_c_force, x_pad], dim=0)
+
+        # --- Clip / pad per-object tensors ---
+        c_id_orig = sample['c_id']       # (n_obj_orig,)
+        c_mat_orig = sample['c_mat']     # (n_obj_orig, 2)
+        c_mass_orig = sample['c_mass']   # (n_obj_orig,)
+        c_static_orig = sample['c_static']  # (n_obj_orig,)
+        c_init_orig = sample['c_init']   # (n_obj_orig, 7)
+
+        c_id = torch.zeros(max_objects, dtype=c_id_orig.dtype)
+        c_mat = torch.zeros(max_objects, 2, dtype=c_mat_orig.dtype)
+        c_mass = torch.zeros(max_objects, dtype=c_mass_orig.dtype)
+        c_static = torch.zeros(max_objects, dtype=c_static_orig.dtype)
+        c_init = torch.zeros(max_objects, 7, dtype=c_init_orig.dtype)
+
+        c_id[:n_obj_clip] = c_id_orig[:n_obj_clip]
+        c_mat[:n_obj_clip] = c_mat_orig[:n_obj_clip]
+        c_mass[:n_obj_clip] = c_mass_orig[:n_obj_clip]
+        c_static[:n_obj_clip] = c_static_orig[:n_obj_clip]
+        c_init[:n_obj_clip] = c_init_orig[:n_obj_clip]
+
+        obj_mask = torch.zeros(max_objects, dtype=torch.bool)
+        obj_mask[:n_obj_clip] = True
+
+        p = {
+            'x_s_raw': new_x_s_raw,          # (max_T_raw, max_N, 6)
+            'c_force_raw': new_c_force,        # (max_T_raw, max_N, 6)
+            'c_floor': sample['c_floor'],      # scalar
+            'c_id': c_id,                       # (max_objects,)
+            'c_mat': c_mat,                     # (max_objects, 2)
+            'c_mass': c_mass,                   # (max_objects,)
+            'c_static': c_static,               # (max_objects,)
+            'c_init': c_init,                   # (max_objects, 7)
+            'point_obj_idx': new_point_obj_idx, # (max_N,)
+            'point_mask': point_mask,           # (max_N,) bool
+            'obj_mask': obj_mask,               # (max_objects,) bool
+            'T_raw': T_clip,
+            'N': total_valid_N,
+            'n_objects': n_obj_clip,
+        }
+        if 'text' in sample:
+            p['text'] = sample['text']
+        processed.append(p)
+
+    # --- Stack all samples ---
+    result = {}
+    keys_tensor = ['x_s_raw', 'c_force_raw', 'c_floor', 'c_id', 'c_mat', 'c_mass',
+                   'c_static', 'c_init', 'point_obj_idx', 'point_mask', 'obj_mask']
+    for key in keys_tensor:
+        result[key] = torch.stack([p[key] for p in processed], dim=0)
+
+    # Scalar metadata as int tensors (not lists) for convenient use in training
+    result['T_raw'] = torch.tensor([p['T_raw'] for p in processed], dtype=torch.long)
+    result['N'] = torch.tensor([p['N'] for p in processed], dtype=torch.long)
+    result['n_objects'] = torch.tensor([p['n_objects'] for p in processed], dtype=torch.long)
+
+    if 'text' in processed[0]:
+        result['text'] = [p['text'] for p in processed]
+
+    return result

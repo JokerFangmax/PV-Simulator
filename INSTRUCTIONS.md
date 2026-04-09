@@ -124,6 +124,37 @@ accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
 | `--d_state` | 256 | Encoded point state dimension |
 | `--d_sim` | 512 | SimTransformer hidden dimension |
 | `--sim_num_layers` | 10 | Number of transformer blocks |
+| `--padded_batch` | off | Enable padded batch mode (allows `--train_batch_size > 1`) |
+| `--max_T_raw` | 21 | Max raw frames in padded mode (must be 4k+1) |
+| `--max_points_per_object` | 200 | Max surface points per object in padded mode |
+
+### Padded Batch Mode
+
+By default, each sample has variable `T_raw`, `n_objects`, and `N` (total points), so the dataloader requires `--train_batch_size 1`. Enable `--padded_batch` to allow larger batches by zero-padding samples to fixed shape caps.
+
+```bash
+accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
+    --dataset_type movi \
+    --data_root datasets/movi_ab_10k \
+    --output_dir outputs/stage1_padded \
+    --padded_batch \
+    --max_objects 5 \
+    --max_T_raw 21 \
+    --max_points_per_object 200 \
+    --train_batch_size 8 \
+    --mixed_precision bf16
+```
+
+**How it works:**
+
+- `max_N = max_objects × max_points_per_object` (e.g. 5 × 200 = 1000) is the fixed total point count per sample.
+- Each sample's objects are packed into contiguous blocks of `max_points_per_object` slots. Points exceeding the cap are truncated; objects fewer than the cap get zero-padded blocks.
+- `T_raw` is clipped to the largest valid `4k+1 ≤ max_T_raw`, then zero-padded to `max_T_raw`.
+- Two boolean masks are computed per batch:
+  - `point_mask (B, N)` — True for non-padded points (used to zero condition embeddings)
+  - `valid_seq_mask (B, T*N)` — True for valid (time, point) pairs (used as attention key bias)
+- Loss is averaged only over valid positions.
+- Inference (`infer_stage1.py`) always uses B=1 without padding — no changes needed.
 
 ### Checkpoint layout
 

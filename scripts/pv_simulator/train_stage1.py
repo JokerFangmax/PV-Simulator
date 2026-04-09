@@ -56,9 +56,12 @@ for project_root in project_roots:
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
+from functools import partial
+
 from videox_fun.data.dataset_simulation import (MoviSimulationDataset,
                                                   SimulationDataset,
-                                                  sim_collate_fn)
+                                                  sim_collate_fn,
+                                                  sim_collate_fn_padded)
 from videox_fun.models.sim_causal_encoder import CausalTemporalDecoder, CausalTemporalEncoder
 from videox_fun.models.sim_condition import SimConditionEmbedder
 from videox_fun.models.sim_transformer import SimTransformer
@@ -87,13 +90,23 @@ def parse_args():
     parser.add_argument("--sim_num_heads", type=int, default=8, help="SimTransformer attention heads.")
     parser.add_argument("--sim_num_layers", type=int, default=10, help="SimTransformer blocks.")
     parser.add_argument("--state_enc_mid", type=int, default=128, help="Causal encoder intermediate channels.")
-    parser.add_argument("--max_objects", type=int, default=16, help="Maximum number of objects per scene.")
+    parser.add_argument("--max_objects", type=int, default=5, help="Maximum number of objects per scene.")
 
     # Training
     parser.add_argument("--output_dir", type=str, default="outputs/stage1", help="Output directory.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train_batch_size", type=int, default=1)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+
+    # Padded batch mode (enables batch_size > 1 with variable-length samples)
+    parser.add_argument("--padded_batch", action="store_true",
+                        help="Enable padded batch mode: zero-pad samples to fixed shapes "
+                             "so batch_size > 1 can be used with variable-length data.")
+    parser.add_argument("--max_T_raw", type=int, default=21,
+                        help="Max raw frame count in padded batch mode (must be 4k+1). Default: 21.")
+    parser.add_argument("--max_points_per_object", type=int, default=200,
+                        help="Max surface points per object in padded batch mode. "
+                             "max_N = max_objects * max_points_per_object. Default: 200.")
     parser.add_argument("--max_train_steps", type=int, default=100000)
     parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
@@ -236,12 +249,27 @@ def main():
             load_video=False,
         )
 
+    if args.padded_batch:
+        collate_fn = partial(
+            sim_collate_fn_padded,
+            max_T_raw=args.max_T_raw,
+            max_objects=args.max_objects,
+            max_points_per_object=args.max_points_per_object,
+        )
+        logger.info(
+            f"Padded batch mode enabled: max_T_raw={args.max_T_raw}, "
+            f"max_objects={args.max_objects}, max_points_per_object={args.max_points_per_object}, "
+            f"max_N={args.max_objects * args.max_points_per_object}"
+        )
+    else:
+        collate_fn = sim_collate_fn
+
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
         shuffle=True,
         num_workers=args.dataloader_num_workers,
-        collate_fn=sim_collate_fn,
+        collate_fn=collate_fn,
         pin_memory=True,
     )
 
@@ -295,7 +323,7 @@ def main():
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(sim_transformer):
                 # --- Unpack batch ---
-                # Tensors have shape (B, ...) after sim_collate_fn stacking
+                # Tensors have shape (B, ...) after collation
                 x_s_raw = batch['x_s_raw'].to(accelerator.device, dtype=weight_dtype)    # (B, T_raw, N, 6)
                 c_force_raw = batch['c_force_raw'].to(accelerator.device, dtype=weight_dtype)  # (B, T_raw, N, 6)
                 c_floor = batch['c_floor'].to(accelerator.device)                          # (B,)
@@ -305,11 +333,31 @@ def main():
                 c_static = batch['c_static'].to(accelerator.device)                        # (B, n_objects,)
                 c_init = batch['c_init'].to(accelerator.device)                            # (B, n_objects, 7)
                 point_obj_idx = batch['point_obj_idx'].to(accelerator.device)              # (B, N)
-                T_raw = batch['T_raw'][0]   # int (same across batch when stacking worked)
+
+                # Padded batch mode: masks and per-sample T_raw
+                if args.padded_batch:
+                    point_mask = batch['point_mask'].to(accelerator.device)   # (B, N) bool
+                    T_raw_tensor = batch['T_raw'].to(accelerator.device)      # (B,) int
+                else:
+                    point_mask = None
+                    T_raw_tensor = None
 
                 # --- Encode point states ---
                 x_s_enc = x_s_encoder(x_s_raw)  # (B, T, N, d_state)
-                T = x_s_enc.shape[1]
+                B_sz, T, N_sz, d_state = x_s_enc.shape
+
+                # --- Build valid sequence mask (padded batch mode) ---
+                if args.padded_batch:
+                    # Per-sample latent frame count from actual T_raw
+                    t_latent = (T_raw_tensor - 1) // 4 + 1   # (B,)
+                    t_idx = torch.arange(T, device=accelerator.device).unsqueeze(0)  # (1, T)
+                    t_valid = t_idx < t_latent.unsqueeze(1)   # (B, T)
+                    # seq_mask: (B, T, N) — valid time AND valid point
+                    seq_mask = t_valid.unsqueeze(2) & point_mask.unsqueeze(1)
+                    valid_seq_mask = seq_mask.view(B_sz, T * N_sz)  # (B, T*N)
+                else:
+                    seq_mask = None
+                    valid_seq_mask = None
 
                 # --- Encode conditions ---
                 c_sim = sim_cond_embedder(
@@ -322,6 +370,7 @@ def main():
                     c_init=c_init,
                     point_obj_idx=point_obj_idx,
                     T=T,
+                    point_mask=point_mask,
                 )  # (B, T, N, d_cond)
 
                 # --- Flow matching noise ---
@@ -360,14 +409,23 @@ def main():
 
                 # --- Forward pass ---
                 with torch.cuda.amp.autocast(dtype=weight_dtype):
-                    pred = sim_transformer(noisy_x_s_enc, c_sim, timesteps, dtype=weight_dtype)
+                    pred = sim_transformer(noisy_x_s_enc, c_sim, timesteps, dtype=weight_dtype,
+                                          valid_seq_mask=valid_seq_mask)
 
                 # --- Loss computation ---
                 weighting = compute_loss_weighting_for_sd3(
                     weighting_scheme=args.weighting_scheme, sigmas=sigma,
                 )
                 loss_latent = F.mse_loss(pred.float(), target.float(), reduction='none')
-                loss_latent = (loss_latent * weighting.float()).mean()
+
+                if args.padded_batch and seq_mask is not None:
+                    # Mask out padded positions before averaging
+                    # seq_mask: (B, T, N) → (B, T, N, 1) broadcast over d_state
+                    loss_latent = loss_latent * seq_mask.unsqueeze(-1).float()
+                    n_valid = seq_mask.float().sum() * d_state
+                    loss_latent = (loss_latent * weighting.float()).sum() / n_valid.clamp(min=1)
+                else:
+                    loss_latent = (loss_latent * weighting.float()).mean()
 
                 loss = loss_latent
 

@@ -6,7 +6,16 @@ on physics trajectory data using flow matching diffusion loss.
 No video branch is loaded. No Joint Attention is used.
 
 Usage:
+    # MOVI-AB dataset (directory-based):
     accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
+        --dataset_type movi \
+        --data_root datasets/movi_ab_10k \
+        --output_dir outputs/stage1 \
+        --gradient_accumulation_steps 8
+
+    # Custom npz dataset:
+    accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
+        --dataset_type simulation \
         --data_root /path/to/sim_data \
         --ann_path /path/to/annotations.json \
         --output_dir outputs/stage1 \
@@ -47,8 +56,10 @@ for project_root in project_roots:
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-from videox_fun.data.dataset_simulation import SimulationDataset, sim_collate_fn
-from videox_fun.models.sim_causal_encoder import CausalTemporalEncoder, CausalTemporalDecoder
+from videox_fun.data.dataset_simulation import (MoviSimulationDataset,
+                                                  SimulationDataset,
+                                                  sim_collate_fn)
+from videox_fun.models.sim_causal_encoder import CausalTemporalDecoder, CausalTemporalEncoder
 from videox_fun.models.sim_condition import SimConditionEmbedder
 from videox_fun.models.sim_transformer import SimTransformer
 from videox_fun.utils.discrete_sampler import DiscreteSampling
@@ -60,8 +71,14 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Stage 1: Train Simulation Branch")
 
     # Data
-    parser.add_argument("--ann_path", type=str, required=True, help="Path to annotation JSON file.")
-    parser.add_argument("--data_root", type=str, default=None, help="Root directory for data files.")
+    parser.add_argument("--dataset_type", type=str, default="movi",
+                        choices=["simulation", "movi"],
+                        help="Dataset type: 'movi' for MOVI-AB directory format, "
+                             "'simulation' for npz annotation format.")
+    parser.add_argument("--ann_path", type=str, default=None,
+                        help="Path to annotation JSON (required for --dataset_type simulation).")
+    parser.add_argument("--data_root", type=str, default=None,
+                        help="Root directory for data files or MOVI dataset root.")
 
     # Model architecture
     parser.add_argument("--d_state", type=int, default=256, help="Encoded point state dimension.")
@@ -75,7 +92,7 @@ def parse_args():
     # Training
     parser.add_argument("--output_dir", type=str, default="outputs/stage1", help="Output directory.")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--train_batch_size", type=int, default=1, help="Must be 1 (variable shapes).")
+    parser.add_argument("--train_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
     parser.add_argument("--max_train_steps", type=int, default=100000)
     parser.add_argument("--num_train_epochs", type=int, default=100)
@@ -110,7 +127,10 @@ def parse_args():
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
 
     args = parser.parse_args()
-    assert args.train_batch_size == 1, "SimulationDataset requires batch_size=1"
+
+    if args.dataset_type == "simulation" and args.ann_path is None:
+        parser.error("--ann_path is required when --dataset_type simulation")
+
     return args
 
 
@@ -153,7 +173,8 @@ def main():
     sim_cond_embedder = SimConditionEmbedder(max_objects=args.max_objects)
     d_cond = sim_cond_embedder.d_cond
 
-    x_s_encoder = CausalTemporalEncoder(c_in=9, c_mid=args.state_enc_mid, d_out=args.d_state)
+    # c_in=6: pos(3) + vel(3)
+    x_s_encoder = CausalTemporalEncoder(c_in=6, c_mid=args.state_enc_mid, d_out=args.d_state)
     x_s_decoder = CausalTemporalDecoder(d_feat=args.d_state, c_mid=args.state_enc_mid, c_out=6)
 
     sim_transformer = SimTransformer(
@@ -203,15 +224,21 @@ def main():
     )
 
     # --- Dataset & Dataloader ---
-    train_dataset = SimulationDataset(
-        ann_path=args.ann_path,
-        data_root=args.data_root,
-        load_video=False,
-    )
+    if args.dataset_type == "movi":
+        train_dataset = MoviSimulationDataset(
+            data_root=args.data_root,
+            max_objects=args.max_objects,
+        )
+    else:
+        train_dataset = SimulationDataset(
+            ann_path=args.ann_path,
+            data_root=args.data_root,
+            load_video=False,
+        )
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
-        batch_size=1,
+        batch_size=args.train_batch_size,
         shuffle=True,
         num_workers=args.dataloader_num_workers,
         collate_fn=sim_collate_fn,
@@ -267,21 +294,22 @@ def main():
 
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(sim_transformer):
-                # --- Unpack batch (bs=1) ---
-                x_s_raw = batch['x_s_raw'].to(weight_dtype)         # (1, T_raw, N, 9)
-                c_force_raw = batch['c_force_raw'].to(weight_dtype) # (1, T_raw, N, 6)
-                c_floor = batch['c_floor'].to(accelerator.device)   # (1,)
-                c_id = batch['c_id'].squeeze(0).to(accelerator.device)         # (n_objects,)
-                c_mat = batch['c_mat'].squeeze(0).to(accelerator.device)       # (n_objects, 2)
-                c_mass = batch['c_mass'].squeeze(0).to(accelerator.device)     # (n_objects,)
-                c_static = batch['c_static'].squeeze(0).to(accelerator.device) # (n_objects,)
-                c_init = batch['c_init'].squeeze(0).to(accelerator.device)     # (n_objects, 10)
-                point_obj_idx = batch['point_obj_idx'].squeeze(0).to(accelerator.device)  # (N,)
-                T = batch['T']
-                T_raw = batch['T_raw']
+                # --- Unpack batch ---
+                # Tensors have shape (B, ...) after sim_collate_fn stacking
+                x_s_raw = batch['x_s_raw'].to(accelerator.device, dtype=weight_dtype)    # (B, T_raw, N, 6)
+                c_force_raw = batch['c_force_raw'].to(accelerator.device, dtype=weight_dtype)  # (B, T_raw, N, 6)
+                c_floor = batch['c_floor'].to(accelerator.device)                          # (B,)
+                c_id = batch['c_id'].to(accelerator.device)                                # (B, n_objects)
+                c_mat = batch['c_mat'].to(accelerator.device)                              # (B, n_objects, 2)
+                c_mass = batch['c_mass'].to(accelerator.device)                            # (B, n_objects,)
+                c_static = batch['c_static'].to(accelerator.device)                        # (B, n_objects,)
+                c_init = batch['c_init'].to(accelerator.device)                            # (B, n_objects, 7)
+                point_obj_idx = batch['point_obj_idx'].to(accelerator.device)              # (B, N)
+                T_raw = batch['T_raw'][0]   # int (same across batch when stacking worked)
 
                 # --- Encode point states ---
-                x_s_enc = x_s_encoder(x_s_raw)  # (1, T, N, d_state)
+                x_s_enc = x_s_encoder(x_s_raw)  # (B, T, N, d_state)
+                T = x_s_enc.shape[1]
 
                 # --- Encode conditions ---
                 c_sim = sim_cond_embedder(
@@ -294,11 +322,11 @@ def main():
                     c_init=c_init,
                     point_obj_idx=point_obj_idx,
                     T=T,
-                )  # (1, T, N, d_cond)
+                )  # (B, T, N, d_cond)
 
                 # --- Flow matching noise ---
                 noise = torch.randn_like(x_s_enc)
-                bsz = 1
+                bsz = x_s_enc.shape[0]
 
                 if not args.uniform_sampling:
                     u = compute_density_for_timestep_sampling(
@@ -320,7 +348,7 @@ def main():
                 schedule_timesteps = noise_scheduler.timesteps.to(accelerator.device)
                 step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
                 sigma = sigmas[step_indices].flatten()
-                # Expand sigma to match x_s_enc shape
+                # Expand sigma to match x_s_enc shape: (B, 1, 1, 1)
                 while len(sigma.shape) < x_s_enc.ndim:
                     sigma = sigma.unsqueeze(-1)
 
@@ -335,7 +363,6 @@ def main():
                     pred = sim_transformer(noisy_x_s_enc, c_sim, timesteps, dtype=weight_dtype)
 
                 # --- Loss computation ---
-                # Latent-space loss (primary)
                 weighting = compute_loss_weighting_for_sd3(
                     weighting_scheme=args.weighting_scheme, sigmas=sigma,
                 )
@@ -345,7 +372,7 @@ def main():
                 loss = loss_latent
 
                 # --- Backward ---
-                avg_loss = accelerator.gather(loss.repeat(1)).mean()
+                avg_loss = accelerator.gather(loss.repeat(bsz)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
                 accelerator.backward(loss)
@@ -395,6 +422,9 @@ def main():
 
             if global_step >= args.max_train_steps:
                 break
+
+        if global_step >= args.max_train_steps:
+            break
 
     # Final save
     accelerator.wait_for_everyone()

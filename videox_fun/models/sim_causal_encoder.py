@@ -3,14 +3,14 @@
 # 4x temporal compression via 2 layers of stride-2 causal conv (kernel=3).
 #
 # Math (encoder):
-#   T_raw = 4*(T-1)+1 = 4T-3
-#   Layer 1: 4T-3 → floor((4T-4)/2)+1 = 2T-1
-#   Layer 2: 2T-1 → floor((2T-2)/2)+1 = T
+#   T_raw = 4k+1 → T_latent = k+1
+#   Layer 1: 4k+1 → 2k+1
+#   Layer 2: 2k+1 → k+1
 #
 # Math (decoder):
 #   Layer 1: T → 2T (channel-doubling + interleave)
 #   Layer 2: 2T → 4T
-#   Trim last 3 frames → 4T-3 = T_raw
+#   Trim to T_raw = 4k+1
 
 import torch
 import torch.nn as nn
@@ -112,12 +112,12 @@ class CausalUpsample1d(nn.Module):
 
 
 class CausalTemporalEncoder(nn.Module):
-    """4x causal temporal encoder: (1, T_raw, N, C_in) → (1, T, N, d_out).
+    """4x causal temporal encoder: (B, T_raw, N, c_in) → (B, T, N, d_out).
 
-    T_raw = 4*(T-1)+1. Uses 2 stride-2 downsample layers with residual blocks.
+    T_raw = 4k+1, T_latent = k+1. Uses 2 stride-2 downsample layers with residual blocks.
 
     Args:
-        c_in: Input channels (e.g., 9 for pos+vel+ang_vel).
+        c_in: Input channels (e.g., 6 for pos+vel).
         c_mid: Intermediate channel width.
         d_out: Output feature dimension.
     """
@@ -127,32 +127,32 @@ class CausalTemporalEncoder(nn.Module):
         self.encoder = nn.Sequential(
             CausalConv1d(c_in, c_mid, kernel_size=3, padding=1),
             ResidualBlock1d(c_mid, c_mid),
-            CausalDownsample1d(c_mid),        # T_raw → 2T-1
+            CausalDownsample1d(c_mid),        # 4k+1 → 2k+1
             ResidualBlock1d(c_mid, c_mid),
-            CausalDownsample1d(c_mid),        # 2T-1 → T
+            CausalDownsample1d(c_mid),        # 2k+1 → k+1
             ResidualBlock1d(c_mid, d_out),
         )
 
     def forward(self, x):
         """
         Args:
-            x: (1, T_raw, N, C_in)
+            x: (B, T_raw, N, c_in)
         Returns:
-            (1, T, N, d_out)
+            (B, T, N, d_out)
         """
         B, T_raw, N, C = x.shape
-        # Treat N as batch dim, C as channels, T as temporal
-        x = x.squeeze(0).permute(1, 2, 0)      # (N, C, T_raw)
-        x = self.encoder(x)                      # (N, d_out, T)
+        # Reshape: treat N as an independent batch axis, C as channels, T as time
+        x = x.permute(0, 2, 3, 1).reshape(B * N, C, T_raw)  # (B*N, C, T_raw)
+        x = self.encoder(x)                                    # (B*N, d_out, T)
         T = x.shape[2]
-        x = x.permute(2, 0, 1).unsqueeze(0)     # (1, T, N, d_out)
+        x = x.reshape(B, N, -1, T).permute(0, 3, 1, 2)       # (B, T, N, d_out)
         return x
 
 
 class CausalTemporalDecoder(nn.Module):
-    """4x causal temporal decoder: (1, T, N, d_feat) → (1, T_raw, N, c_out).
+    """4x causal temporal decoder: (B, T, N, d_feat) → (B, T_raw, N, c_out).
 
-    Uses 2 upsample-by-2 layers: T → 2T → 4T, then trims to T_raw = 4T-3.
+    Uses 2 upsample-by-2 layers: T → 2T → 4T, then trims to T_raw.
 
     Args:
         d_feat: Input feature dimension from DiT.
@@ -174,15 +174,15 @@ class CausalTemporalDecoder(nn.Module):
     def forward(self, x, t_raw: int):
         """
         Args:
-            x: (1, T, N, d_feat)
-            t_raw: Target temporal length (= 4*(T-1)+1).
+            x: (B, T, N, d_feat)
+            t_raw: Target temporal length (= 4k+1).
         Returns:
-            (1, T_raw, N, c_out)
+            (B, T_raw, N, c_out)
         """
         B, T, N, D = x.shape
-        x = x.squeeze(0).permute(1, 2, 0)       # (N, d_feat, T)
-        x = self.decoder(x)                       # (N, c_mid, 4T)
-        x = x[:, :, :t_raw]                       # trim to T_raw = 4T-3
-        x = self.head(x)                           # (N, c_out, T_raw)
-        x = x.permute(2, 0, 1).unsqueeze(0)       # (1, T_raw, N, c_out)
+        x = x.permute(0, 2, 3, 1).reshape(B * N, D, T)         # (B*N, d_feat, T)
+        x = self.decoder(x)                                       # (B*N, c_mid, 4T)
+        x = x[:, :, :t_raw]                                       # trim to T_raw
+        x = self.head(x)                                           # (B*N, c_out, T_raw)
+        x = x.reshape(B, N, -1, t_raw).permute(0, 3, 1, 2)       # (B, T_raw, N, c_out)
         return x

@@ -1,23 +1,21 @@
 # Simulation dataset for PV-Simulator.
 # Loads physics trajectory data for Stage 1 (sim-only) and Stage 2 (joint) training.
 #
-# Key design: bs=1 always. T_raw, n_objects, and N_i (points per object) all vary
-# per sample. Use multi-GPU DDP + gradient accumulation for effective batch size.
-#
-# Data format: each sample is an npz/hdf5 file containing:
-#   - x_s_raw: (T_raw, N, 9)  — point states (pos3 + vel3 + ang_vel3)
+# Data format (SimulationDataset, npz-based):
+#   - x_s_raw: (T_raw, N, 6)  — point states (pos3 + vel3)
 #   - c_force_raw: (T_raw, N, 6) — force vector (3) + contact point (3)
 #   - c_floor: float — floor height
 #   - c_mat: (n_objects, 2) — (friction, restitution) per object
 #   - c_mass: (n_objects,) — mass per object
 #   - c_static: (n_objects,) — static flag per object (0 or 1)
-#   - c_init: (n_objects, 9) — initial state (pos3 + vel3 + ang_vel3) per object
+#   - c_init: (n_objects, 7) — initial state (pos3 + vel3 + mask1) per object
 #   - point_obj_idx: (N,) — maps each point to its object index
 #   - text: str — text description (for Stage 2)
 #   - video_path: str — path to rendered video (for Stage 2)
 
 import json
 import os
+import pickle
 import random
 
 import numpy as np
@@ -26,10 +24,11 @@ from torch.utils.data import Dataset
 
 
 class SimulationDataset(Dataset):
-    """Dataset for physics simulation trajectory data.
+    """Dataset for physics simulation trajectory data loaded from npz files.
 
-    Each sample is loaded as bs=1 with variable shapes. No padding is applied.
-    Different samples may have different T_raw, n_objects, and N_i.
+    Each sample may have different T_raw, n_objects, and N_i (points per object).
+    When batching with batch_size > 1, all samples in a batch must have identical
+    shapes — the DataLoader will raise an error otherwise.
 
     Args:
         ann_path: Path to JSON annotation file. Each entry should have:
@@ -77,15 +76,13 @@ class SimulationDataset(Dataset):
             try:
                 data, entry = self._load_npz(idx)
 
-                # Point states: (T_raw, N, 9)
+                # Point states: (T_raw, N, 6) — pos3 + vel3
                 x_s_raw = torch.from_numpy(data['x_s_raw'].astype(np.float32))
                 T_raw, N, _ = x_s_raw.shape
 
-                # Validate T_raw is compatible with 4x temporal compression
-                # T_raw should be 4*(T-1)+1 for some integer T
-                assert (T_raw - 1) % (self.temporal_compression_ratio) == 0, \
+                # Validate T_raw is compatible with temporal compression: T_raw = 4k+1
+                assert (T_raw - 1) % self.temporal_compression_ratio == 0, \
                     f"T_raw={T_raw} is not compatible with temporal_compression_ratio={self.temporal_compression_ratio}"
-                T = (T_raw - 1) // self.temporal_compression_ratio + 1
 
                 # Force: (T_raw, N, 6)
                 if 'c_force_raw' in data:
@@ -105,27 +102,24 @@ class SimulationDataset(Dataset):
                 # Object IDs: 0..n_objects-1
                 c_id = torch.arange(n_objects, dtype=torch.long)
 
-                # Initial state: (n_objects, 9) — pos3 + vel3 + ang_vel3
-                c_init_state = torch.from_numpy(data['c_init'].astype(np.float32))  # (n_objects, 9)
-                # Append condition mask: 1 for the first frame (conditioned), 0 otherwise
-                # Shape becomes (n_objects, 10)
+                # Initial state: (n_objects, 7) — pos3 + vel3 + mask1
+                c_init_state = torch.from_numpy(data['c_init'].astype(np.float32))  # (n_objects, 6)
                 c_init_mask = torch.ones(n_objects, 1)
-                c_init = torch.cat([c_init_state, c_init_mask], dim=-1)
+                c_init = torch.cat([c_init_state, c_init_mask], dim=-1)              # (n_objects, 7)
 
                 # Point-to-object mapping: (N,)
                 point_obj_idx = torch.from_numpy(data['point_obj_idx'].astype(np.int64))
 
                 sample = {
-                    'x_s_raw': x_s_raw,                    # (T_raw, N, 9)
+                    'x_s_raw': x_s_raw,                    # (T_raw, N, 6)
                     'c_force_raw': c_force_raw,             # (T_raw, N, 6)
                     'c_floor': c_floor,                     # scalar
                     'c_id': c_id,                           # (n_objects,)
                     'c_mat': c_mat,                         # (n_objects, 2)
                     'c_mass': c_mass,                       # (n_objects,)
                     'c_static': c_static,                   # (n_objects,)
-                    'c_init': c_init,                       # (n_objects, 10)
+                    'c_init': c_init,                       # (n_objects, 7)
                     'point_obj_idx': point_obj_idx,         # (N,)
-                    'T': T,                                 # int
                     'T_raw': T_raw,                         # int
                     'N': N,                                 # int
                     'n_objects': n_objects,                  # int
@@ -144,18 +138,151 @@ class SimulationDataset(Dataset):
                 idx = random.randint(0, self.length - 1)
 
 
-def sim_collate_fn(batch):
-    """Collate function for SimulationDataset.
+class MoviSimulationDataset(Dataset):
+    """Dataset for the MOVI-AB style simulation data (directory-based format).
 
-    Since bs=1, this simply adds a batch dimension to each tensor.
-    Does NOT pad variable-length dimensions.
+    Each sample is a subdirectory containing:
+      - point_cloud_states.pkl: point states (T_raw_avail, N, 6), instance point ranges
+      - metadata.json: per-instance friction, restitution, mass, positions, velocities
+
+    Frames are clipped to the largest valid T_raw = 4k+1 ≤ T_raw_available.
+
+    Each sample may have different n_objects and N (total points). When batching with
+    batch_size > 1, all samples in a batch must have identical shapes — the DataLoader
+    will raise an error otherwise.
+
+    Args:
+        data_root: Root directory containing subdirectories (one per sample).
+        max_objects: Skip samples with more than this many objects.
+        temporal_compression_ratio: Temporal compression ratio (default 4).
     """
-    assert len(batch) == 1, "SimulationDataset requires batch_size=1"
-    sample = batch[0]
+
+    def __init__(
+        self,
+        data_root: str,
+        max_objects: int = 16,
+        temporal_compression_ratio: int = 4,
+    ):
+        self.data_root = data_root
+        self.max_objects = max_objects
+        self.temporal_compression_ratio = temporal_compression_ratio
+
+        # Discover all subdirectories
+        all_dirs = sorted([
+            d for d in os.listdir(data_root)
+            if os.path.isdir(os.path.join(data_root, d))
+        ])
+
+        # Filter: must have both required files and not too many objects
+        self.samples = []
+        for d in all_dirs:
+            sample_dir = os.path.join(data_root, d)
+            pkl_path = os.path.join(sample_dir, 'point_cloud_states.pkl')
+            meta_path = os.path.join(sample_dir, 'metadata.json')
+            if not os.path.exists(pkl_path) or not os.path.exists(meta_path):
+                continue
+            self.samples.append(sample_dir)
+
+        print(f"MoviSimulationDataset: found {len(self.samples)} samples in {data_root}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        while True:
+            try:
+                sample_dir = self.samples[idx]
+                pkl_path = os.path.join(sample_dir, 'point_cloud_states.pkl')
+                meta_path = os.path.join(sample_dir, 'metadata.json')
+
+                with open(pkl_path, 'rb') as f:
+                    pkl = pickle.load(f)
+                with open(meta_path, 'r') as f:
+                    meta = json.load(f)
+
+                # Point states: (T_raw_available, N, 6)
+                point_states = pkl['point_states'].astype(np.float32)  # (T_avail, N, 6)
+                T_avail = point_states.shape[0]
+
+                # Clip to largest valid T_raw = 4k+1
+                r = self.temporal_compression_ratio
+                k = (T_avail - 1) // r
+                T_raw = k * r + 1
+                assert T_raw >= r + 1, f"Too few frames in {sample_dir}: T_avail={T_avail}"
+                point_states = point_states[:T_raw]  # (T_raw, N, 6)
+                T_raw, N, _ = point_states.shape
+
+                # Per-instance info from pkl
+                instances = pkl['instances']
+                n_objects = len(instances)
+
+                if n_objects > self.max_objects:
+                    raise ValueError(f"Too many objects ({n_objects}) in {sample_dir}")
+
+                # point_obj_idx: (N,) — assign each point to its object index
+                point_obj_idx = np.zeros(N, dtype=np.int64)
+                for obj_i, inst in enumerate(instances):
+                    start, end = inst['point_range']
+                    point_obj_idx[start:end] = obj_i
+
+                # Per-object properties from metadata instances
+                meta_instances = meta['instances']
+                assert len(meta_instances) == n_objects, \
+                    f"Instance count mismatch: pkl={n_objects}, meta={len(meta_instances)}"
+
+                c_mat = np.zeros((n_objects, 2), dtype=np.float32)    # (friction, restitution)
+                c_mass = np.zeros(n_objects, dtype=np.float32)
+                c_init_state = np.zeros((n_objects, 6), dtype=np.float32)  # pos3 + vel3
+
+                for obj_i, mi in enumerate(meta_instances):
+                    c_mat[obj_i, 0] = mi.get('friction', 0.5)
+                    c_mat[obj_i, 1] = mi.get('restitution', 0.5)
+                    c_mass[obj_i] = mi.get('mass', 1.0)
+                    pos0 = mi['positions'][0]   # [x, y, z]
+                    vel0 = mi['velocities'][0]  # [vx, vy, vz]
+                    c_init_state[obj_i, :3] = pos0
+                    c_init_state[obj_i, 3:6] = vel0
+
+                # c_init: pos3 + vel3 + mask1 = (n_objects, 7)
+                c_init_mask = np.ones((n_objects, 1), dtype=np.float32)
+                c_init = np.concatenate([c_init_state, c_init_mask], axis=-1)
+
+                sample = {
+                    'x_s_raw': torch.from_numpy(point_states),             # (T_raw, N, 6)
+                    'c_force_raw': torch.zeros(T_raw, N, 6),               # (T_raw, N, 6)
+                    'c_floor': torch.tensor(0.0),                           # scalar
+                    'c_id': torch.arange(n_objects, dtype=torch.long),     # (n_objects,)
+                    'c_mat': torch.from_numpy(c_mat),                       # (n_objects, 2)
+                    'c_mass': torch.from_numpy(c_mass),                     # (n_objects,)
+                    'c_static': torch.zeros(n_objects, dtype=torch.long),  # (n_objects,)
+                    'c_init': torch.from_numpy(c_init),                     # (n_objects, 7)
+                    'point_obj_idx': torch.from_numpy(point_obj_idx),       # (N,)
+                    'T_raw': T_raw,                                          # int
+                    'N': N,                                                  # int
+                    'n_objects': n_objects,                                  # int
+                }
+                return sample
+
+            except Exception as e:
+                print(f"Error loading sample {idx} ({self.samples[idx]}): {e}")
+                idx = random.randint(0, len(self.samples) - 1)
+
+
+def sim_collate_fn(batch):
+    """Collate function for simulation datasets.
+
+    Works for any batch size when all samples have identical tensor shapes.
+    Stacks tensors along a new batch dimension; passes through scalar metadata.
+    """
     result = {}
-    for key, val in sample.items():
-        if isinstance(val, torch.Tensor):
-            result[key] = val.unsqueeze(0)  # add batch dim
+    sample = batch[0]
+    for key in sample:
+        vals = [b[key] for b in batch]
+        if isinstance(vals[0], torch.Tensor):
+            result[key] = torch.stack(vals, dim=0)
+        elif isinstance(vals[0], str):
+            result[key] = vals
         else:
-            result[key] = val
+            # int/scalar metadata — keep as list; caller can index [0] if needed
+            result[key] = vals
     return result

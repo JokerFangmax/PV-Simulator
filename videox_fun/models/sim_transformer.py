@@ -2,10 +2,8 @@
 # 10-block Transformer with self-attention + FFN, timestep modulation.
 # No cross-attention (text conditioning is only in the video branch).
 #
-# Input: encoded point states (1, T, N, d_state) + conditions (1, T, N, d_cond)
-# Output: predicted noise in latent space (1, T, N, d_state)
-#
-# Always bs=1 (variable T, N per sample).
+# Input: encoded point states (B, T, N, d_state) + conditions (B, T, N, d_cond)
+# Output: predicted noise in latent space (B, T, N, d_state)
 
 import torch
 import torch.nn as nn
@@ -48,7 +46,7 @@ class SimSelfAttention(nn.Module):
     def forward(self, x, dtype=torch.bfloat16):
         """
         Args:
-            x: (B, L, C) where B=1, L=T*N.
+            x: (B, L, C) where L = T*N.
             dtype: Dtype for the attention kernel (FlashAttention needs bf16/fp16).
         Returns:
             (B, L, C)
@@ -115,7 +113,7 @@ class SimAttentionBlock(nn.Module):
     def forward(self, x, e, dtype=torch.bfloat16):
         """
         Args:
-            x: (B, L, C) where B=1, L=T*N.
+            x: (B, L, C) where L = T*N.
             e: (B, 6, C) timestep modulation embedding.
         Returns:
             (B, L, C)
@@ -140,12 +138,10 @@ class SimAttentionBlock(nn.Module):
 class SimTransformer(nn.Module):
     """Simulation DiT: 10-block Transformer for physics trajectory denoising.
 
-    Input: encoded point states x_s_enc (1, T, N, d_state) concatenated with
-    conditions c_sim (1, T, N, d_cond), projected to hidden dim d_sim.
+    Input: encoded point states x_s_enc (B, T, N, d_state) concatenated with
+    conditions c_sim (B, T, N, d_cond), projected to hidden dim d_sim.
 
-    Output: predicted value in latent space (1, T, N, d_state).
-
-    Always operates with bs=1 (variable T, N per sample).
+    Output: predicted value in latent space (B, T, N, d_state).
 
     Args:
         d_state: Dimension of encoded point states.
@@ -212,27 +208,28 @@ class SimTransformer(nn.Module):
     def forward(self, x_enc, c_sim, t, dtype=torch.bfloat16):
         """
         Args:
-            x_enc: (1, T, N, d_state) — encoded noisy point states.
-            c_sim: (1, T, N, d_cond) — condition embeddings.
-            t: (1,) — diffusion timestep.
+            x_enc: (B, T, N, d_state) — encoded noisy point states.
+            c_sim: (B, T, N, d_cond) — condition embeddings.
+            t: (B,) — diffusion timestep.
             dtype: Compute dtype for attention.
         Returns:
-            (1, T, N, d_state) — predicted value in latent space.
+            (B, T, N, d_state) — predicted value in latent space.
         """
         B, T, N, _ = x_enc.shape
 
         # Concatenate state and conditions, project to hidden dim
-        x = torch.cat([x_enc, c_sim], dim=-1)  # (1, T, N, d_state + d_cond)
-        x = self.input_proj(x)                   # (1, T, N, d_sim)
-        x = x.view(B, T * N, self.d_sim)         # (1, T*N, d_sim)
+        x = torch.cat([x_enc, c_sim], dim=-1)  # (B, T, N, d_state + d_cond)
+        x = self.input_proj(x)                   # (B, T, N, d_sim)
+        x = x.view(B, T * N, self.d_sim)         # (B, T*N, d_sim)
 
-        # Timestep modulation
+        # Timestep modulation (computed in fp32 for numerical stability, then cast back)
         with amp.autocast(dtype=torch.float32):
             e = self.time_embedding(
                 sinusoidal_embedding_1d(self.freq_dim, t).float()
             )
             e0 = self.time_projection(e).unflatten(1, (6, self.d_sim))
-            # e0: (1, 6, d_sim)
+            # e0: (B, 6, d_sim)
+        e0 = e0.to(dtype)   # cast back so modulation arithmetic stays in model dtype
 
         # Transformer blocks
         for block in self.blocks:
@@ -240,5 +237,5 @@ class SimTransformer(nn.Module):
 
         # Output head
         x = x.view(B, T, N, self.d_sim)
-        x = self.head_proj(self.head_norm(x))     # (1, T, N, d_state)
+        x = self.head_proj(self.head_norm(x.to(self.head_proj.weight.dtype)))  # (B, T, N, d_state)
         return x

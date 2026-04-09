@@ -8,15 +8,15 @@ Usage:
 
     pipeline = SimulationPipeline.from_pretrained("outputs/stage1/final")
     result = pipeline(
-        c_floor=0.0,
-        c_id=torch.tensor([0, 1]),
-        c_mat=torch.tensor([[0.5, 0.3], [0.4, 0.8]]),
-        c_mass=torch.tensor([1.0, 2.0]),
-        c_static=torch.tensor([0, 0]),
-        c_force_raw=torch.zeros(1, T_raw, N, 6),
-        c_init=torch.zeros(n_objects, 10),
-        point_obj_idx=point_obj_idx,
-        T=17,
+        c_floor=torch.tensor([0.0]),          # (1,)
+        c_id=torch.tensor([[0, 1]]),          # (1, n_objects)
+        c_mat=torch.tensor([[[0.5, 0.3], [0.4, 0.8]]]),  # (1, n_objects, 2)
+        c_mass=torch.tensor([[1.0, 2.0]]),    # (1, n_objects)
+        c_static=torch.tensor([[0, 0]]),      # (1, n_objects)
+        c_force_raw=torch.zeros(1, T_raw, N, 6),          # (1, T_raw, N, 6)
+        c_init=torch.zeros(1, n_objects, 7),  # (1, n_objects, 7) pos+vel+mask
+        point_obj_idx=point_obj_idx,          # (1, N)
+        T=6,
         num_inference_steps=50,
     )
     x_s_decoded = result['x_s']   # (1, T_raw, N, 6)  predicted pos + vel
@@ -74,7 +74,7 @@ class SimulationPipeline:
         sim_cond_embedder = SimConditionEmbedder(max_objects=max_objects)
         d_cond = sim_cond_embedder.d_cond
 
-        x_s_encoder = CausalTemporalEncoder(c_in=9, c_mid=state_enc_mid, d_out=d_state)
+        x_s_encoder = CausalTemporalEncoder(c_in=6, c_mid=state_enc_mid, d_out=d_state)
         x_s_decoder = CausalTemporalDecoder(d_feat=d_state, c_mid=state_enc_mid, c_out=6)
         sim_transformer = SimTransformer(
             d_state=d_state, d_cond=d_cond, d_sim=d_sim,
@@ -109,14 +109,14 @@ class SimulationPipeline:
     @torch.no_grad()
     def __call__(
         self,
-        c_floor: torch.Tensor,          # (1,) float
-        c_id: torch.Tensor,              # (n_objects,) int
-        c_mat: torch.Tensor,             # (n_objects, 2) float
-        c_mass: torch.Tensor,            # (n_objects,) float
-        c_static: torch.Tensor,          # (n_objects,) int
-        c_force_raw: torch.Tensor,       # (1, T_raw, N, 6)
-        c_init: torch.Tensor,            # (n_objects, 10) float  (state + mask)
-        point_obj_idx: torch.Tensor,     # (N,) int
+        c_floor: torch.Tensor,          # (B,) float
+        c_id: torch.Tensor,              # (B, n_objects) int
+        c_mat: torch.Tensor,             # (B, n_objects, 2) float
+        c_mass: torch.Tensor,            # (B, n_objects) float
+        c_static: torch.Tensor,          # (B, n_objects) int
+        c_force_raw: torch.Tensor,       # (B, T_raw, N, 6)
+        c_init: torch.Tensor,            # (B, n_objects, 7) float  pos+vel+mask
+        point_obj_idx: torch.Tensor,     # (B, N) int
         T: int,                          # number of latent frames
         num_inference_steps: int = 50,
         guidance_scale: float = 1.0,     # reserved for future CFG
@@ -127,16 +127,17 @@ class SimulationPipeline:
 
         Returns:
             dict with:
-              'x_s': (1, T_raw, N, 6) — decoded predicted point states (pos + vel)
-              'x_s_latent': (1, T, N, d_state) — latent-space output before decoding
+              'x_s': (B, T_raw, N, 6) — decoded predicted point states (pos + vel)
+              'x_s_latent': (B, T, N, d_state) — latent-space output before decoding
         """
         device = self.device
         dtype = self.dtype
         T_raw = 4 * (T - 1) + 1
-        N = point_obj_idx.shape[0]
+        B = c_floor.shape[0]
+        N = point_obj_idx.shape[1]
 
         # Move inputs to device
-        c_floor = c_floor.to(device)
+        c_floor = c_floor.to(device, dtype=dtype)
         c_id = c_id.to(device)
         c_mat = c_mat.to(device, dtype=dtype)
         c_mass = c_mass.to(device, dtype=dtype)
@@ -156,11 +157,11 @@ class SimulationPipeline:
             c_init=c_init,
             point_obj_idx=point_obj_idx,
             T=T,
-        )  # (1, T, N, d_cond)
+        )  # (B, T, N, d_cond)
 
         # --- Start from pure noise in latent space ---
         latents = torch.randn(
-            1, T, N, self.sim_transformer.d_state,
+            B, T, N, self.sim_transformer.d_state,
             device=device, dtype=dtype, generator=generator,
         )
 

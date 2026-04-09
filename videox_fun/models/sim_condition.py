@@ -32,7 +32,7 @@ class SimConditionEmbedder(nn.Module):
 
     Handles per-object → per-point expansion via point_obj_idx.
 
-    Output shape: (1, T, N, d_cond) where d_cond = sum of all sub-condition dims.
+    Output shape: (B, T, N, d_cond) where d_cond = sum of all sub-condition dims.
 
     Args:
         d_floor: Floor height embedding dim.
@@ -68,67 +68,75 @@ class SimConditionEmbedder(nn.Module):
         self.mass_mlp = ConditionMLP(1, d_mass)
         self.static_embed = nn.Embedding(2, d_static)
 
-        # Time-varying force: (1, T_raw, N, 6) → (1, T, N, d_force)
+        # Time-varying force: (B, T_raw, N, 6) → (B, T, N, d_force)
         self.force_encoder = CausalTemporalEncoder(6, force_encoder_mid, d_force)
 
-        # Initial state: pos(3) + vel(3) + ang_vel(3) + mask(1) = 10 dims
-        self.init_mlp = ConditionMLP(10, d_init)
+        # Initial state: pos(3) + vel(3) + mask(1) = 7 dims
+        self.init_mlp = ConditionMLP(7, d_init)
 
     def forward(
         self,
-        c_floor: torch.Tensor,        # (1,) float — floor height
-        c_id: torch.Tensor,            # (n_objects,) int — object IDs [0..max_objects)
-        c_mat: torch.Tensor,           # (n_objects, 2) float — (friction, restitution)
-        c_mass: torch.Tensor,          # (n_objects,) float — mass
-        c_static: torch.Tensor,        # (n_objects,) int — static flag {0, 1}
-        c_force_raw: torch.Tensor,     # (1, T_raw, N, 6) float — force + contact point
-        c_init: torch.Tensor,          # (n_objects, 10) float — initial state + mask
-        point_obj_idx: torch.Tensor,   # (N,) int — maps each point to its object
+        c_floor: torch.Tensor,        # (B,) float — floor height
+        c_id: torch.Tensor,            # (B, n_objects) int — object IDs [0..max_objects)
+        c_mat: torch.Tensor,           # (B, n_objects, 2) float — (friction, restitution)
+        c_mass: torch.Tensor,          # (B, n_objects,) float — mass
+        c_static: torch.Tensor,        # (B, n_objects,) int — static flag {0, 1}
+        c_force_raw: torch.Tensor,     # (B, T_raw, N, 6) float — force + contact point
+        c_init: torch.Tensor,          # (B, n_objects, 7) float — initial state + mask
+        point_obj_idx: torch.Tensor,   # (B, N) int — maps each point to its object
         T: int,                        # Number of latent time frames
     ) -> torch.Tensor:
-        """Encode all conditions and return (1, T, N, d_cond)."""
-        N = point_obj_idx.shape[0]
+        """Encode all conditions and return (B, T, N, d_cond)."""
+        B = c_floor.shape[0]
+        N = point_obj_idx.shape[1]
 
         # --- Per-object embeddings → gather to per-point → expand over T ---
+        # Cast to the model's weight dtype so we work correctly under any mixed precision.
+        w_dtype = next(self.parameters()).dtype
 
-        # Floor: scalar → (1, T, N, d_floor)
-        e_floor = self.floor_mlp(c_floor.view(1, 1).float())  # (1, d_floor)
-        e_floor = e_floor.view(1, 1, 1, -1).expand(1, T, N, -1)
+        # Floor: (B,) → (B, d_floor)
+        e_floor = self.floor_mlp(c_floor.view(B, 1).to(w_dtype))    # (B, d_floor)
+        e_floor = e_floor.view(B, 1, 1, -1).expand(B, T, N, -1)
 
-        # Object ID: (n_objects,) → embed → gather → (1, T, N, d_id)
-        e_id = self.id_embed(c_id)                          # (n_objects, d_id)
-        e_id = e_id[point_obj_idx]                           # (N, d_id)
-        e_id = e_id.view(1, 1, N, -1).expand(1, T, N, -1)
+        # Object ID: (B, n_objects) → embed → (B, n_objects, d_id)
+        e_id = self.id_embed(c_id)                                   # (B, n_obj, d_id)
+        idx = point_obj_idx.unsqueeze(-1).expand(-1, -1, e_id.size(-1))  # (B, N, d_id)
+        e_id = e_id.gather(1, idx)                                   # (B, N, d_id)
+        e_id = e_id.unsqueeze(1).expand(-1, T, -1, -1)
 
-        # Material: (n_objects, 2) → MLP → gather → (1, T, N, d_mat)
-        e_mat = self.mat_mlp(c_mat.float())                  # (n_objects, d_mat)
-        e_mat = e_mat[point_obj_idx]                          # (N, d_mat)
-        e_mat = e_mat.view(1, 1, N, -1).expand(1, T, N, -1)
+        # Material: (B, n_objects, 2) → MLP → gather → (B, T, N, d_mat)
+        e_mat = self.mat_mlp(c_mat.to(w_dtype))                     # (B, n_obj, d_mat)
+        idx = point_obj_idx.unsqueeze(-1).expand(-1, -1, e_mat.size(-1))
+        e_mat = e_mat.gather(1, idx)                                 # (B, N, d_mat)
+        e_mat = e_mat.unsqueeze(1).expand(-1, T, -1, -1)
 
-        # Mass: (n_objects,) → MLP → gather → (1, T, N, d_mass)
-        e_mass = self.mass_mlp(c_mass.float().unsqueeze(-1))  # (n_objects, d_mass)
-        e_mass = e_mass[point_obj_idx]                         # (N, d_mass)
-        e_mass = e_mass.view(1, 1, N, -1).expand(1, T, N, -1)
+        # Mass: (B, n_objects) → MLP → gather → (B, T, N, d_mass)
+        e_mass = self.mass_mlp(c_mass.to(w_dtype).unsqueeze(-1))    # (B, n_obj, d_mass)
+        idx = point_obj_idx.unsqueeze(-1).expand(-1, -1, e_mass.size(-1))
+        e_mass = e_mass.gather(1, idx)                               # (B, N, d_mass)
+        e_mass = e_mass.unsqueeze(1).expand(-1, T, -1, -1)
 
-        # Static flag: (n_objects,) → embed → gather → (1, T, N, d_static)
-        e_static = self.static_embed(c_static)               # (n_objects, d_static)
-        e_static = e_static[point_obj_idx]                    # (N, d_static)
-        e_static = e_static.view(1, 1, N, -1).expand(1, T, N, -1)
+        # Static flag: (B, n_objects) → embed → gather → (B, T, N, d_static)
+        e_static = self.static_embed(c_static)                       # (B, n_obj, d_static)
+        idx = point_obj_idx.unsqueeze(-1).expand(-1, -1, e_static.size(-1))
+        e_static = e_static.gather(1, idx)                           # (B, N, d_static)
+        e_static = e_static.unsqueeze(1).expand(-1, T, -1, -1)
 
-        # Init state: (n_objects, 10) → MLP → gather → (1, T, N, d_init)
-        e_init = self.init_mlp(c_init.float())               # (n_objects, d_init)
-        e_init = e_init[point_obj_idx]                        # (N, d_init)
-        e_init = e_init.view(1, 1, N, -1).expand(1, T, N, -1)
+        # Init state: (B, n_objects, 7) → MLP → gather → (B, T, N, d_init)
+        e_init = self.init_mlp(c_init.to(w_dtype))                  # (B, n_obj, d_init)
+        idx = point_obj_idx.unsqueeze(-1).expand(-1, -1, e_init.size(-1))
+        e_init = e_init.gather(1, idx)                               # (B, N, d_init)
+        e_init = e_init.unsqueeze(1).expand(-1, T, -1, -1)
 
         # --- Time-varying conditions ---
 
-        # Force: (1, T_raw, N, 6) → causal encoder → (1, T, N, d_force)
+        # Force: (B, T_raw, N, 6) → causal encoder → (B, T, N, d_force)
         e_force = self.force_encoder(c_force_raw)
 
         # --- Concatenate all ---
         c_sim = torch.cat(
             [e_floor, e_id, e_mat, e_mass, e_static, e_force, e_init],
             dim=-1,
-        )  # (1, T, N, d_cond)
+        )  # (B, T, N, d_cond)
 
         return c_sim

@@ -79,13 +79,13 @@ There are **no automated tests** in this repository.
   - `max_points_per_object` (default 200): surface points per object, clipped/padded
   - `max_N = max_objects × max_points_per_object`: fixed total points per sample
   - Each object occupies a contiguous block of `max_points_per_object` slots in the flattened point array; `point_obj_idx[i*MPO:(i+1)*MPO] = i` regardless of padding
-  - `point_mask (B, N)` bool: True for non-padded points; zeroes condition embeddings and masks attention
-  - `valid_seq_mask (B, T*N)` bool: True for valid (t, n) pairs; used as additive attention key bias (padded tokens → −∞)
-  - Loss is averaged only over valid positions (sum / n_valid instead of .mean())
+  - `point_mask (B, N)` bool: True for non-padded points; zeroes condition embeddings
+  - `valid_seq_mask (B, T*N)` bool: True for valid latent (t, n) pairs; used as additive attention key bias in DiT (padded tokens → −∞)
+  - Loss uses a **raw-space mask** `(B, T_raw, N)` combining temporal and point validity; averaged only over valid positions
 - **max_objects=5**: Default cap on objects per scene (used in both modes).
 - **4x causal temporal compression**: Encoder compresses T_raw=4(T-1)+1 raw frames to T latent frames via 2 stride-2 causal conv layers (kernel=3). Matches video VAE's temporal compression ratio.
 - **Variable N**: Objects have different numbers of surface points N_i. All points are concatenated: N = ΣN_i. Per-object properties are expanded to per-point via `point_obj_idx` (gather-based, works in both modes).
-- **Flow matching diffusion**: Noise added in latent point-state space. Encoder/decoder wrap the compressed DiT. Target = noise - x_s (same as video branch).
+- **Flow matching diffusion**: Noise is added in **raw state space** `(B, T_raw, N, 6)`. The full denoising network is `Encoder → DiT → Decoder`, where the encoder/decoder act as temporal projection layers (not a VAE). Training target = `noise - x_s_raw` and loss is computed in raw space. At each inference step: `noisy_raw → encoder → DiT → decoder → velocity_raw → scheduler step in raw space`.
 
 ### Block Pairing (Video ↔ Sim)
 

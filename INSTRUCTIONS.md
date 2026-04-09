@@ -7,7 +7,7 @@ PV-Simulator extends VideoX-Fun with a **Simulation Branch** (SimDiT) that gener
 ```bash
 conda activate asr
 # Install any missing packages:
-uv pip install matplotlib imageio imageio-ffmpeg
+uv pip install matplotlib imageio imageio-ffmpeg wandb
 ```
 
 ---
@@ -60,7 +60,7 @@ NPZ keys:
 
 ## Stage 1 Training (Simulation Branch Only)
 
-Trains `SimTransformer` + `CausalTemporalEncoder/Decoder` + `SimConditionEmbedder` using flow matching diffusion on physics trajectory data.
+Trains the full denoising network (`CausalTemporalEncoder` → `SimTransformer` → `CausalTemporalDecoder`) + `SimConditionEmbedder` using flow matching diffusion. Noise is added and loss is computed in **raw state space** `(T_raw, N, 6)`; the encoder/decoder act as temporal projection layers around the latent-space DiT.
 
 ### Single GPU (smoke test)
 
@@ -127,6 +127,32 @@ accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
 | `--padded_batch` | off | Enable padded batch mode (allows `--train_batch_size > 1`) |
 | `--max_T_raw` | 21 | Max raw frames in padded mode (must be 4k+1) |
 | `--max_points_per_object` | 200 | Max surface points per object in padded mode |
+| `--report_to` | `tensorboard` | Logging backend: `tensorboard` or `wandb` |
+| `--wandb_project` | `pv_simulator` | wandb project name (when `--report_to wandb`) |
+| `--wandb_run_name` | — | wandb run name; auto-assigned if omitted |
+| `--vis_steps` | 0 | Log GT+pred trajectory videos to wandb every N steps (0 = off) |
+| `--num_vis_samples` | 4 | Number of fixed training samples to visualize |
+| `--vis_num_inference_steps` | 50 | Denoising steps used during visualization inference |
+| `--vis_fps` | 10 | FPS of visualization videos logged to wandb |
+
+### Logging with wandb
+
+Pass `--report_to wandb` to switch from TensorBoard to wandb. Both `train_loss` and `lr` are logged at every optimizer step.
+
+```bash
+accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
+    --dataset_type movi \
+    --data_root datasets/movi_ab_10k \
+    --output_dir outputs/stage1 \
+    --report_to wandb \
+    --wandb_project pv_simulator \
+    --wandb_run_name exp_001 \
+    --vis_steps 1000 \
+    --num_vis_samples 4 \
+    --gradient_accumulation_steps 8
+```
+
+With `--vis_steps N`, the trainer picks the first `--num_vis_samples` samples from the dataset at startup and runs full inference on them every N optimizer steps (main process only). Both the ground-truth trajectory and the model prediction are rendered as multi-view MP4s and logged to the `vis/` section of the wandb run. This is useful for tracking generation quality throughout training without a separate evaluation loop.
 
 ### Padded Batch Mode
 
@@ -152,8 +178,8 @@ accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
 - `T_raw` is clipped to the largest valid `4k+1 ≤ max_T_raw`, then zero-padded to `max_T_raw`.
 - Two boolean masks are computed per batch:
   - `point_mask (B, N)` — True for non-padded points (used to zero condition embeddings)
-  - `valid_seq_mask (B, T*N)` — True for valid (time, point) pairs (used as attention key bias)
-- Loss is averaged only over valid positions.
+  - `valid_seq_mask (B, T*N)` — True for valid latent (time, point) pairs (used as DiT attention key bias)
+- Loss uses a **raw-space mask** `(B, T_raw, N)` combining temporal and point validity; averaged only over valid positions.
 - Inference (`infer_stage1.py`) always uses B=1 without padding — no changes needed.
 
 ### Checkpoint layout
@@ -303,13 +329,15 @@ visualize_point_cloud_motion(
 
 | Component | File | Role |
 |-----------|------|------|
-| `CausalTemporalEncoder` | `videox_fun/models/sim_causal_encoder.py` | Compresses `(B, T_raw, N, 6)` → `(B, T, N, d_state)` via 2× stride-2 causal conv |
-| `CausalTemporalDecoder` | `videox_fun/models/sim_causal_encoder.py` | Expands `(B, T, N, d_state)` → `(B, T_raw, N, 6)` |
+| `CausalTemporalEncoder` | `videox_fun/models/sim_causal_encoder.py` | Projects `(B, T_raw, N, 6)` → `(B, T, N, d_state)` via 2× stride-2 causal conv |
+| `CausalTemporalDecoder` | `videox_fun/models/sim_causal_encoder.py` | Projects `(B, T, N, d_state)` → `(B, T_raw, N, 6)` |
 | `SimConditionEmbedder` | `videox_fun/models/sim_condition.py` | Encodes floor, object ID, material, mass, static flag, force, init state → `(B, T, N, d_cond)` |
-| `SimTransformer` | `videox_fun/models/sim_transformer.py` | 10-block DiT; denoises latent trajectories |
+| `SimTransformer` | `videox_fun/models/sim_transformer.py` | 10-block DiT; denoises in latent space |
 | `SimulationDataset` | `videox_fun/data/dataset_simulation.py` | Loads custom NPZ format |
 | `MoviSimulationDataset` | `videox_fun/data/dataset_simulation.py` | Loads MOVI-AB directory format |
-| `SimulationPipeline` | `videox_fun/pipeline/pipeline_simulation.py` | Stage 1 inference: loads checkpoint, runs DDIM denoising |
+| `SimulationPipeline` | `videox_fun/pipeline/pipeline_simulation.py` | Stage 1 inference: Encoder→DiT→Decoder denoising in raw space |
+
+The full denoising network is `Encoder → SimTransformer → Decoder`. Diffusion noise and scheduler steps operate in **raw state space** `(B, T_raw, N, 6)`. The encoder/decoder serve as temporal projection layers (4× compression/expansion), not a VAE.
 
 ### Temporal compression
 

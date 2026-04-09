@@ -140,7 +140,7 @@ def parse_args():
     parser.add_argument("--sim_num_heads", type=int, default=8)
     parser.add_argument("--sim_num_layers", type=int, default=10)
     parser.add_argument("--state_enc_mid", type=int, default=128)
-    parser.add_argument("--max_objects", type=int, default=16)
+    parser.add_argument("--max_objects", type=int, default=5)
     # Visualization
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--views", type=str, nargs='+',

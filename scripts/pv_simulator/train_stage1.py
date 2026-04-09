@@ -32,6 +32,7 @@ import os
 import random
 import shutil
 import sys
+import tempfile
 
 import numpy as np
 import torch
@@ -136,8 +137,20 @@ def parse_args():
     parser.add_argument("--checkpointing_steps", type=int, default=5000)
     parser.add_argument("--checkpoints_total_limit", type=int, default=5)
     parser.add_argument("--logging_dir", type=str, default="logs")
-    parser.add_argument("--report_to", type=str, default="tensorboard")
+    parser.add_argument("--report_to", type=str, default="tensorboard", choices=["tensorboard", "wandb"])
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument("--wandb_project", type=str, default="pv_simulator",
+                        help="wandb project name (used when --report_to wandb).")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                        help="wandb run name. Defaults to None (auto-assigned by wandb).")
+    parser.add_argument("--vis_steps", type=int, default=0,
+                        help="Log trajectory visualization to wandb every N steps. 0 = disabled.")
+    parser.add_argument("--num_vis_samples", type=int, default=3,
+                        help="Number of fixed training samples to visualize.")
+    parser.add_argument("--vis_num_inference_steps", type=int, default=50,
+                        help="Denoising steps during visualization inference.")
+    parser.add_argument("--vis_fps", type=int, default=10,
+                        help="FPS for wandb visualization videos.")
 
     args = parser.parse_args()
 
@@ -145,6 +158,81 @@ def parse_args():
         parser.error("--ann_path is required when --dataset_type simulation")
 
     return args
+
+
+def _run_vis(vis_samples, sim_transformer, x_s_encoder, x_s_decoder, sim_cond_embedder,
+             global_step, device, weight_dtype, num_inference_steps, fps):
+    """Run inference on fixed samples, render GT+pred videos, and log to wandb.
+
+    Must be called on main process only. Imports wandb and pipeline lazily so
+    that training without wandb does not require these packages.
+    """
+    import wandb
+    from diffusers import FlowMatchEulerDiscreteScheduler
+    from videox_fun.pipeline.pipeline_simulation import SimulationPipeline
+
+    # visualize.py lives in the same directory — defer import so matplotlib
+    # backend is set inside (it calls matplotlib.use('Agg') at import time).
+    _vis_dir = os.path.dirname(os.path.abspath(__file__))
+    if _vis_dir not in sys.path:
+        sys.path.insert(0, _vis_dir)
+    from visualize import visualize_point_cloud_motion
+
+    pipeline = SimulationPipeline(
+        sim_transformer=sim_transformer,
+        x_s_encoder=x_s_encoder,
+        x_s_decoder=x_s_decoder,
+        sim_cond_embedder=sim_cond_embedder,
+        scheduler=FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000),
+    )
+
+    log_dict = {}
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for i, sample in enumerate(vis_samples):
+            def _b(t, as_float=False):
+                if not isinstance(t, torch.Tensor):
+                    t = torch.as_tensor(t)
+                t = t.unsqueeze(0).to(device)
+                return t.to(weight_dtype) if as_float else t
+
+            x_s_raw       = _b(sample['x_s_raw'],       as_float=True)   # (1, T_raw, N, 6)
+            c_force_raw   = _b(sample['c_force_raw'],   as_float=True)   # (1, T_raw, N, 6)
+            c_floor       = _b(sample['c_floor'],        as_float=True)   # (1,)
+            c_id          = _b(sample['c_id'])                             # (1, n_objects) int
+            c_mat         = _b(sample['c_mat'],          as_float=True)   # (1, n_objects, 2)
+            c_mass        = _b(sample['c_mass'],         as_float=True)   # (1, n_objects)
+            c_static      = _b(sample['c_static'])                        # (1, n_objects) int
+            c_init        = _b(sample['c_init'],         as_float=True)   # (1, n_objects, 7)
+            point_obj_idx = _b(sample['point_obj_idx'])                   # (1, N) int
+
+            T_raw = x_s_raw.shape[1]
+            T = (T_raw - 1) // 4 + 1
+
+            with torch.cuda.amp.autocast(dtype=weight_dtype):
+                result = pipeline(
+                    c_floor=c_floor, c_id=c_id, c_mat=c_mat, c_mass=c_mass,
+                    c_static=c_static, c_force_raw=c_force_raw, c_init=c_init,
+                    point_obj_idx=point_obj_idx, T=T,
+                    num_inference_steps=num_inference_steps, show_progress=False,
+                )
+            x_s_pred = result['x_s'][0].float().cpu()   # (T_raw, N, 6)
+
+            gt_np  = sample['x_s_raw']        # (T_raw, N, 6) — numpy/tensor from dataset
+            obj_np = sample['point_obj_idx']   # (N,)
+
+            gt_path   = os.path.join(tmpdir, f"s{i}_gt.mp4")
+            pred_path = os.path.join(tmpdir, f"s{i}_pred.mp4")
+
+            visualize_point_cloud_motion(gt_np,    obj_np, gt_path,   fps=fps, views=["birdseye", "side", "iso"])
+            visualize_point_cloud_motion(x_s_pred, obj_np, pred_path, fps=fps, views=["birdseye", "side", "iso"])
+
+            log_dict[f"vis/sample{i}_gt"]   = wandb.Video(gt_path,   fps=fps, format="mp4")
+            log_dict[f"vis/sample{i}_pred"] = wandb.Video(pred_path, fps=fps, format="mp4")
+
+        if log_dict:
+            wandb.log(log_dict, step=global_step)
+
+    logger.info(f"[Step {global_step}] Logged {len(vis_samples) * 2} vis videos to wandb.")
 
 
 def main():
@@ -287,13 +375,20 @@ def main():
     )
 
     # --- Accelerate prepare ---
-    sim_transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        sim_transformer, optimizer, train_dataloader, lr_scheduler,
+    # All trainable modules are wrapped so DDP syncs their gradients across GPUs.
+    (sim_transformer, x_s_encoder, x_s_decoder, sim_cond_embedder,
+     optimizer, train_dataloader, lr_scheduler) = accelerator.prepare(
+        sim_transformer, x_s_encoder, x_s_decoder, sim_cond_embedder,
+        optimizer, train_dataloader, lr_scheduler,
     )
-    # These don't need gradient wrapping but should be on the right device
-    x_s_encoder = x_s_encoder.to(accelerator.device)
-    x_s_decoder = x_s_decoder.to(accelerator.device)
-    sim_cond_embedder = sim_cond_embedder.to(accelerator.device)
+
+    # --- Fixed visualization samples (loaded once, main process only) ---
+    vis_samples = []
+    if args.vis_steps > 0 and args.report_to == "wandb" and accelerator.is_main_process:
+        num_vis = min(args.num_vis_samples, len(train_dataset))
+        for idx in range(num_vis):
+            vis_samples.append(train_dataset[idx])
+        logger.info(f"Loaded {len(vis_samples)} fixed vis samples (indices 0..{num_vis - 1}).")
 
     # --- Resume from checkpoint ---
     global_step = 0
@@ -315,13 +410,17 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
 
-    accelerator.init_trackers("pv_simulator_stage1", config=vars(args))
+    init_kwargs = {}
+    if args.report_to == "wandb":
+        init_kwargs["wandb"] = {"name": args.wandb_run_name}
+    accelerator.init_trackers(args.wandb_project, config=vars(args), init_kwargs=init_kwargs)
 
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
+        accum_count = 0
 
         for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(sim_transformer):
+            with accelerator.accumulate(sim_transformer, x_s_encoder, x_s_decoder, sim_cond_embedder):
                 # --- Unpack batch ---
                 # Tensors have shape (B, ...) after collation
                 x_s_raw = batch['x_s_raw'].to(accelerator.device, dtype=weight_dtype)    # (B, T_raw, N, 6)
@@ -342,40 +441,12 @@ def main():
                     point_mask = None
                     T_raw_tensor = None
 
-                # --- Encode point states ---
-                x_s_enc = x_s_encoder(x_s_raw)  # (B, T, N, d_state)
-                B_sz, T, N_sz, d_state = x_s_enc.shape
-
-                # --- Build valid sequence mask (padded batch mode) ---
-                if args.padded_batch:
-                    # Per-sample latent frame count from actual T_raw
-                    t_latent = (T_raw_tensor - 1) // 4 + 1   # (B,)
-                    t_idx = torch.arange(T, device=accelerator.device).unsqueeze(0)  # (1, T)
-                    t_valid = t_idx < t_latent.unsqueeze(1)   # (B, T)
-                    # seq_mask: (B, T, N) — valid time AND valid point
-                    seq_mask = t_valid.unsqueeze(2) & point_mask.unsqueeze(1)
-                    valid_seq_mask = seq_mask.view(B_sz, T * N_sz)  # (B, T*N)
-                else:
-                    seq_mask = None
-                    valid_seq_mask = None
-
-                # --- Encode conditions ---
-                c_sim = sim_cond_embedder(
-                    c_floor=c_floor,
-                    c_id=c_id,
-                    c_mat=c_mat,
-                    c_mass=c_mass,
-                    c_static=c_static,
-                    c_force_raw=c_force_raw,
-                    c_init=c_init,
-                    point_obj_idx=point_obj_idx,
-                    T=T,
-                    point_mask=point_mask,
-                )  # (B, T, N, d_cond)
-
-                # --- Flow matching noise ---
-                noise = torch.randn_like(x_s_enc)
-                bsz = x_s_enc.shape[0]
+                # --- Flow matching noise (in raw space) ---
+                B_sz = x_s_raw.shape[0]
+                T_raw_dim = x_s_raw.shape[1]
+                N_sz = x_s_raw.shape[2]
+                noise = torch.randn_like(x_s_raw)   # (B, T_raw, N, 6)
+                bsz = B_sz
 
                 if not args.uniform_sampling:
                     u = compute_density_for_timestep_sampling(
@@ -397,41 +468,70 @@ def main():
                 schedule_timesteps = noise_scheduler.timesteps.to(accelerator.device)
                 step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
                 sigma = sigmas[step_indices].flatten()
-                # Expand sigma to match x_s_enc shape: (B, 1, 1, 1)
-                while len(sigma.shape) < x_s_enc.ndim:
+                while len(sigma.shape) < x_s_raw.ndim:
                     sigma = sigma.unsqueeze(-1)
 
-                # Noisy latents: zt = (1 - sigma) * x + sigma * noise
-                noisy_x_s_enc = (1.0 - sigma) * x_s_enc + sigma * noise
+                # Noisy raw states: zt = (1 - sigma) * x + sigma * noise
+                noisy_x_s_raw = (1.0 - sigma) * x_s_raw + sigma * noise
 
-                # Flow matching target: noise - x
-                target = noise - x_s_enc
+                # Flow matching target (raw space): velocity = noise - x
+                target = noise - x_s_raw
 
-                # --- Forward pass ---
+                # --- Encode noisy raw data → latent ---
+                noisy_enc = x_s_encoder(noisy_x_s_raw)  # (B, T, N, d_state)
+                T = noisy_enc.shape[1]
+
+                # --- Build valid sequence mask for DiT attention (padded batch mode) ---
+                if args.padded_batch:
+                    t_latent = (T_raw_tensor - 1) // 4 + 1   # (B,)
+                    t_idx = torch.arange(T, device=accelerator.device).unsqueeze(0)  # (1, T)
+                    t_valid = t_idx < t_latent.unsqueeze(1)   # (B, T)
+                    latent_seq_mask = t_valid.unsqueeze(2) & point_mask.unsqueeze(1)
+                    valid_seq_mask = latent_seq_mask.view(B_sz, T * noisy_enc.shape[2])
+                else:
+                    valid_seq_mask = None
+
+                # --- Encode conditions ---
+                c_sim = sim_cond_embedder(
+                    c_floor=c_floor,
+                    c_id=c_id,
+                    c_mat=c_mat,
+                    c_mass=c_mass,
+                    c_static=c_static,
+                    c_force_raw=c_force_raw,
+                    c_init=c_init,
+                    point_obj_idx=point_obj_idx,
+                    T=T,
+                    point_mask=point_mask,
+                )  # (B, T, N, d_cond)
+
+                # --- Forward pass: DiT in latent space, then decode to raw ---
                 with torch.cuda.amp.autocast(dtype=weight_dtype):
-                    pred = sim_transformer(noisy_x_s_enc, c_sim, timesteps, dtype=weight_dtype,
-                                          valid_seq_mask=valid_seq_mask)
+                    pred_enc = sim_transformer(noisy_enc, c_sim, timesteps, dtype=weight_dtype,
+                                              valid_seq_mask=valid_seq_mask)
+                    pred_raw = x_s_decoder(pred_enc, T_raw_dim)  # (B, T_raw, N, 6)
 
-                # --- Loss computation ---
+                # --- Loss computation (raw space) ---
                 weighting = compute_loss_weighting_for_sd3(
                     weighting_scheme=args.weighting_scheme, sigmas=sigma,
                 )
-                loss_latent = F.mse_loss(pred.float(), target.float(), reduction='none')
+                loss_per_elem = F.mse_loss(pred_raw.float(), target.float(), reduction='none')
 
-                if args.padded_batch and seq_mask is not None:
-                    # Mask out padded positions before averaging
-                    # seq_mask: (B, T, N) → (B, T, N, 1) broadcast over d_state
-                    loss_latent = loss_latent * seq_mask.unsqueeze(-1).float()
-                    n_valid = seq_mask.float().sum() * d_state
-                    loss_latent = (loss_latent * weighting.float()).sum() / n_valid.clamp(min=1)
+                if args.padded_batch and point_mask is not None:
+                    # Build raw-space mask: (B, T_raw, N)
+                    t_raw_idx = torch.arange(T_raw_dim, device=accelerator.device).unsqueeze(0)
+                    t_raw_valid = t_raw_idx < T_raw_tensor.unsqueeze(1)
+                    raw_mask = t_raw_valid.unsqueeze(2) & point_mask.unsqueeze(1)
+                    loss_per_elem = loss_per_elem * raw_mask.unsqueeze(-1).float()
+                    n_valid = raw_mask.float().sum() * 6   # 6 raw channels
+                    loss = (loss_per_elem * weighting.float()).sum() / n_valid.clamp(min=1)
                 else:
-                    loss_latent = (loss_latent * weighting.float()).mean()
-
-                loss = loss_latent
+                    loss = (loss_per_elem * weighting.float()).mean()
 
                 # --- Backward ---
                 avg_loss = accelerator.gather(loss.repeat(bsz)).mean()
-                train_loss += avg_loss.item() / args.gradient_accumulation_steps
+                train_loss += avg_loss.item()
+                accum_count += 1
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -444,8 +544,40 @@ def main():
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
-                accelerator.log({"train_loss": train_loss}, step=global_step)
+                current_lr = lr_scheduler.get_last_lr()[0]
+                accelerator.log({"train_loss": train_loss / max(accum_count, 1), "lr": current_lr}, step=global_step)
                 train_loss = 0.0
+                accum_count = 0
+
+                # --- Visualization ---
+                if (
+                    args.vis_steps > 0
+                    and args.report_to == "wandb"
+                    and global_step % args.vis_steps == 0
+                    and accelerator.is_main_process
+                    and len(vis_samples) > 0
+                ):
+                    unwrapped_sim = accelerator.unwrap_model(sim_transformer)
+                    unwrapped_enc = accelerator.unwrap_model(x_s_encoder)
+                    unwrapped_dec = accelerator.unwrap_model(x_s_decoder)
+                    unwrapped_cond = accelerator.unwrap_model(sim_cond_embedder)
+                    unwrapped_sim.eval()
+                    unwrapped_enc.eval()
+                    unwrapped_dec.eval()
+                    unwrapped_cond.eval()
+                    try:
+                        _run_vis(
+                            vis_samples, unwrapped_sim, unwrapped_enc, unwrapped_dec, unwrapped_cond,
+                            global_step, accelerator.device, weight_dtype,
+                            args.vis_num_inference_steps, args.vis_fps,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Visualization failed at step {global_step}: {e}")
+                    finally:
+                        unwrapped_sim.train()
+                        unwrapped_enc.train()
+                        unwrapped_dec.train()
+                        unwrapped_cond.train()
 
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
@@ -461,15 +593,18 @@ def main():
                                 for removing_checkpoint in checkpoints[:num_to_remove]:
                                     shutil.rmtree(os.path.join(args.output_dir, removing_checkpoint))
 
-                        # Save all sim components
+                        # Save all sim components (unwrap DDP wrappers)
                         save_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         os.makedirs(save_dir, exist_ok=True)
 
-                        unwrapped_sim = accelerator.unwrap_model(sim_transformer)
-                        torch.save(unwrapped_sim.state_dict(), os.path.join(save_dir, "sim_transformer.pt"))
-                        torch.save(x_s_encoder.state_dict(), os.path.join(save_dir, "x_s_encoder.pt"))
-                        torch.save(x_s_decoder.state_dict(), os.path.join(save_dir, "x_s_decoder.pt"))
-                        torch.save(sim_cond_embedder.state_dict(), os.path.join(save_dir, "sim_cond_embedder.pt"))
+                        torch.save(accelerator.unwrap_model(sim_transformer).state_dict(),
+                                   os.path.join(save_dir, "sim_transformer.pt"))
+                        torch.save(accelerator.unwrap_model(x_s_encoder).state_dict(),
+                                   os.path.join(save_dir, "x_s_encoder.pt"))
+                        torch.save(accelerator.unwrap_model(x_s_decoder).state_dict(),
+                                   os.path.join(save_dir, "x_s_decoder.pt"))
+                        torch.save(accelerator.unwrap_model(sim_cond_embedder).state_dict(),
+                                   os.path.join(save_dir, "sim_cond_embedder.pt"))
                         logger.info(f"Saved checkpoint to {save_dir}")
 
                         gc.collect()
@@ -489,11 +624,14 @@ def main():
     if accelerator.is_main_process:
         save_dir = os.path.join(args.output_dir, "final")
         os.makedirs(save_dir, exist_ok=True)
-        unwrapped_sim = accelerator.unwrap_model(sim_transformer)
-        torch.save(unwrapped_sim.state_dict(), os.path.join(save_dir, "sim_transformer.pt"))
-        torch.save(x_s_encoder.state_dict(), os.path.join(save_dir, "x_s_encoder.pt"))
-        torch.save(x_s_decoder.state_dict(), os.path.join(save_dir, "x_s_decoder.pt"))
-        torch.save(sim_cond_embedder.state_dict(), os.path.join(save_dir, "sim_cond_embedder.pt"))
+        torch.save(accelerator.unwrap_model(sim_transformer).state_dict(),
+                   os.path.join(save_dir, "sim_transformer.pt"))
+        torch.save(accelerator.unwrap_model(x_s_encoder).state_dict(),
+                   os.path.join(save_dir, "x_s_encoder.pt"))
+        torch.save(accelerator.unwrap_model(x_s_decoder).state_dict(),
+                   os.path.join(save_dir, "x_s_decoder.pt"))
+        torch.save(accelerator.unwrap_model(sim_cond_embedder).state_dict(),
+                   os.path.join(save_dir, "sim_cond_embedder.pt"))
         logger.info(f"Saved final model to {save_dir}")
 
     accelerator.end_training()

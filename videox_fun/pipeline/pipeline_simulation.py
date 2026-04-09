@@ -1,7 +1,9 @@
 """Stage 1 inference pipeline for PV-Simulator: Simulation Branch only.
 
-Runs the SimTransformer standalone (no video branch) to denoise physics
-trajectories from pure noise given physics conditions.
+Runs the full denoising network (Encoder → SimTransformer → Decoder) to
+denoise physics trajectories from pure noise in raw state space.  The
+encoder/decoder act as projection layers; the diffusion process operates
+in raw (T_raw, N, 6) space while the DiT works in compressed latent space.
 
 Usage:
     from videox_fun.pipeline.pipeline_simulation import SimulationPipeline
@@ -19,14 +21,13 @@ Usage:
         T=6,
         num_inference_steps=50,
     )
-    x_s_decoded = result['x_s']   # (1, T_raw, N, 6)  predicted pos + vel
+    x_s_pred = result['x_s']   # (1, T_raw, N, 6)  predicted pos + vel
 """
 
 import os
 from typing import Optional
 
 import torch
-import torch.nn as nn
 from diffusers import FlowMatchEulerDiscreteScheduler
 from tqdm.auto import tqdm
 
@@ -38,8 +39,14 @@ from videox_fun.models.sim_transformer import SimTransformer
 class SimulationPipeline:
     """Inference pipeline for the Stage 1 Simulation Branch.
 
-    Loads encoder/decoder/conditions/transformer from a Stage 1 checkpoint
-    directory and runs DDIM-style flow-matching denoising.
+    The denoising network is Encoder → DiT → Decoder:
+      - Encoder projects noisy raw states (T_raw, N, 6) → latent (T, N, d_state)
+      - DiT denoises in latent space
+      - Decoder projects latent prediction → raw velocity (T_raw, N, 6)
+
+    The diffusion process (noise addition / scheduler steps) operates in the
+    original raw state space.  This matches the training procedure where
+    loss is computed in raw space.
 
     Args:
         sim_transformer: SimTransformer model.
@@ -125,18 +132,14 @@ class SimulationPipeline:
         point_mask: Optional[torch.Tensor] = None,    # (B, N) bool — valid points (padded batch)
         valid_seq_mask: Optional[torch.Tensor] = None,  # (B, T*N) bool — valid tokens (padded batch)
     ):
-        """Run simulation denoising from noise.
+        """Run simulation denoising from noise in raw state space.
 
-        Args:
-            point_mask: Optional (B, N) bool tensor marking valid (non-padded) points.
-                Pass when using padded batch mode to zero out padding in conditions.
-            valid_seq_mask: Optional (B, T*N) bool tensor marking valid tokens.
-                Pass when using padded batch mode to mask padding in self-attention.
+        At each denoising step the full network runs:
+          noisy_raw → Encoder → latent → DiT → latent → Decoder → velocity_raw
+        The scheduler then updates the raw-space sample.
 
         Returns:
-            dict with:
-              'x_s': (B, T_raw, N, 6) — decoded predicted point states (pos + vel)
-              'x_s_latent': (B, T, N, d_state) — latent-space output before decoding
+            dict with 'x_s': (B, T_raw, N, 6) — predicted point states
         """
         device = self.device
         dtype = self.dtype
@@ -172,13 +175,13 @@ class SimulationPipeline:
             point_mask=point_mask,
         )  # (B, T, N, d_cond)
 
-        # --- Start from pure noise in latent space ---
-        latents = torch.randn(
-            B, T, N, self.sim_transformer.d_state,
+        # --- Start from pure noise in raw state space ---
+        sample = torch.randn(
+            B, T_raw, N, 6,
             device=device, dtype=dtype, generator=generator,
         )
 
-        # --- Denoising loop ---
+        # --- Denoising loop (diffusion in raw space) ---
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
@@ -186,18 +189,21 @@ class SimulationPipeline:
         for t in progress_bar:
             t_batch = t.unsqueeze(0)
 
-            pred = self.sim_transformer(
-                latents, c_sim, t_batch, dtype=dtype,
+            # Encode current noisy raw sample to latent
+            encoded = self.x_s_encoder(sample)  # (B, T, N, d_state)
+
+            # DiT forward in latent space
+            pred_latent = self.sim_transformer(
+                encoded, c_sim, t_batch, dtype=dtype,
                 valid_seq_mask=valid_seq_mask,
             )  # (B, T, N, d_state)
 
-            # Scheduler step
-            latents = self.scheduler.step(pred, t, latents).prev_sample
+            # Decode back to raw space (velocity prediction)
+            pred_raw = self.x_s_decoder(pred_latent, T_raw)  # (B, T_raw, N, 6)
 
-        # --- Decode latents back to raw state space ---
-        x_s = self.x_s_decoder(latents, T_raw)  # (B, T_raw, N, 6)
+            # Euler step in raw space
+            sample = self.scheduler.step(pred_raw, t, sample).prev_sample
 
         return {
-            'x_s': x_s,
-            'x_s_latent': latents,
+            'x_s': sample,
         }

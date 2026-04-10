@@ -55,7 +55,7 @@ for project_root in project_roots:
 
 from videox_fun.data.dataset_simulation import SimulationDataset, sim_collate_fn
 from videox_fun.models import AutoencoderKLWan, WanT5EncoderModel, WanTransformer3DModel
-from videox_fun.models.sim_causal_encoder import CausalTemporalEncoder, CausalTemporalDecoder
+from videox_fun.models.sim_ae import CausalAE
 from videox_fun.models.sim_condition import SimConditionEmbedder
 from videox_fun.models.sim_transformer import SimTransformer
 from videox_fun.models.mot_wrapper import MoTWrapper, DEFAULT_PAIRING
@@ -71,6 +71,8 @@ def parse_args():
     # Checkpoints
     parser.add_argument("--stage1_ckpt", type=str, required=True,
                         help="Path to Stage 1 checkpoint directory.")
+    parser.add_argument("--ae_ckpt_dir", type=str, required=True,
+                        help="Path to Stage 0 CausalAE checkpoint directory.")
     parser.add_argument("--video_model_path", type=str, required=True,
                         help="Path to Wan2.1-Fun-V1.1-1.3B-InP pretrained weights.")
 
@@ -79,12 +81,11 @@ def parse_args():
     parser.add_argument("--data_root", type=str, default=None)
 
     # Model architecture (must match Stage 1)
-    parser.add_argument("--d_state", type=int, default=256)
+    parser.add_argument("--d_state", type=int, default=64)
     parser.add_argument("--d_sim", type=int, default=512)
     parser.add_argument("--sim_ffn_dim", type=int, default=2048)
     parser.add_argument("--sim_num_heads", type=int, default=8)
     parser.add_argument("--sim_num_layers", type=int, default=10)
-    parser.add_argument("--state_enc_mid", type=int, default=128)
     parser.add_argument("--max_objects", type=int, default=16)
     parser.add_argument("--d_joint", type=int, default=256)
     parser.add_argument("--joint_num_heads", type=int, default=8)
@@ -207,12 +208,17 @@ def main():
     for p in text_encoder.parameters():
         p.requires_grad_(False)
 
+    # --- Load frozen CausalAE (from Stage 0) ---
+    ae = CausalAE.load(args.ae_ckpt_dir)
+    ae.to(accelerator.device, dtype=weight_dtype)
+    ae.eval()
+    for p in ae.parameters():
+        p.requires_grad_(False)
+    logger.info(f"Loaded frozen CausalAE from {args.ae_ckpt_dir}")
+
     # --- Build Sim Components ---
     sim_cond_embedder = SimConditionEmbedder(max_objects=args.max_objects)
     d_cond = sim_cond_embedder.d_cond
-
-    x_s_encoder = CausalTemporalEncoder(c_in=9, c_mid=args.state_enc_mid, d_out=args.d_state)
-    x_s_decoder = CausalTemporalDecoder(d_feat=args.d_state, c_mid=args.state_enc_mid, c_out=6)
 
     sim_transformer = SimTransformer(
         d_state=args.d_state,
@@ -228,28 +234,16 @@ def main():
     sim_transformer.load_state_dict(
         torch.load(os.path.join(args.stage1_ckpt, "sim_transformer.pt"), map_location="cpu")
     )
-    x_s_encoder.load_state_dict(
-        torch.load(os.path.join(args.stage1_ckpt, "x_s_encoder.pt"), map_location="cpu")
-    )
-    x_s_decoder.load_state_dict(
-        torch.load(os.path.join(args.stage1_ckpt, "x_s_decoder.pt"), map_location="cpu")
-    )
     sim_cond_embedder.load_state_dict(
         torch.load(os.path.join(args.stage1_ckpt, "sim_cond_embedder.pt"), map_location="cpu")
     )
 
     # Move to device
     sim_transformer.to(accelerator.device, dtype=weight_dtype)
-    x_s_encoder.to(accelerator.device, dtype=weight_dtype)
-    x_s_decoder.to(accelerator.device, dtype=weight_dtype)
     sim_cond_embedder.to(accelerator.device, dtype=weight_dtype)
 
     if not args.train_sim_branch:
         for p in sim_transformer.parameters():
-            p.requires_grad_(False)
-        for p in x_s_encoder.parameters():
-            p.requires_grad_(False)
-        for p in x_s_decoder.parameters():
             p.requires_grad_(False)
         for p in sim_cond_embedder.parameters():
             p.requires_grad_(False)
@@ -266,12 +260,9 @@ def main():
         d_joint=args.d_joint,
         joint_num_heads=args.joint_num_heads,
         max_objects=args.max_objects,
-        state_enc_mid=args.state_enc_mid,
     )
     # Copy loaded sim components into mot
     mot.sim.load_state_dict(sim_transformer.state_dict())
-    mot.x_s_encoder.load_state_dict(x_s_encoder.state_dict())
-    mot.x_s_decoder.load_state_dict(x_s_decoder.state_dict())
     mot.sim_cond_embedder.load_state_dict(sim_cond_embedder.state_dict())
     mot.to(accelerator.device, dtype=weight_dtype)
 
@@ -310,8 +301,6 @@ def main():
     if args.train_sim_branch:
         sim_params = (
             list(mot.sim.parameters()) +
-            list(mot.x_s_encoder.parameters()) +
-            list(mot.x_s_decoder.parameters()) +
             list(mot.sim_cond_embedder.parameters())
         )
         param_groups.append({"params": sim_params, "lr": args.learning_rate * args.sim_lr_scale})
@@ -379,26 +368,43 @@ def main():
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(mot):
                 # --- Sim inputs ---
-                x_s_raw = batch['x_s_raw'].to(weight_dtype)          # (1, T_raw, N, 9)
+                x_s_raw = batch['x_s_raw'].to(weight_dtype)          # (1, T_raw, N, 6)
                 c_force_raw = batch['c_force_raw'].to(weight_dtype)  # (1, T_raw, N, 6)
                 c_floor = batch['c_floor'].to(accelerator.device)
                 c_id = batch['c_id'].squeeze(0).to(accelerator.device)
                 c_mat = batch['c_mat'].squeeze(0).to(accelerator.device)
                 c_mass = batch['c_mass'].squeeze(0).to(accelerator.device)
                 c_static = batch['c_static'].squeeze(0).to(accelerator.device)
-                c_init = batch['c_init'].squeeze(0).to(accelerator.device)
                 point_obj_idx = batch['point_obj_idx'].squeeze(0).to(accelerator.device)
                 T = batch['T']
-                T_raw = batch['T_raw']
+                T_raw_val = batch['T_raw']
                 N = batch['N']
 
                 unwrapped_mot = accelerator.unwrap_model(mot)
 
-                # --- Encode sim states ---
-                x_s_enc = unwrapped_mot.x_s_encoder(x_s_raw)  # (1, T, N, d_state)
+                # --- Encode sim states via frozen AE ---
+                with torch.no_grad():
+                    pos_enc = ae.encode(x_s_raw[..., :3])    # (1, T, N, d_latent)
+                    vel_enc = ae.encode(x_s_raw[..., 3:6])   # (1, T, N, d_latent)
+                x_s_enc = torch.cat([pos_enc, vel_enc], dim=-1)  # (1, T, N, d_state)
+
+                # --- Initial frame conditioning via frozen AE ---
+                with torch.no_grad():
+                    init_pos_enc = ae.encode(x_s_raw[:, :1, :, :3])
+                    init_vel_enc = ae.encode(x_s_raw[:, :1, :, 3:6])
+                init_enc_1 = torch.cat([init_pos_enc, init_vel_enc], dim=-1)
+                init_enc_padded = torch.cat([
+                    init_enc_1,
+                    torch.zeros(1, T - 1, N, args.d_state,
+                                device=accelerator.device, dtype=weight_dtype),
+                ], dim=1)
+                init_mask = torch.ones(1, T, N, 1,
+                                       device=accelerator.device, dtype=weight_dtype)
+                init_mask[:, 0, :, :] = 0.0
+
                 c_sim = unwrapped_mot.sim_cond_embedder(
                     c_floor=c_floor, c_id=c_id, c_mat=c_mat, c_mass=c_mass,
-                    c_static=c_static, c_force_raw=c_force_raw, c_init=c_init,
+                    c_static=c_static, c_force_raw=c_force_raw,
                     point_obj_idx=point_obj_idx, T=T,
                 )  # (1, T, N, d_cond)
 
@@ -438,7 +444,7 @@ def main():
 
                 # --- Prepare sim tokens ---
                 sim_x, sim_e0 = unwrapped_mot.prepare_sim_inputs(
-                    noisy_x_s_enc, c_sim, timesteps,
+                    noisy_x_s_enc, init_enc_padded, init_mask, c_sim, timesteps,
                 )
 
                 # --- Stage 2: joint forward pass ---
@@ -452,10 +458,14 @@ def main():
                     # a full video loading pipeline (out of scope for this script skeleton).
                     # TODO: integrate video loading and joint forward pass.
                     with torch.cuda.amp.autocast(dtype=weight_dtype):
-                        pred_sim = unwrapped_mot.sim(noisy_x_s_enc, c_sim, timesteps, dtype=weight_dtype)
+                        pred_sim = unwrapped_mot.sim(
+                            noisy_x_s_enc, init_enc_padded, init_mask, c_sim,
+                            timesteps, dtype=weight_dtype)
                 else:
                     with torch.cuda.amp.autocast(dtype=weight_dtype):
-                        pred_sim = unwrapped_mot.sim(noisy_x_s_enc, c_sim, timesteps, dtype=weight_dtype)
+                        pred_sim = unwrapped_mot.sim(
+                            noisy_x_s_enc, init_enc_padded, init_mask, c_sim,
+                            timesteps, dtype=weight_dtype)
 
                 # --- Sim loss ---
                 weighting = compute_loss_weighting_for_sd3(
@@ -508,10 +518,6 @@ def main():
                                    os.path.join(save_dir, "joint_attns.pt"))
                         torch.save(unwrapped.sim.state_dict(),
                                    os.path.join(save_dir, "sim_transformer.pt"))
-                        torch.save(unwrapped.x_s_encoder.state_dict(),
-                                   os.path.join(save_dir, "x_s_encoder.pt"))
-                        torch.save(unwrapped.x_s_decoder.state_dict(),
-                                   os.path.join(save_dir, "x_s_decoder.pt"))
                         torch.save(unwrapped.sim_cond_embedder.state_dict(),
                                    os.path.join(save_dir, "sim_cond_embedder.pt"))
                         # Save LoRA weights
@@ -537,8 +543,6 @@ def main():
         unwrapped = accelerator.unwrap_model(mot)
         torch.save(unwrapped.joint_attns.state_dict(), os.path.join(save_dir, "joint_attns.pt"))
         torch.save(unwrapped.sim.state_dict(), os.path.join(save_dir, "sim_transformer.pt"))
-        torch.save(unwrapped.x_s_encoder.state_dict(), os.path.join(save_dir, "x_s_encoder.pt"))
-        torch.save(unwrapped.x_s_decoder.state_dict(), os.path.join(save_dir, "x_s_decoder.pt"))
         torch.save(unwrapped.sim_cond_embedder.state_dict(), os.path.join(save_dir, "sim_cond_embedder.pt"))
         lora_network.save_weights(os.path.join(save_dir, "lora.safetensors"), weight_dtype, None)
         logger.info(f"Saved final model to {save_dir}")

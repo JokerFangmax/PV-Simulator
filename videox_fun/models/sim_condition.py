@@ -1,6 +1,9 @@
 # Simulation condition embedders for PV-Simulator.
-# Encodes physics conditions (floor, object ID, material, mass, static, force, init)
+# Encodes physics conditions (floor, object ID, material, mass, static, force)
 # into per-point, per-timestep feature tensors.
+#
+# Initial state conditioning is handled separately via the frozen CausalAE
+# encoder — see sim_ae.py and the init_enc/init_mask inputs to SimTransformer.
 #
 # Per-object properties are expanded to per-point via point_obj_idx (N,) mapping.
 
@@ -36,6 +39,10 @@ class SimConditionEmbedder(nn.Module):
 
     Output shape: (B, T, N, d_cond) where d_cond = sum of all sub-condition dims.
 
+    Note: Initial state conditioning is no longer handled here. It is encoded
+    via the frozen CausalAE (same encoder as the noisy state) and passed
+    directly to SimTransformer as init_enc + init_mask.
+
     Args:
         d_floor: Floor height embedding dim.
         d_id: Object ID embedding dim.
@@ -43,7 +50,6 @@ class SimConditionEmbedder(nn.Module):
         d_mass: Mass embedding dim.
         d_static: Static flag embedding dim.
         d_force: Force embedding dim (via causal temporal encoder).
-        d_init: Initial state embedding dim.
         max_objects: Maximum number of objects per scene.
         force_encoder_mid: Intermediate channel width for force causal encoder.
     """
@@ -56,12 +62,11 @@ class SimConditionEmbedder(nn.Module):
         d_mass: int = 32,
         d_static: int = 16,
         d_force: int = 128,
-        d_init: int = 64,
         max_objects: int = 16,
         force_encoder_mid: int = 128,
     ):
         super().__init__()
-        self.d_cond = d_floor + d_id + d_mat + d_mass + d_static + d_force + d_init
+        self.d_cond = d_floor + d_id + d_mat + d_mass + d_static + d_force
 
         # Scalar / per-object encoders
         self.floor_mlp = ConditionMLP(1, d_floor)
@@ -73,9 +78,6 @@ class SimConditionEmbedder(nn.Module):
         # Time-varying force: (B, T_raw, N, 6) → (B, T, N, d_force)
         self.force_encoder = CausalTemporalEncoder(6, force_encoder_mid, d_force)
 
-        # Initial state: pos(3) + vel(3) + mask(1) = 7 dims
-        self.init_mlp = ConditionMLP(7, d_init)
-
     def forward(
         self,
         c_floor: torch.Tensor,        # (B,) float — floor height
@@ -84,7 +86,6 @@ class SimConditionEmbedder(nn.Module):
         c_mass: torch.Tensor,          # (B, n_objects,) float — mass
         c_static: torch.Tensor,        # (B, n_objects,) int — static flag {0, 1}
         c_force_raw: torch.Tensor,     # (B, T_raw, N, 6) float — force + contact point
-        c_init: torch.Tensor,          # (B, n_objects, 7) float — initial state + mask
         point_obj_idx: torch.Tensor,   # (B, N) int — maps each point to its object
         T: int,                        # Number of latent time frames
         point_mask: Optional[torch.Tensor] = None,  # (B, N) bool — valid points (padded batch mode)
@@ -125,12 +126,6 @@ class SimConditionEmbedder(nn.Module):
         e_static = e_static.gather(1, idx)                           # (B, N, d_static)
         e_static = e_static.unsqueeze(1).expand(-1, T, -1, -1)
 
-        # Init state: (B, n_objects, 7) → MLP → gather → (B, T, N, d_init)
-        e_init = self.init_mlp(c_init.to(w_dtype))                  # (B, n_obj, d_init)
-        idx = point_obj_idx.unsqueeze(-1).expand(-1, -1, e_init.size(-1))
-        e_init = e_init.gather(1, idx)                               # (B, N, d_init)
-        e_init = e_init.unsqueeze(1).expand(-1, T, -1, -1)
-
         # --- Time-varying conditions ---
 
         # Force: (B, T_raw, N, 6) → causal encoder → (B, T, N, d_force)
@@ -138,7 +133,7 @@ class SimConditionEmbedder(nn.Module):
 
         # --- Concatenate all ---
         c_sim = torch.cat(
-            [e_floor, e_id, e_mat, e_mass, e_static, e_force, e_init],
+            [e_floor, e_id, e_mat, e_mass, e_static, e_force],
             dim=-1,
         )  # (B, T, N, d_cond)
 

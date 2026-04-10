@@ -13,9 +13,10 @@ Two parallel DiT branches share information via Joint Attention during diffusion
 - **Video Branch**: Pre-trained `Wan2.1-Fun-V1.1-1.3B-InP` (30 blocks, dim=2048). Generates video latents from text + first-frame image.
 - **Simulation Branch**: Trained from scratch (10 blocks, dim=512). Generates physics trajectories (per-point positions + velocities) from physical conditions.
 
-Training is two-stage:
-1. **Stage 1**: Train SimDiT alone on physics trajectory data (no video branch)
-2. **Stage 2**: Joint training with LoRA on video branch + cross-modal Joint Attention
+Training is three-stage:
+0. **Stage 0**: Train a Causal AE for 4x temporal compression of raw states `(T_raw, 3) → (T, 16)`. Uses WAE-style training (MSE + MMD + smoothness + interpolation consistency) on synthesized data. After training, AE weights are frozen for all subsequent stages.
+1. **Stage 1**: Train SimDiT alone on physics trajectory data (no video branch). Uses frozen AE for encoding/decoding.
+2. **Stage 2**: Joint training with LoRA on video branch + cross-modal Joint Attention. Uses frozen AE.
 
 ## Environment
 
@@ -32,8 +33,14 @@ Install missing packages using `uv pip install`.
 # Original VideoX-Fun web UI (for reference)
 python examples/wan2.1_fun/app.py
 
+# PV-Simulator Stage 0: Train Causal AE
+accelerate launch --num_processes=1 scripts/pv_simulator/train_stage0.py \
+  --output_dir outputs/ae \
+  --max_steps 50000
+
 # PV-Simulator Stage 1 training (simulation branch only)
 accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
+  --ae_ckpt_dir outputs/ae/final \
   --ann_path /path/to/annotations.json \
   --data_root /path/to/sim_data \
   --output_dir outputs/stage1 \
@@ -41,6 +48,7 @@ accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
 
 # PV-Simulator Stage 2 training (joint MoT + LoRA)
 accelerate launch --num_processes=4 scripts/pv_simulator/train_stage2.py \
+  --ae_ckpt_dir outputs/ae/final \
   --stage1_ckpt outputs/stage1/final \
   --video_model_path /path/to/Wan2.1-Fun-V1.1-1.3B-InP \
   --ann_path /path/to/annotations.json \
@@ -57,16 +65,18 @@ There are **no automated tests** in this repository.
 
 | File | Purpose |
 |------|---------|
-| `videox_fun/models/sim_causal_encoder.py` | 4x causal temporal encoder/decoder (2-layer stride-2 CausalConv1d, mirrors wan_vae.py) |
-| `videox_fun/models/sim_condition.py` | `SimConditionEmbedder`: encodes physics conditions (floor, object ID, material, mass, static flag, force, initial state) |
+| `videox_fun/models/sim_ae.py` | `CausalAE`: 4x causal autoencoder for temporal compression `(T_raw, 3) → (T, 16)`; trained in Stage 0, frozen after |
+| `videox_fun/models/sim_causal_encoder.py` | Building blocks (CausalConv1d, ResidualBlock1d, CausalDownsample1d, CausalUpsample1d); used by `sim_ae.py` and `sim_condition.py` force encoder |
+| `videox_fun/models/sim_condition.py` | `SimConditionEmbedder`: encodes physics conditions (floor, object ID, material, mass, static flag, force) → d_cond=368 |
 | `videox_fun/models/sim_transformer.py` | `SimTransformer`: 10-block DiT for physics simulation (d=512, 8 heads) |
 | `videox_fun/models/joint_attention.py` | `JointAttention`: gated cross-modal attention between video and sim branches |
 | `videox_fun/models/mot_wrapper.py` | `MoTWrapper`: orchestrates paired forward pass of both branches |
 | `videox_fun/data/dataset_simulation.py` | `SimulationDataset`/`MoviSimulationDataset`: loads physics trajectory data; `sim_collate_fn` (bs=1) and `sim_collate_fn_padded` (bs>1 with zero-padding) |
-| `videox_fun/pipeline/pipeline_simulation.py` | Stage 1 inference: standalone sim branch denoising |
+| `videox_fun/pipeline/pipeline_simulation.py` | Stage 1 inference: standalone sim branch denoising with frozen AE |
 | `videox_fun/pipeline/pipeline_mot.py` | Stage 2 inference: joint video + sim denoising |
-| `scripts/pv_simulator/train_stage1.py` | Stage 1 training script (SimDiT only) |
-| `scripts/pv_simulator/train_stage2.py` | Stage 2 training script (joint MoT + LoRA) |
+| `scripts/pv_simulator/train_stage0.py` | Stage 0 training script: trains CausalAE on synthesized data |
+| `scripts/pv_simulator/train_stage1.py` | Stage 1 training script (SimDiT only, frozen AE) |
+| `scripts/pv_simulator/train_stage2.py` | Stage 2 training script (joint MoT + LoRA, frozen AE) |
 | `scripts/pv_simulator/infer_stage1.py` | Stage 1 inference script |
 | `scripts/pv_simulator/visualize.py` | Visualize point cloud motion |
 
@@ -83,9 +93,10 @@ There are **no automated tests** in this repository.
   - `valid_seq_mask (B, T*N)` bool: True for valid latent (t, n) pairs; used as additive attention key bias in DiT (padded tokens → −∞)
   - Loss uses a **raw-space mask** `(B, T_raw, N)` combining temporal and point validity; averaged only over valid positions
 - **max_objects=5**: Default cap on objects per scene (used in both modes).
-- **4x causal temporal compression**: Encoder compresses T_raw=4(T-1)+1 raw frames to T latent frames via 2 stride-2 causal conv layers (kernel=3). Matches video VAE's temporal compression ratio.
+- **4x causal AE (Stage 0)**: `CausalAE` encodes `(T_raw, 3) → (T, 16)` per pos/vel channel group via 2 stride-2 causal conv layers. Applied separately to pos(3) and vel(3) → concatenated d_state=64 (2×16×2). Frozen after Stage 0, used in all subsequent stages. Matches video VAE's 4× temporal compression ratio.
+- **Initial state conditioning**: First frame `x_s_raw[:, :1]` is encoded with the same frozen AE, zero-padded to T latent frames, and concatenated with a binary inpainting mask `(B, T, N, 1)` where 0=given (t=0) and 1=unknown. DiT `input_proj` takes `[x_enc, init_enc, init_mask, c_sim]` → `Linear(2×64+1+368=697, 512)`.
 - **Variable N**: Objects have different numbers of surface points N_i. All points are concatenated: N = ΣN_i. Per-object properties are expanded to per-point via `point_obj_idx` (gather-based, works in both modes).
-- **Flow matching diffusion**: Noise is added in **raw state space** `(B, T_raw, N, 6)`. The full denoising network is `Encoder → DiT → Decoder`, where the encoder/decoder act as temporal projection layers (not a VAE). Training target = `noise - x_s_raw` and loss is computed in raw space. At each inference step: `noisy_raw → encoder → DiT → decoder → velocity_raw → scheduler step in raw space`.
+- **Flow matching diffusion**: Noise is added in **raw state space** `(B, T_raw, N, 6)`. The full denoising network is `frozen AE Encoder → DiT → frozen AE Decoder`. Training target = `noise - x_s_raw` and loss is computed in raw space. At each inference step: `noisy_raw → AE encode → DiT → AE decode → velocity_raw → scheduler step in raw space`.
 
 ### Block Pairing (Video ↔ Sim)
 
@@ -138,7 +149,7 @@ Each sample is an `.npz` file with:
 | `c_mat` | `(n_obj, 2)` | (friction, restitution) per object |
 | `c_mass` | `(n_obj,)` | Mass per object |
 | `c_static` | `(n_obj,)` | Static flag (0 or 1) per object |
-| `c_init` | `(n_obj, 9)` | Initial pos+vel+ang_vel per object |
+| `c_init` | `(n_obj, 9)` | Initial pos+vel+ang_vel per object (legacy; model uses per-point `x_s_raw[:1]` via frozen AE instead) |
 | `point_obj_idx` | `(N,)` | Maps each point to its object index |
 
 Annotation JSON entries must have `file_path` (path to npz). Optional: `text`, `video_path` (for Stage 2).

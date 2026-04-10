@@ -8,6 +8,7 @@ Usage:
     # From a MOVI-AB sample directory (ground truth + inference):
     python scripts/pv_simulator/infer_stage1.py \
         --ckpt_dir outputs/stage1_test/final \
+        --ae_ckpt_dir outputs/ae/final \
         --data_dir datasets/movi_ab_10k/00000 \
         --output_dir outputs/stage1_test/infer \
         --num_inference_steps 50
@@ -15,6 +16,7 @@ Usage:
     # From a saved numpy array:
     python scripts/pv_simulator/infer_stage1.py \
         --ckpt_dir outputs/stage1_test/final \
+        --ae_ckpt_dir outputs/ae/final \
         --point_states_npy /path/to/states.npy \
         --point_obj_idx_npy /path/to/obj_idx.npy \
         --output_dir outputs/infer
@@ -85,9 +87,6 @@ def load_movi_sample(data_dir: str, temporal_compression_ratio: int = 4):
         c_init_state[obj_i, :3] = mi['positions'][0]
         c_init_state[obj_i, 3:6] = mi['velocities'][0]
 
-    c_init_mask = np.ones((n_objects, 1), dtype=np.float32)
-    c_init = np.concatenate([c_init_state, c_init_mask], axis=-1)   # (n_obj, 7)
-
     T_latent = k + 1
 
     return {
@@ -99,7 +98,7 @@ def load_movi_sample(data_dir: str, temporal_compression_ratio: int = 4):
         'c_mass': torch.from_numpy(c_mass).unsqueeze(0),              # (1, n_obj)
         'c_static': torch.zeros(1, n_objects, dtype=torch.long),      # (1, n_obj)
         'c_force_raw': torch.zeros(1, T_raw, N, 6),                   # (1, T_raw, N, 6)
-        'c_init': torch.from_numpy(c_init).unsqueeze(0),              # (1, n_obj, 7)
+        'x_s_init': torch.from_numpy(point_states[:1]).unsqueeze(0),  # (1, 1, N, 6)
         'point_obj_idx_batched': torch.from_numpy(point_obj_idx).unsqueeze(0),  # (1, N)
         'T_latent': T_latent,
         'T_raw': T_raw,
@@ -133,13 +132,15 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp32"])
+    # AE checkpoint (from Stage 0)
+    parser.add_argument("--ae_ckpt_dir", type=str, required=True,
+                        help="Path to Stage 0 CausalAE checkpoint directory")
     # Model architecture (must match the checkpoint)
-    parser.add_argument("--d_state", type=int, default=256)
+    parser.add_argument("--d_state", type=int, default=64)
     parser.add_argument("--d_sim", type=int, default=512)
     parser.add_argument("--sim_ffn_dim", type=int, default=2048)
     parser.add_argument("--sim_num_heads", type=int, default=8)
     parser.add_argument("--sim_num_layers", type=int, default=10)
-    parser.add_argument("--state_enc_mid", type=int, default=128)
     parser.add_argument("--max_objects", type=int, default=5)
     # Visualization
     parser.add_argument("--fps", type=int, default=10)
@@ -180,7 +181,7 @@ def main():
             'c_mass': torch.ones(1, n_objects),
             'c_static': torch.zeros(1, n_objects, dtype=torch.long),
             'c_force_raw': torch.zeros(1, T_raw, N, 6),
-            'c_init': torch.zeros(1, n_objects, 7),
+            'x_s_init': torch.from_numpy(point_states_np[:1]).unsqueeze(0),
             'point_obj_idx_batched': torch.from_numpy(point_obj_idx_np).unsqueeze(0),
             'T_latent': k + 1,
             'T_raw': T_raw,
@@ -199,6 +200,7 @@ def main():
     print(f"Loading checkpoint from {args.ckpt_dir} ...")
     pipeline = SimulationPipeline.from_pretrained(
         ckpt_dir=args.ckpt_dir,
+        ae_ckpt_dir=args.ae_ckpt_dir,
         device=args.device,
         dtype=dtype,
         max_objects=args.max_objects,
@@ -207,7 +209,6 @@ def main():
         sim_ffn_dim=args.sim_ffn_dim,
         sim_num_heads=args.sim_num_heads,
         sim_num_layers=args.sim_num_layers,
-        state_enc_mid=args.state_enc_mid,
     )
 
     # --- Run inference ---
@@ -220,7 +221,7 @@ def main():
         c_mass=sample['c_mass'],
         c_static=sample['c_static'],
         c_force_raw=sample['c_force_raw'],
-        c_init=sample['c_init'],
+        x_s_init=sample['x_s_init'],
         point_obj_idx=sample['point_obj_idx_batched'],
         T=T_latent,
         num_inference_steps=args.num_inference_steps,

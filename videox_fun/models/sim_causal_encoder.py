@@ -1,16 +1,14 @@
-# Causal Temporal Encoder/Decoder for PV-Simulator Simulation Branch.
-# Design mirrors wan_vae.py's Encoder3d/Decoder3d, adapted to 1D temporal convolutions.
+# Causal temporal building blocks and legacy encoder/decoder for PV-Simulator.
+# Building blocks (CausalConv1d, ResidualBlock1d, etc.) are reused by both:
+#   - CausalAE (sim_ae.py) for pre-trained state encoding (Stage 0+)
+#   - CausalTemporalEncoder below for force condition encoding (sim_condition.py)
+#
+# NOTE: For point-state encoding, use CausalAE from sim_ae.py instead of
+# CausalTemporalEncoder/Decoder below. The AE is pre-trained in Stage 0
+# and frozen for subsequent stages.
+#
 # 4x temporal compression via 2 layers of stride-2 causal conv (kernel=3).
-#
-# Math (encoder):
-#   T_raw = 4k+1 → T_latent = k+1
-#   Layer 1: 4k+1 → 2k+1
-#   Layer 2: 2k+1 → k+1
-#
-# Math (decoder):
-#   Layer 1: T → 2T (channel-doubling + interleave)
-#   Layer 2: 2T → 4T
-#   Trim to T_raw = 4k+1
+# Math: T_raw = 4k+1 → T_latent = k+1
 
 import torch
 import torch.nn as nn

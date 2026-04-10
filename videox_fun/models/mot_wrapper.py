@@ -19,7 +19,6 @@ from videox_fun.models.wan_transformer3d import (
     sinusoidal_embedding_1d,
 )
 from videox_fun.models.sim_transformer import SimTransformer
-from videox_fun.models.sim_causal_encoder import CausalTemporalEncoder, CausalTemporalDecoder
 from videox_fun.models.sim_condition import SimConditionEmbedder
 from videox_fun.models.joint_attention import JointAttention
 
@@ -37,15 +36,17 @@ class MoTWrapper(nn.Module):
     """Mixture-of-Transformers: wraps Video + Sim branches with JointAttention.
 
     Manages:
-    - Causal temporal encoder/decoder for point states
     - Condition embedding for physics properties
     - Interleaved block execution with joint attention at paired blocks
     - Bias scale scheduling for gradual attention transition
 
+    Note: The frozen CausalAE for state encoding/decoding is managed externally
+    (loaded in the training script) and not owned by this wrapper.
+
     Args:
         video_transformer: Pre-trained WanTransformer3DModel (frozen or LoRA-wrapped).
-        d_state: Encoded point state dimension.
-        d_cond: Condition embedding dimension (from SimConditionEmbedder).
+        d_state: Encoded point state dimension (AE pos+vel concat = 64).
+        d_cond: Condition embedding dimension (from SimConditionEmbedder = 368).
         d_sim: Simulation branch hidden dimension.
         sim_ffn_dim: Simulation branch FFN dimension.
         sim_num_heads: Simulation branch attention heads.
@@ -55,15 +56,14 @@ class MoTWrapper(nn.Module):
         init_gate: Initial gate value for JointAttention (sigmoid ≈ 0).
         pairing: Dict mapping video_block_idx → sim_block_idx.
         max_objects: Maximum number of objects per scene.
-        state_enc_mid: Intermediate channels for causal temporal encoder.
         force_enc_mid: Intermediate channels for force encoder.
     """
 
     def __init__(
         self,
         video_transformer: WanTransformer3DModel,
-        d_state: int = 256,
-        d_cond: int = 432,
+        d_state: int = 64,
+        d_cond: int = 368,
         d_sim: int = 512,
         sim_ffn_dim: int = 2048,
         sim_num_heads: int = 8,
@@ -73,7 +73,6 @@ class MoTWrapper(nn.Module):
         init_gate: float = -10.0,
         pairing: Optional[Dict[int, int]] = None,
         max_objects: int = 16,
-        state_enc_mid: int = 128,
         force_enc_mid: int = 128,
     ):
         super().__init__()
@@ -91,13 +90,8 @@ class MoTWrapper(nn.Module):
             num_layers=sim_num_layers,
         )
 
-        # Causal temporal encoder/decoder for point states
-        self.x_s_encoder = CausalTemporalEncoder(9, state_enc_mid, d_state)
-        self.x_s_decoder = CausalTemporalDecoder(d_state, state_enc_mid, 6)
-
         # Condition embedder
         self.sim_cond_embedder = SimConditionEmbedder(
-            d_cond=(d_cond - 0),  # SimConditionEmbedder computes d_cond internally
             max_objects=max_objects,
             force_encoder_mid=force_enc_mid,
         )
@@ -235,6 +229,8 @@ class MoTWrapper(nn.Module):
     def prepare_sim_inputs(
         self,
         noisy_x_s_enc: torch.Tensor,   # (1, T, N, d_state)
+        init_enc: torch.Tensor,         # (1, T, N, d_state) — zero-padded init frame encoding
+        init_mask: torch.Tensor,        # (1, T, N, 1) — 0 at t=0, 1 elsewhere
         c_sim: torch.Tensor,            # (1, T, N, d_cond)
         t: torch.Tensor,                # (1,) diffusion timestep
     ):
@@ -246,8 +242,8 @@ class MoTWrapper(nn.Module):
         """
         B, T, N, _ = noisy_x_s_enc.shape
 
-        # Concatenate and project
-        x = torch.cat([noisy_x_s_enc, c_sim], dim=-1)
+        # Concatenate state, init conditioning, mask, and conditions → project
+        x = torch.cat([noisy_x_s_enc, init_enc, init_mask, c_sim], dim=-1)
         x = self.sim.input_proj(x)
         sim_x = x.view(B, T * N, self.sim.d_sim)
 

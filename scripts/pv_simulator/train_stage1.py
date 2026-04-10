@@ -1,7 +1,8 @@
 """Stage 1 training for PV-Simulator: Simulation Branch only.
 
-Trains the SimTransformer + CausalTemporalEncoder/Decoder + SimConditionEmbedder
-on physics trajectory data using flow matching diffusion loss.
+Trains the SimTransformer + SimConditionEmbedder on physics trajectory data
+using flow matching diffusion loss. Uses a frozen CausalAE (pre-trained in
+Stage 0) for temporal encoding/decoding.
 
 No video branch is loaded. No Joint Attention is used.
 
@@ -10,6 +11,7 @@ Usage:
     accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
         --dataset_type movi \
         --data_root datasets/movi_ab_10k \
+        --ae_ckpt_dir outputs/ae/final \
         --output_dir outputs/stage1 \
         --gradient_accumulation_steps 8
 
@@ -18,6 +20,7 @@ Usage:
         --dataset_type simulation \
         --data_root /path/to/sim_data \
         --ann_path /path/to/annotations.json \
+        --ae_ckpt_dir outputs/ae/final \
         --output_dir outputs/stage1 \
         --gradient_accumulation_steps 8
 
@@ -63,7 +66,7 @@ from videox_fun.data.dataset_simulation import (MoviSimulationDataset,
                                                   SimulationDataset,
                                                   sim_collate_fn,
                                                   sim_collate_fn_padded)
-from videox_fun.models.sim_causal_encoder import CausalTemporalDecoder, CausalTemporalEncoder
+from videox_fun.models.sim_ae import CausalAE
 from videox_fun.models.sim_condition import SimConditionEmbedder
 from videox_fun.models.sim_transformer import SimTransformer
 from videox_fun.utils.discrete_sampler import DiscreteSampling
@@ -84,13 +87,17 @@ def parse_args():
     parser.add_argument("--data_root", type=str, default=None,
                         help="Root directory for data files or MOVI dataset root.")
 
+    # Pre-trained AE (from Stage 0)
+    parser.add_argument("--ae_ckpt_dir", type=str, required=True,
+                        help="Path to Stage 0 CausalAE checkpoint directory (e.g. outputs/ae/final)")
+
     # Model architecture
-    parser.add_argument("--d_state", type=int, default=256, help="Encoded point state dimension.")
+    parser.add_argument("--d_state", type=int, default=64,
+                        help="Encoded point state dimension (2 * AE d_latent for pos+vel concat).")
     parser.add_argument("--d_sim", type=int, default=512, help="SimTransformer hidden dimension.")
     parser.add_argument("--sim_ffn_dim", type=int, default=2048, help="SimTransformer FFN dimension.")
     parser.add_argument("--sim_num_heads", type=int, default=8, help="SimTransformer attention heads.")
     parser.add_argument("--sim_num_layers", type=int, default=10, help="SimTransformer blocks.")
-    parser.add_argument("--state_enc_mid", type=int, default=128, help="Causal encoder intermediate channels.")
     parser.add_argument("--max_objects", type=int, default=5, help="Maximum number of objects per scene.")
 
     # Training
@@ -160,7 +167,7 @@ def parse_args():
     return args
 
 
-def _run_vis(vis_samples, sim_transformer, x_s_encoder, x_s_decoder, sim_cond_embedder,
+def _run_vis(vis_samples, sim_transformer, ae, sim_cond_embedder,
              global_step, device, weight_dtype, num_inference_steps, fps):
     """Run inference on fixed samples, render GT+pred videos, and log to wandb.
 
@@ -180,8 +187,7 @@ def _run_vis(vis_samples, sim_transformer, x_s_encoder, x_s_decoder, sim_cond_em
 
     pipeline = SimulationPipeline(
         sim_transformer=sim_transformer,
-        x_s_encoder=x_s_encoder,
-        x_s_decoder=x_s_decoder,
+        ae=ae,
         sim_cond_embedder=sim_cond_embedder,
         scheduler=FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000),
     )
@@ -202,8 +208,8 @@ def _run_vis(vis_samples, sim_transformer, x_s_encoder, x_s_decoder, sim_cond_em
             c_mat         = _b(sample['c_mat'],          as_float=True)   # (1, n_objects, 2)
             c_mass        = _b(sample['c_mass'],         as_float=True)   # (1, n_objects)
             c_static      = _b(sample['c_static'])                        # (1, n_objects) int
-            c_init        = _b(sample['c_init'],         as_float=True)   # (1, n_objects, 7)
             point_obj_idx = _b(sample['point_obj_idx'])                   # (1, N) int
+            x_s_init      = x_s_raw[:, :1, :, :]                          # (1, 1, N, 6)
 
             T_raw = x_s_raw.shape[1]
             T = (T_raw - 1) // 4 + 1
@@ -211,7 +217,8 @@ def _run_vis(vis_samples, sim_transformer, x_s_encoder, x_s_decoder, sim_cond_em
             with torch.cuda.amp.autocast(dtype=weight_dtype):
                 result = pipeline(
                     c_floor=c_floor, c_id=c_id, c_mat=c_mat, c_mass=c_mass,
-                    c_static=c_static, c_force_raw=c_force_raw, c_init=c_init,
+                    c_static=c_static, c_force_raw=c_force_raw,
+                    x_s_init=x_s_init,
                     point_obj_idx=point_obj_idx, T=T,
                     num_inference_steps=num_inference_steps, show_progress=False,
                 )
@@ -270,13 +277,25 @@ def main():
     elif args.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
+    # --- Load frozen CausalAE (from Stage 0) ---
+    ae = CausalAE.load(args.ae_ckpt_dir)
+    ae.to(accelerator.device, dtype=weight_dtype)
+    ae.eval()
+    for p in ae.parameters():
+        p.requires_grad_(False)
+    d_latent = ae.d_latent
+    d_state_actual = 2 * d_latent  # pos + vel AE latents concatenated
+    if args.d_state != d_state_actual:
+        logger.warning(
+            f"--d_state={args.d_state} overridden to {d_state_actual} "
+            f"(2 * AE d_latent={d_latent})"
+        )
+        args.d_state = d_state_actual
+    logger.info(f"Loaded frozen CausalAE from {args.ae_ckpt_dir} (d_latent={d_latent})")
+
     # --- Build Models ---
     sim_cond_embedder = SimConditionEmbedder(max_objects=args.max_objects)
     d_cond = sim_cond_embedder.d_cond
-
-    # c_in=6: pos(3) + vel(3)
-    x_s_encoder = CausalTemporalEncoder(c_in=6, c_mid=args.state_enc_mid, d_out=args.d_state)
-    x_s_decoder = CausalTemporalDecoder(d_feat=args.d_state, c_mid=args.state_enc_mid, c_out=6)
 
     sim_transformer = SimTransformer(
         d_state=args.d_state,
@@ -289,15 +308,11 @@ def main():
 
     # Move to device
     sim_cond_embedder.to(accelerator.device, dtype=weight_dtype)
-    x_s_encoder.to(accelerator.device, dtype=weight_dtype)
-    x_s_decoder.to(accelerator.device, dtype=weight_dtype)
     sim_transformer.to(accelerator.device, dtype=weight_dtype)
 
     # Count parameters
     total_params = (
         sum(p.numel() for p in sim_transformer.parameters()) +
-        sum(p.numel() for p in x_s_encoder.parameters()) +
-        sum(p.numel() for p in x_s_decoder.parameters()) +
         sum(p.numel() for p in sim_cond_embedder.parameters())
     )
     logger.info(f"Total trainable parameters: {total_params:,}")
@@ -311,8 +326,6 @@ def main():
 
     trainable_params = (
         list(sim_transformer.parameters()) +
-        list(x_s_encoder.parameters()) +
-        list(x_s_decoder.parameters()) +
         list(sim_cond_embedder.parameters())
     )
 
@@ -376,9 +389,10 @@ def main():
 
     # --- Accelerate prepare ---
     # All trainable modules are wrapped so DDP syncs their gradients across GPUs.
-    (sim_transformer, x_s_encoder, x_s_decoder, sim_cond_embedder,
+    # AE is frozen and not wrapped (no gradient sync needed).
+    (sim_transformer, sim_cond_embedder,
      optimizer, train_dataloader, lr_scheduler) = accelerator.prepare(
-        sim_transformer, x_s_encoder, x_s_decoder, sim_cond_embedder,
+        sim_transformer, sim_cond_embedder,
         optimizer, train_dataloader, lr_scheduler,
     )
 
@@ -420,7 +434,7 @@ def main():
         accum_count = 0
 
         for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(sim_transformer, x_s_encoder, x_s_decoder, sim_cond_embedder):
+            with accelerator.accumulate(sim_transformer, sim_cond_embedder):
                 # --- Unpack batch ---
                 # Tensors have shape (B, ...) after collation
                 x_s_raw = batch['x_s_raw'].to(accelerator.device, dtype=weight_dtype)    # (B, T_raw, N, 6)
@@ -430,7 +444,6 @@ def main():
                 c_mat = batch['c_mat'].to(accelerator.device)                              # (B, n_objects, 2)
                 c_mass = batch['c_mass'].to(accelerator.device)                            # (B, n_objects,)
                 c_static = batch['c_static'].to(accelerator.device)                        # (B, n_objects,)
-                c_init = batch['c_init'].to(accelerator.device)                            # (B, n_objects, 7)
                 point_obj_idx = batch['point_obj_idx'].to(accelerator.device)              # (B, N)
 
                 # Padded batch mode: masks and per-sample T_raw
@@ -477,9 +490,26 @@ def main():
                 # Flow matching target (raw space): velocity = noise - x
                 target = noise - x_s_raw
 
-                # --- Encode noisy raw data → latent ---
-                noisy_enc = x_s_encoder(noisy_x_s_raw)  # (B, T, N, d_state)
+                # --- Encode noisy raw data → latent via frozen AE ---
+                with torch.no_grad():
+                    noisy_pos_enc = ae.encode(noisy_x_s_raw[..., :3])   # (B, T, N, d_latent)
+                    noisy_vel_enc = ae.encode(noisy_x_s_raw[..., 3:6])  # (B, T, N, d_latent)
+                noisy_enc = torch.cat([noisy_pos_enc, noisy_vel_enc], dim=-1)  # (B, T, N, d_state)
                 T = noisy_enc.shape[1]
+
+                # --- Initial frame conditioning via frozen AE ---
+                with torch.no_grad():
+                    init_pos_enc = ae.encode(x_s_raw[:, :1, :, :3])     # (B, 1, N, d_latent)
+                    init_vel_enc = ae.encode(x_s_raw[:, :1, :, 3:6])    # (B, 1, N, d_latent)
+                init_enc_1 = torch.cat([init_pos_enc, init_vel_enc], dim=-1)  # (B, 1, N, d_state)
+                init_enc_padded = torch.cat([
+                    init_enc_1,
+                    torch.zeros(B_sz, T - 1, N_sz, args.d_state,
+                                device=accelerator.device, dtype=weight_dtype),
+                ], dim=1)                                                 # (B, T, N, d_state)
+                init_mask = torch.ones(B_sz, T, N_sz, 1,
+                                       device=accelerator.device, dtype=weight_dtype)
+                init_mask[:, 0, :, :] = 0.0  # first latent frame is given
 
                 # --- Build valid sequence mask for DiT attention (padded batch mode) ---
                 if args.padded_batch:
@@ -487,7 +517,7 @@ def main():
                     t_idx = torch.arange(T, device=accelerator.device).unsqueeze(0)  # (1, T)
                     t_valid = t_idx < t_latent.unsqueeze(1)   # (B, T)
                     latent_seq_mask = t_valid.unsqueeze(2) & point_mask.unsqueeze(1)
-                    valid_seq_mask = latent_seq_mask.view(B_sz, T * noisy_enc.shape[2])
+                    valid_seq_mask = latent_seq_mask.view(B_sz, T * N_sz)
                 else:
                     valid_seq_mask = None
 
@@ -499,7 +529,6 @@ def main():
                     c_mass=c_mass,
                     c_static=c_static,
                     c_force_raw=c_force_raw,
-                    c_init=c_init,
                     point_obj_idx=point_obj_idx,
                     T=T,
                     point_mask=point_mask,
@@ -507,9 +536,15 @@ def main():
 
                 # --- Forward pass: DiT in latent space, then decode to raw ---
                 with torch.cuda.amp.autocast(dtype=weight_dtype):
-                    pred_enc = sim_transformer(noisy_enc, c_sim, timesteps, dtype=weight_dtype,
-                                              valid_seq_mask=valid_seq_mask)
-                    pred_raw = x_s_decoder(pred_enc, T_raw_dim)  # (B, T_raw, N, 6)
+                    pred_enc = sim_transformer(
+                        noisy_enc, init_enc_padded, init_mask, c_sim, timesteps,
+                        dtype=weight_dtype, valid_seq_mask=valid_seq_mask,
+                    )
+                    # Decode pos/vel separately via frozen AE
+                    with torch.no_grad():
+                        pred_pos_raw = ae.decode(pred_enc[..., :d_latent], T_raw_dim)
+                        pred_vel_raw = ae.decode(pred_enc[..., d_latent:], T_raw_dim)
+                    pred_raw = torch.cat([pred_pos_raw, pred_vel_raw], dim=-1)  # (B, T_raw, N, 6)
 
                 # --- Loss computation (raw space) ---
                 weighting = compute_loss_weighting_for_sd3(
@@ -558,16 +593,12 @@ def main():
                     and len(vis_samples) > 0
                 ):
                     unwrapped_sim = accelerator.unwrap_model(sim_transformer)
-                    unwrapped_enc = accelerator.unwrap_model(x_s_encoder)
-                    unwrapped_dec = accelerator.unwrap_model(x_s_decoder)
                     unwrapped_cond = accelerator.unwrap_model(sim_cond_embedder)
                     unwrapped_sim.eval()
-                    unwrapped_enc.eval()
-                    unwrapped_dec.eval()
                     unwrapped_cond.eval()
                     try:
                         _run_vis(
-                            vis_samples, unwrapped_sim, unwrapped_enc, unwrapped_dec, unwrapped_cond,
+                            vis_samples, unwrapped_sim, ae, unwrapped_cond,
                             global_step, accelerator.device, weight_dtype,
                             args.vis_num_inference_steps, args.vis_fps,
                         )
@@ -575,8 +606,6 @@ def main():
                         logger.warning(f"Visualization failed at step {global_step}: {e}")
                     finally:
                         unwrapped_sim.train()
-                        unwrapped_enc.train()
-                        unwrapped_dec.train()
                         unwrapped_cond.train()
 
                 if global_step % args.checkpointing_steps == 0:
@@ -593,16 +622,12 @@ def main():
                                 for removing_checkpoint in checkpoints[:num_to_remove]:
                                     shutil.rmtree(os.path.join(args.output_dir, removing_checkpoint))
 
-                        # Save all sim components (unwrap DDP wrappers)
+                        # Save trainable sim components (unwrap DDP wrappers)
                         save_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         os.makedirs(save_dir, exist_ok=True)
 
                         torch.save(accelerator.unwrap_model(sim_transformer).state_dict(),
                                    os.path.join(save_dir, "sim_transformer.pt"))
-                        torch.save(accelerator.unwrap_model(x_s_encoder).state_dict(),
-                                   os.path.join(save_dir, "x_s_encoder.pt"))
-                        torch.save(accelerator.unwrap_model(x_s_decoder).state_dict(),
-                                   os.path.join(save_dir, "x_s_decoder.pt"))
                         torch.save(accelerator.unwrap_model(sim_cond_embedder).state_dict(),
                                    os.path.join(save_dir, "sim_cond_embedder.pt"))
                         logger.info(f"Saved checkpoint to {save_dir}")
@@ -626,10 +651,6 @@ def main():
         os.makedirs(save_dir, exist_ok=True)
         torch.save(accelerator.unwrap_model(sim_transformer).state_dict(),
                    os.path.join(save_dir, "sim_transformer.pt"))
-        torch.save(accelerator.unwrap_model(x_s_encoder).state_dict(),
-                   os.path.join(save_dir, "x_s_encoder.pt"))
-        torch.save(accelerator.unwrap_model(x_s_decoder).state_dict(),
-                   os.path.join(save_dir, "x_s_decoder.pt"))
         torch.save(accelerator.unwrap_model(sim_cond_embedder).state_dict(),
                    os.path.join(save_dir, "sim_cond_embedder.pt"))
         logger.info(f"Saved final model to {save_dir}")

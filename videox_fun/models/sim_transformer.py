@@ -2,8 +2,9 @@
 # 10-block Transformer with self-attention + FFN, timestep modulation.
 # No cross-attention (text conditioning is only in the video branch).
 #
-# Input: encoded point states (B, T, N, d_state) + conditions (B, T, N, d_cond)
-# Output: predicted noise in latent space (B, T, N, d_state)
+# Input: encoded point states (B, T, N, d_state) + init_enc (B, T, N, d_state)
+#        + init_mask (B, T, N, 1) + conditions (B, T, N, d_cond)
+# Output: predicted value in latent space (B, T, N, d_state)
 
 from typing import Optional
 
@@ -142,14 +143,16 @@ class SimAttentionBlock(nn.Module):
 class SimTransformer(nn.Module):
     """Simulation DiT: 10-block Transformer for physics trajectory denoising.
 
-    Input: encoded point states x_s_enc (B, T, N, d_state) concatenated with
-    conditions c_sim (B, T, N, d_cond), projected to hidden dim d_sim.
+    Input: encoded noisy states x_enc (B, T, N, d_state), initial frame
+    encoding init_enc (B, T, N, d_state) zero-padded beyond t=0, inpainting
+    mask init_mask (B, T, N, 1) with 0=given/1=unknown, and conditions
+    c_sim (B, T, N, d_cond). All concatenated and projected to hidden dim.
 
     Output: predicted value in latent space (B, T, N, d_state).
 
     Args:
-        d_state: Dimension of encoded point states.
-        d_cond: Dimension of condition embedding.
+        d_state: Dimension of encoded point states (AE pos+vel concat = 64).
+        d_cond: Dimension of condition embedding (368).
         d_sim: Hidden dimension of the transformer.
         ffn_dim: FFN intermediate dimension.
         num_heads: Number of attention heads.
@@ -161,8 +164,8 @@ class SimTransformer(nn.Module):
 
     def __init__(
         self,
-        d_state: int = 256,
-        d_cond: int = 432,
+        d_state: int = 64,
+        d_cond: int = 368,
         d_sim: int = 512,
         ffn_dim: int = 2048,
         num_heads: int = 8,
@@ -178,8 +181,9 @@ class SimTransformer(nn.Module):
         self.num_layers = num_layers
         self.freq_dim = freq_dim
 
-        # Input projection: [d_state + d_cond] → d_sim
-        self.input_proj = nn.Linear(d_state + d_cond, d_sim)
+        # Input projection: [x_enc | init_enc | init_mask | c_sim] → d_sim
+        # = 2 * d_state + 1 + d_cond
+        self.input_proj = nn.Linear(2 * d_state + 1 + d_cond, d_sim)
 
         # Timestep embedding (same pattern as WanTransformer3DModel)
         self.time_embedding = nn.Sequential(
@@ -209,11 +213,13 @@ class SimTransformer(nn.Module):
         nn.init.zeros_(self.head_proj.weight)
         nn.init.zeros_(self.head_proj.bias)
 
-    def forward(self, x_enc, c_sim, t, dtype=torch.bfloat16,
+    def forward(self, x_enc, init_enc, init_mask, c_sim, t, dtype=torch.bfloat16,
                 valid_seq_mask: Optional[torch.Tensor] = None):
         """
         Args:
-            x_enc: (B, T, N, d_state) — encoded noisy point states.
+            x_enc: (B, T, N, d_state) — AE-encoded noisy point states.
+            init_enc: (B, T, N, d_state) — AE-encoded initial frame, zero-padded beyond t=0.
+            init_mask: (B, T, N, 1) — 0 at t=0 (given frame), 1 elsewhere.
             c_sim: (B, T, N, d_cond) — condition embeddings.
             t: (B,) — diffusion timestep.
             dtype: Compute dtype for attention.
@@ -225,8 +231,8 @@ class SimTransformer(nn.Module):
         """
         B, T, N, _ = x_enc.shape
 
-        # Concatenate state and conditions, project to hidden dim
-        x = torch.cat([x_enc, c_sim], dim=-1)  # (B, T, N, d_state + d_cond)
+        # Concatenate state, init conditioning, mask, and conditions → project
+        x = torch.cat([x_enc, init_enc, init_mask, c_sim], dim=-1)  # (B, T, N, 2*d_state+1+d_cond)
         x = self.input_proj(x)                   # (B, T, N, d_sim)
         x = x.view(B, T * N, self.d_sim)         # (B, T*N, d_sim)
 

@@ -1,6 +1,6 @@
 # PV-Simulator: Usage Instructions
 
-PV-Simulator extends VideoX-Fun with a **Simulation Branch** (SimDiT) that generates physically plausible object trajectories. Training is two-stage: Stage 1 trains the simulation branch alone on physics trajectory data; Stage 2 (not yet complete) trains both branches jointly with cross-modal Joint Attention.
+PV-Simulator extends VideoX-Fun with a **Simulation Branch** (SimDiT) that generates physically plausible object trajectories. Training is three-stage: Stage 0 trains a Causal AE for temporal compression (then frozen); Stage 1 trains the simulation branch alone on physics trajectory data using the frozen AE; Stage 2 (not yet complete) trains both branches jointly with cross-modal Joint Attention.
 
 ## Environment
 
@@ -51,21 +51,82 @@ NPZ keys:
 | `c_mat`        | `(n_obj, 2)`      | (friction, restitution) per object     |
 | `c_mass`       | `(n_obj,)`        | Mass per object                        |
 | `c_static`     | `(n_obj,)`        | Static flag (0 or 1) per object        |
-| `c_init`       | `(n_obj, 6)`      | Initial pos(3) + vel(3) per object     |
+| `c_init`       | `(n_obj, 6)`      | Initial pos(3) + vel(3) per object (legacy; model uses per-point `x_s_raw[:1]` via frozen AE) |
 | `point_obj_idx`| `(N,)`            | Maps each point to its object index    |
 
 `T_raw` must satisfy `T_raw = 4k+1` (e.g. 5, 9, 13, 17, 21, 25, ...).
 
 ---
 
+## Stage 0: Causal AE Training
+
+Trains a lightweight Causal Autoencoder (`CausalAE`) for 4× temporal compression of 3D trajectories: `(T_raw, 3) → (T, 16)`. Uses synthesized random data (no real physics data needed). After training, AE weights are frozen and used in all subsequent stages.
+
+The AE is applied separately to position(3) and velocity(3) channels, producing concatenated latents of dimension 64 (2×16×2) per point.
+
+```bash
+# Single GPU (sufficient — AE is small ~200K params)
+python scripts/pv_simulator/train_stage0.py \
+    --output_dir outputs/ae \
+    --max_train_steps 50000 \
+    --batch_size 256 \
+    --lr 3e-4
+
+# Multi-GPU (optional)
+accelerate launch --num_processes=4 scripts/pv_simulator/train_stage0.py \
+    --output_dir outputs/ae \
+    --max_train_steps 50000
+```
+
+### Key training arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--output_dir` | `outputs/ae` | Checkpoint output directory |
+| `--max_train_steps` | 50000 | Total training steps |
+| `--batch_size` | 256 | Batch size (trajectories per step) |
+| `--n_pts` | 64 | Points per trajectory (batch axis) |
+| `--lr` | 3e-4 | Peak learning rate (cosine decay to 0) |
+| `--lambda_mmd` | 0.1 | WAE-MMD regularization weight |
+| `--lambda_smooth` | 0.01 | Temporal smoothness weight |
+| `--lambda_interp` | 0.1 | Linear interpolation consistency weight |
+| `--d_latent` | 16 | Latent dimension per channel group |
+| `--c_mid` | 64 | Intermediate channels in encoder/decoder |
+
+### Checkpoint layout
+
+```
+outputs/ae/
+  checkpoint-10000/
+    causal_ae.pt
+    config.pt
+  final/
+    causal_ae.pt
+    config.pt
+```
+
+### Verification
+
+```python
+from videox_fun.models.sim_ae import CausalAE
+ae = CausalAE.load("outputs/ae/final")
+x = torch.randn(2, 21, 50, 3) * 5
+x_hat, z = ae(x)
+assert x_hat.shape == x.shape        # (2, 21, 50, 3)
+assert z.shape == (2, 6, 50, 16)     # T=(21-1)//4+1=6
+```
+
+---
+
 ## Stage 1 Training (Simulation Branch Only)
 
-Trains the full denoising network (`CausalTemporalEncoder` → `SimTransformer` → `CausalTemporalDecoder`) + `SimConditionEmbedder` using flow matching diffusion. Noise is added and loss is computed in **raw state space** `(T_raw, N, 6)`; the encoder/decoder act as temporal projection layers around the latent-space DiT.
+Trains `SimTransformer` + `SimConditionEmbedder` using flow matching diffusion with a frozen `CausalAE` for encoding/decoding. Noise is added and loss is computed in **raw state space** `(T_raw, N, 6)`; the frozen AE provides temporal compression around the latent-space DiT.
 
 ### Single GPU (smoke test)
 
 ```bash
 python scripts/pv_simulator/train_stage1.py \
+    --ae_ckpt_dir outputs/ae/final \
     --dataset_type movi \
     --data_root datasets/movi_ab_10k \
     --output_dir outputs/stage1 \
@@ -81,6 +142,7 @@ python scripts/pv_simulator/train_stage1.py \
 
 ```bash
 accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
+    --ae_ckpt_dir outputs/ae/final \
     --dataset_type movi \
     --data_root datasets/movi_ab_10k \
     --output_dir outputs/stage1 \
@@ -98,6 +160,7 @@ Effective batch size = `num_processes × train_batch_size × gradient_accumulati
 
 ```bash
 accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
+    --ae_ckpt_dir outputs/ae/final \
     --dataset_type simulation \
     --ann_path /path/to/annotations.json \
     --data_root /path/to/sim_data \
@@ -121,7 +184,8 @@ accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
 | `--lr_warmup_steps` | 1000 | Linear warmup steps |
 | `--mixed_precision` | `bf16` | `bf16`, `fp16`, or `no` |
 | `--checkpointing_steps` | 5000 | Save a checkpoint every N global steps |
-| `--d_state` | 256 | Encoded point state dimension |
+| `--ae_ckpt_dir` | — | **Required.** Path to Stage 0 CausalAE checkpoint directory |
+| `--d_state` | 64 | Encoded point state dimension (2×d_latent, auto-corrected from AE) |
 | `--d_sim` | 512 | SimTransformer hidden dimension |
 | `--sim_num_layers` | 10 | Number of transformer blocks |
 | `--padded_batch` | off | Enable padded batch mode (allows `--train_batch_size > 1`) |
@@ -141,6 +205,7 @@ Pass `--report_to wandb` to switch from TensorBoard to wandb. Both `train_loss` 
 
 ```bash
 accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
+    --ae_ckpt_dir outputs/ae/final \
     --dataset_type movi \
     --data_root datasets/movi_ab_10k \
     --output_dir outputs/stage1 \
@@ -160,6 +225,7 @@ By default, each sample has variable `T_raw`, `n_objects`, and `N` (total points
 
 ```bash
 accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
+    --ae_ckpt_dir outputs/ae/final \
     --dataset_type movi \
     --data_root datasets/movi_ab_10k \
     --output_dir outputs/stage1_padded \
@@ -188,12 +254,10 @@ accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
 outputs/stage1/
   checkpoint-5000/
     sim_transformer.pt
-    x_s_encoder.pt
-    x_s_decoder.pt
     sim_cond_embedder.pt
   final/
     sim_transformer.pt
-    ...
+    sim_cond_embedder.pt
 ```
 
 ---
@@ -205,6 +269,7 @@ Run the trained SimTransformer to generate physics trajectories from pure noise,
 ```bash
 python scripts/pv_simulator/infer_stage1.py \
     --ckpt_dir outputs/stage1/final \
+    --ae_ckpt_dir outputs/ae/final \
     --data_dir datasets/movi_ab_10k/00000 \
     --output_dir outputs/infer/00000 \
     --num_inference_steps 50
@@ -219,6 +284,7 @@ This produces:
 ```bash
 python scripts/pv_simulator/infer_stage1.py \
     --ckpt_dir outputs/stage1/final \
+    --ae_ckpt_dir outputs/ae/final \
     --point_states_npy /path/to/states.npy \
     --point_obj_idx_npy /path/to/obj_idx.npy \
     --output_dir outputs/infer/custom
@@ -228,7 +294,8 @@ python scripts/pv_simulator/infer_stage1.py \
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--ckpt_dir` | — | **Required.** Path to checkpoint directory |
+| `--ckpt_dir` | — | **Required.** Path to Stage 1 checkpoint directory |
+| `--ae_ckpt_dir` | — | **Required.** Path to Stage 0 CausalAE checkpoint directory |
 | `--data_dir` | — | MOVI-AB sample dir (mutually exclusive with `--point_states_npy`) |
 | `--point_states_npy` | — | Ground truth states `.npy` (T_raw, N, 6) |
 | `--point_obj_idx_npy` | — | Object index `.npy` (N,) — optional with npy input |
@@ -248,6 +315,7 @@ from videox_fun.pipeline.pipeline_simulation import SimulationPipeline
 
 pipeline = SimulationPipeline.from_pretrained(
     ckpt_dir="outputs/stage1/final",
+    ae_ckpt_dir="outputs/ae/final",
     device="cuda",
     dtype=torch.bfloat16,
 )
@@ -260,7 +328,7 @@ result = pipeline(
     c_mass=torch.tensor([[1.0, 2.0]]),                    # (B, n_objects)
     c_static=torch.tensor([[0, 0]]),                      # (B, n_objects)
     c_force_raw=torch.zeros(1, 21, 400, 6),               # (B, T_raw, N, 6)
-    c_init=torch.zeros(1, 2, 7),                          # (B, n_objects, 7) pos+vel+mask
+    x_s_init=torch.randn(1, 1, 400, 6),                   # (B, 1, N, 6) first frame
     point_obj_idx=torch.zeros(1, 400, dtype=torch.long),  # (B, N)
     T=6,                                                   # latent frames (T_raw=4*(T-1)+1)
     num_inference_steps=50,
@@ -329,28 +397,31 @@ visualize_point_cloud_motion(
 
 | Component | File | Role |
 |-----------|------|------|
-| `CausalTemporalEncoder` | `videox_fun/models/sim_causal_encoder.py` | Projects `(B, T_raw, N, 6)` → `(B, T, N, d_state)` via 2× stride-2 causal conv |
-| `CausalTemporalDecoder` | `videox_fun/models/sim_causal_encoder.py` | Projects `(B, T, N, d_state)` → `(B, T_raw, N, 6)` |
-| `SimConditionEmbedder` | `videox_fun/models/sim_condition.py` | Encodes floor, object ID, material, mass, static flag, force, init state → `(B, T, N, d_cond)` |
-| `SimTransformer` | `videox_fun/models/sim_transformer.py` | 10-block DiT; denoises in latent space |
+| `CausalAE` | `videox_fun/models/sim_ae.py` | Frozen 4× causal autoencoder: `(T_raw, 3) → (T, 16)` per channel group; trained in Stage 0 |
+| `SimConditionEmbedder` | `videox_fun/models/sim_condition.py` | Encodes floor, object ID, material, mass, static flag, force → `(B, T, N, 368)` |
+| `SimTransformer` | `videox_fun/models/sim_transformer.py` | 10-block DiT; denoises in latent space with init conditioning |
 | `SimulationDataset` | `videox_fun/data/dataset_simulation.py` | Loads custom NPZ format |
 | `MoviSimulationDataset` | `videox_fun/data/dataset_simulation.py` | Loads MOVI-AB directory format |
-| `SimulationPipeline` | `videox_fun/pipeline/pipeline_simulation.py` | Stage 1 inference: Encoder→DiT→Decoder denoising in raw space |
+| `SimulationPipeline` | `videox_fun/pipeline/pipeline_simulation.py` | Stage 1 inference: frozen AE Encoder→DiT→frozen AE Decoder denoising |
 
-The full denoising network is `Encoder → SimTransformer → Decoder`. Diffusion noise and scheduler steps operate in **raw state space** `(B, T_raw, N, 6)`. The encoder/decoder serve as temporal projection layers (4× compression/expansion), not a VAE.
+The full denoising network is `frozen AE Encoder → SimTransformer → frozen AE Decoder`. Diffusion noise and scheduler steps operate in **raw state space** `(B, T_raw, N, 6)`. The AE provides 4× temporal compression, applied separately to pos(3) and vel(3) channels → d_state=64 concatenated latents.
 
 ### Temporal compression
 
-The causal encoder does `T_raw = 4k+1 → T_latent = k+1` (e.g. T_raw=21 → T=6). This matches the video VAE's 4× temporal compression ratio, keeping the two branches in sync for Stage 2 joint training.
+The frozen `CausalAE` (Stage 0) does `T_raw = 4k+1 → T_latent = k+1` (e.g. T_raw=21 → T=6). Applied separately to pos(3) and vel(3) → concatenated d_state=64. This matches the video VAE's 4× temporal compression ratio, keeping the two branches in sync for Stage 2 joint training.
 
 ```
-Encoder:  [4k+1] --stride2--> [2k+1] --stride2--> [k+1]
-Decoder:  [k+1]  --upsample--> [2k+1] --upsample--> [4k+1] --trim--> [T_raw]
+AE Encoder:  [4k+1] --stride2--> [2k+1] --stride2--> [k+1]   (3 → 16 channels)
+AE Decoder:  [k+1]  --upsample--> [2k+1] --upsample--> [4k+1] --trim--> [T_raw]  (16 → 3 channels)
 ```
+
+### Initial state conditioning
+
+The first raw frame `x_s_raw[:, :1]` is encoded with the same frozen AE (pos/vel separately → 64 dims), zero-padded to T latent frames, and concatenated with a binary mask `(B, T, N, 1)` where 0=given (t=0) and 1=unknown. The DiT `input_proj` takes `[x_enc(64), init_enc(64), init_mask(1), c_sim(368)] = 697 → 512`.
 
 ### Point state representation
 
 - **Per-point**: `(x, y, z, vx, vy, vz)` — 6D position + velocity
-- **Per-object**: `c_init = (x0, y0, z0, vx0, vy0, vz0, mask)` — 7D initial state + validity mask
+- **Initial frame conditioning**: per-point first frame encoded via frozen AE (replaces old per-object `c_init`)
 - **N points** total = sum of surface and volume samples across all objects
 - `point_obj_idx: (N,)` maps each point to its object index `[0, n_objects)`

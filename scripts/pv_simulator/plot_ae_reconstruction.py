@@ -37,6 +37,7 @@ CATEGORY_MAP = {
     "gen_exponential_decay": "smooth",
     "gen_bounce": "sharp",
     "gen_smooth_then_sharp": "sharp",
+    "gen_sudden_stop": "sharp",
     "gen_piecewise_linear": "sharp",
     "gen_piecewise_constant": "sharp",
     "gen_sparse_impulse": "sparse",

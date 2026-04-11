@@ -45,6 +45,7 @@ GENERATOR_CATEGORIES = {
     # Sharp / discontinuous — contact forces, collisions
     "gen_bounce":             "sharp",
     "gen_smooth_then_sharp":  "sharp",
+    "gen_sudden_stop":        "sharp",
     "gen_piecewise_linear":   "sharp",
     "gen_piecewise_constant": "sharp",
     # Sparse / intermittent — force vectors, contact points

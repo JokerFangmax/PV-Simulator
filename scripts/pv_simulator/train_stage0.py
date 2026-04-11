@@ -65,10 +65,10 @@ logger = get_logger(__name__, log_level="INFO")
 # Time convention: T_raw frames captured at FPS=12 Hz.
 # All generators use REAL time in seconds: t = frame_index / FPS.
 # Physical scales for a table-top rigid-body simulation (MOVI-AB style):
-#   positions:     ~[-2, 2] m
-#   velocities:    ~[-4, 4] m/s
+#   positions:     ~[-5, 5] m
+#   velocities:    ~[-5, 5] m/s
 #   accelerations: ~[-15, 15] m/s²  (gravity ≈ 9.8 m/s²)
-#   frequencies:   0.5 – 4 Hz
+#   frequencies:   0.1 – 10 Hz
 
 FPS = 12.0   # capture frame rate (frames per second)
 
@@ -83,56 +83,79 @@ def _time_grid(B, T_raw, N, c_in, device):
 
 
 def gen_gaussian_noise(B, T_raw, N, c_in, device):
-    """Pure i.i.d. Gaussian noise — baseline, stress-tests reconstruction."""
-    std = torch.empty(B, 1, 1, 1, device=device).uniform_(0.05, 1.0)
+    """Pure i.i.d. Gaussian noise — baseline, stress-tests reconstruction.
+
+    Range: ~[-15, 15]
+      std ~ U(0.01, 7.5), worst case std=7.5 → 2·std = 15.
+    """
+    std = torch.empty(B, 1, 1, 1, device=device).uniform_(0.01, 7.5)
     return torch.randn(B, T_raw, N, c_in, device=device) * std
 
 
 def gen_stationary(B, T_raw, N, c_in, device):
-    """Near-constant signal with tiny sensor jitter — objects at rest."""
-    offset = torch.randn(B, 1, N, c_in, device=device) * 1.0   # ±1 m position
+    """Near-constant signal with tiny sensor jitter — objects at rest.
+
+    Range: ~[-15, 15]
+      offset = N(0,7.5) → ±15; jitter = N(0,0.01) → ±0.02 (negligible).
+    """
+    offset = torch.randn(B, 1, N, c_in, device=device) * 7.5   # ±7.5 m position
     jitter = torch.randn(B, T_raw, N, c_in, device=device) * 0.01  # 1 cm jitter
     return offset + jitter
 
 
 def gen_constant_velocity(B, T_raw, N, c_in, device):
-    """Linear trajectories x(t) = x0 + v*t — uniform motion."""
+    """Linear trajectories x(t) = x0 + v*t — uniform motion.
+
+    Range: ~[-27, 27]
+      x0 = N(0,5) → ±10; v·t_max = N(0,5)·1.67 → ±16.7; total ±26.7.
+    """
     t = _time_grid(B, T_raw, N, c_in, device)
-    x0 = torch.randn(B, 1, N, c_in, device=device) * 1.0   # ±1 m
-    v = torch.randn(B, 1, N, c_in, device=device) * 2.0    # ±2 m/s
+    x0 = torch.randn(B, 1, N, c_in, device=device) * 5.0   # ±5 m
+    v = torch.randn(B, 1, N, c_in, device=device) * 5.0    # ±5 m/s
     return x0 + v * t
 
 
 def gen_ballistic(B, T_raw, N, c_in, device):
     """Parabolic trajectories x(t) = x0 + v0*t + 0.5*a*t² — gravity/throws.
 
-    3σ range at T_raw=21 (t=1.667s): 0.9 + 5.5 + 11.3 ≈ ±28.2.
+    Range: ~[-41, 41]
+      x0=N(0,5)→±10; v0·t_max→±16.7; 0.5·a·t_max²=0.5·N(0,5)·1.67²→±13.9;
+      total ±40.6.
     """
     t = _time_grid(B, T_raw, N, c_in, device)
-    x0 = torch.randn(B, 1, N, c_in, device=device) * 0.5   # ±0.5 m
-    v0 = torch.randn(B, 1, N, c_in, device=device) * 2.0   # ±2 m/s
-    a  = torch.randn(B, 1, N, c_in, device=device) * 4.0   # ±4 m/s² (gravity ~9.8)
+    x0 = torch.randn(B, 1, N, c_in, device=device) * 5.0   # ±5 m
+    v0 = torch.randn(B, 1, N, c_in, device=device) * 5.0   # ±5 m/s
+    a  = torch.randn(B, 1, N, c_in, device=device) * 5.0   # ±5 m/s² (gravity ~9.8)
     return x0 + v0 * t + 0.5 * a * t ** 2
 
 
 def gen_sinusoidal(B, T_raw, N, c_in, device):
-    """Sinusoidal oscillation — springs, vibrations, periodic motion."""
+    """Sinusoidal oscillation — springs, vibrations, periodic motion.
+
+    Range: ~[-20, 20]
+      offset = N(0,5) → ±10; amp·sin = N(0,5)·[-1,1] → ±10; total ±20.
+    """
     t = _time_grid(B, T_raw, N, c_in, device)
-    amp = torch.empty(B, 1, N, c_in, device=device).uniform_(0.05, 1.0)  # 5 cm – 1 m
-    freq = torch.empty(B, 1, N, c_in, device=device).uniform_(0.5, 4.0)  # 0.5–4 Hz
+    amp = torch.randn(B, 1, N, c_in, device=device) * 5.0   # ±5 m
+    freq = torch.empty(B, 1, N, c_in, device=device).uniform_(0.1, 10.0)  # 0.1–10 Hz
     phase = torch.empty(B, 1, N, c_in, device=device).uniform_(0, 2 * math.pi)
-    offset = torch.randn(B, 1, N, c_in, device=device) * 0.5
+    offset = torch.randn(B, 1, N, c_in, device=device) * 5.0   # ±5 m
     return offset + amp * torch.sin(2 * math.pi * freq * t + phase)
 
 
 def gen_damped_oscillation(B, T_raw, N, c_in, device):
-    """Exponentially damped sinusoid — friction, energy dissipation."""
+    """Exponentially damped sinusoid — friction, energy dissipation.
+
+    Range: ~[-20, 20]
+      offset = N(0,5) → ±10; amp·exp(−decay·t)·sin ≤ |amp| at t=0 → ±10;
+      exp decay only reduces amplitude over time; total ±20.
+    """
     t = _time_grid(B, T_raw, N, c_in, device)
-    amp = torch.empty(B, 1, N, c_in, device=device).uniform_(0.1, 1.5)   # 10 cm – 1.5 m
-    freq = torch.empty(B, 1, N, c_in, device=device).uniform_(0.5, 4.0)  # 0.5–4 Hz
+    amp = torch.randn(B, 1, N, c_in, device=device) * 5.0   # ±5 m
+    freq = torch.empty(B, 1, N, c_in, device=device).uniform_(0.1, 10.0)  # 0.1–10 Hz
     phase = torch.empty(B, 1, N, c_in, device=device).uniform_(0, 2 * math.pi)
     decay = torch.empty(B, 1, N, c_in, device=device).uniform_(0.5, 6.0) # half-life 0.12–1.4 s
-    offset = torch.randn(B, 1, N, c_in, device=device) * 0.3
+    offset = torch.randn(B, 1, N, c_in, device=device) * 5.0   # ±5 m
     return offset + amp * torch.exp(-decay * t) * torch.sin(2 * math.pi * freq * t + phase)
 
 
@@ -140,25 +163,34 @@ def gen_smooth_fourier(B, T_raw, N, c_in, device):
     """Random smooth curves via low-frequency Fourier basis — general smooth motion.
 
     Harmonics at k Hz (k=1..n_harmonics), amplitude falls as 1/k.
+
+    Range: ~[-24, 24]  (n_harmonics up to 5)
+      base = N(0,5) → ±10; k=1: N(0,3)→±6; k=2: N(0,1.5)→±3; k=3: N(0,1)→±2;
+      k=4: N(0,0.75)→±1.5; k=5: N(0,0.6)→±1.2; total ±23.7.
     """
     t = _time_grid(B, T_raw, N, c_in, device)  # real seconds
     n_harmonics = random.randint(2, 5)
-    x = torch.zeros(B, T_raw, N, c_in, device=device)
+    x = torch.randn(B, 1, N, c_in, device=device) * 5.0   # ±5 m
     for k in range(1, n_harmonics + 1):
-        amp = torch.randn(B, 1, N, c_in, device=device) * (0.5 / k)  # 0.5 m / k
+        amp = torch.randn(B, 1, N, c_in, device=device) * (3 / k)  # 3 m / k
         phase = torch.empty(B, 1, N, c_in, device=device).uniform_(0, 2 * math.pi)
         x = x + amp * torch.sin(2 * math.pi * k * t + phase)
     return x
 
 
 def gen_circular(B, T_raw, N, c_in, device):
-    """Circular/spiral motion — rotation, orbits. Pairs channels for rotation."""
+    """Circular/spiral motion — rotation, orbits. Pairs channels for rotation.
+
+    Range: ~[-26, 26]
+      radius = N(0,3) → ±6; growth·t_max = N(0,3)·1.67 → ±10; r = radius+growth·t → ±16;
+      r·cos/sin → ±16; center = N(0,5) → ±10; total ±26.
+    """
     t = _time_grid(B, T_raw, N, c_in, device)  # real seconds
-    radius = torch.empty(B, 1, N, 1, device=device).uniform_(0.05, 1.0)   # 5 cm – 1 m
-    freq   = torch.empty(B, 1, N, 1, device=device).uniform_(0.3, 2.0)    # 0.3–2 Hz
+    radius = torch.randn(B, 1, N, 1, device=device) * 3   # ±3 m
+    freq   = torch.empty(B, 1, N, 1, device=device).uniform_(0.1, 10.0)    # 0.3–2 Hz
     phase  = torch.empty(B, 1, N, 1, device=device).uniform_(0, 2 * math.pi)
-    center = torch.randn(B, 1, N, c_in, device=device) * 0.5              # ±0.5 m
-    growth = torch.empty(B, 1, N, 1, device=device).uniform_(-0.3, 0.3)   # ±0.3 m/s radial
+    center = torch.randn(B, 1, N, c_in, device=device) * 5              # ±5 m
+    growth = torch.randn(B, 1, N, 1, device=device) * 3   # ±3 m/s radial
     r = radius + growth * t.expand(B, T_raw, N, 1)
     angle = 2 * math.pi * freq * t.expand(B, T_raw, N, 1) + phase
     x = torch.zeros(B, T_raw, N, c_in, device=device)
@@ -174,28 +206,41 @@ def gen_brownian(B, T_raw, N, c_in, device):
     """Brownian motion / random walk — cumulative small steps.
 
     step_std is per frame (1/FPS s), so diffusion = step_std * sqrt(FPS) m/sqrt(s).
+
+    Range: ~[-20, 20]
+      start = N(0,8.5) → ±17; step_std ~ U(0.005, 0.3), worst case 0.3;
+      cumulative drift after 20 steps: std = 0.3·√20 ≈ 1.34 → 2·std ≈ 2.7;
+      total ±19.7.
     """
-    step_std = torch.empty(B, 1, 1, 1, device=device).uniform_(0.005, 0.1)  # 5–100 mm/frame
+    step_std = torch.empty(B, 1, 1, 1, device=device).uniform_(0.005, 0.3)  # 5–300 mm/frame
     steps = torch.randn(B, T_raw, N, c_in, device=device) * step_std
-    steps[:, 0] = torch.randn(B, N, c_in, device=device) * 0.5   # ±0.5 m start
+    steps[:, 0] = torch.randn(B, N, c_in, device=device) * 8.5   # ±8.5 m start
     return steps.cumsum(dim=1)
 
 
 def gen_exponential_decay(B, T_raw, N, c_in, device):
     """Exponential decay/growth — energy dissipation, temperature cooling.
 
-    3σ range at T_raw=21 (t=1.667s, growth): 0.9 + 3.0·exp(1.667) ≈ ±16.8.
+    Range: ~[-25, 25]
+      offset = N(0,0.3) → ±0.6; amp = N(0,1) → ±2;
+      growth case (sign=+1): exp(rate·t_max) ≤ exp(1.5·1.67) = exp(2.5) ≈ 12.2,
+        amp·exp → ±24.4; total ±25.
+      decay case (sign=−1): exp(−rate·t) ≤ 1 → amp·exp ≤ ±2; total ±2.6.
     """
     t = _time_grid(B, T_raw, N, c_in, device)
     amp  = torch.randn(B, 1, N, c_in, device=device) * 1.0       # ±1.0 m amplitude
-    rate = torch.empty(B, 1, N, c_in, device=device).uniform_(0.3, 1.0)  # 1/s
+    rate = torch.empty(B, 1, N, c_in, device=device).uniform_(0.3, 1.5)  # 1/s
     offset = torch.randn(B, 1, N, c_in, device=device) * 0.3
     sign = torch.sign(torch.randn(B, 1, N, c_in, device=device))
     return offset + amp * torch.exp(sign * rate * t)
 
 
 def gen_piecewise_constant(B, T_raw, N, c_in, device):
-    """Piecewise constant — force on/off, discrete state changes."""
+    """Piecewise constant — force on/off, discrete state changes.
+
+    Range: ~[-15, 15]
+      Each segment: val = N(0,7.5) → ±15; no accumulation across segments.
+    """
     n_segments = random.randint(2, 5)
     x = torch.zeros(B, T_raw, N, c_in, device=device)
     # Random change points
@@ -203,20 +248,25 @@ def gen_piecewise_constant(B, T_raw, N, c_in, device):
     change_points = [0] + change_points + [T_raw]
     for i in range(len(change_points) - 1):
         t_start, t_end = change_points[i], change_points[i + 1]
-        val = torch.randn(B, 1, N, c_in, device=device) * 2.0  # ±2 (m or N, 3σ ≈ ±6)
+        val = torch.randn(B, 1, N, c_in, device=device) * 7.5  # ±7.5 (m or N)
         x[:, t_start:t_end] = val
     return x
 
 
 def gen_piecewise_linear(B, T_raw, N, c_in, device):
-    """Piecewise linear — velocity changes at discrete points (collisions)."""
+    """Piecewise linear — velocity changes at discrete points (collisions).
+
+    Range: ~[-15, 15]
+      vals at change points = N(0,7.5) → ±15; linear interpolation stays within
+      the convex hull of endpoint values; no accumulation.
+    """
     n_segments = random.randint(2, 5)
     change_points = sorted(random.sample(range(1, T_raw), min(n_segments - 1, T_raw - 1)))
     change_points = [0] + change_points + [T_raw]
 
     x = torch.zeros(B, T_raw, N, c_in, device=device)
     # Values at each change point
-    vals = [torch.randn(B, 1, N, c_in, device=device) * 2.0  # 3σ ≈ ±6
+    vals = [torch.randn(B, 1, N, c_in, device=device) * 5.0
             for _ in range(len(change_points))]
 
     for i in range(len(change_points) - 1):
@@ -233,13 +283,19 @@ def gen_bounce(B, T_raw, N, c_in, device):
     """Bounce / collision pattern — smooth parabolas with sudden velocity reversals.
 
     Uses real time (seconds) so v0 is in m/s and a is in m/s².
+
+    Range: ~[-41, 41]
+      First segment is ballistic: x0=N(0,5)→±10, v0·t→±16.7, 0.5·a·t²→±13.9;
+      total ±40.6. Post-bounce velocity is multiplied by restitution ∈ [0.4, 0.95]
+      and reversed, so subsequent segments are damped; position resets to the
+      previous segment end and does not accumulate unboundedly.
     """
     t = torch.arange(T_raw, device=device).float() / FPS   # real seconds
     n_bounces = random.randint(1, 3)
     bounce_times = sorted([random.uniform(0.15, 0.85) for _ in range(n_bounces)])
 
-    x0 = torch.randn(B, 1, N, c_in, device=device) * 0.5   # ±0.5 m
-    v0 = torch.randn(B, 1, N, c_in, device=device) * 2.0   # ±2 m/s
+    x0 = torch.randn(B, 1, N, c_in, device=device) * 5   # 5 m
+    v0 = torch.randn(B, 1, N, c_in, device=device) * 5.0   # ±5 m/s
     a  = torch.randn(B, 1, N, c_in, device=device) * 5.0   # ±5 m/s²
     restitution = torch.empty(B, 1, N, c_in, device=device).uniform_(0.4, 0.95)
 
@@ -265,7 +321,12 @@ def gen_bounce(B, T_raw, N, c_in, device):
 
 
 def gen_sparse_impulse(B, T_raw, N, c_in, device):
-    """Sparse impulses — mostly zero with occasional short bursts. Models contact forces."""
+    """Sparse impulses — mostly zero with occasional short bursts. Models contact forces.
+
+    Range: ~[-7.5, 7.5] typical; ~[-22.5, 22.5] worst case
+      impulse_val = N(0,3.75) → ±7.5 per impulse; up to 3 additive impulses if they
+      overlap at the same frame → ±22.5; background is 0.
+    """
     x = torch.zeros(B, T_raw, N, c_in, device=device)
     # 1-3 impulse windows per trajectory
     n_impulses = random.randint(1, 3)
@@ -275,18 +336,22 @@ def gen_sparse_impulse(B, T_raw, N, c_in, device):
         start = random.randint(0, T_raw - dur)
         # Only affect a random subset of points (~30-80%)
         point_mask = torch.rand(B, 1, N, 1, device=device) < random.uniform(0.3, 0.8)
-        impulse_val = torch.randn(B, dur, N, c_in, device=device) * 2.0  # ±2 N
+        impulse_val = torch.randn(B, dur, N, c_in, device=device) * 3.75  # ±3.75 N
         x[:, start:start + dur] += impulse_val * point_mask
     return x
 
 
 def gen_step_function(B, T_raw, N, c_in, device):
-    """Step function — abrupt on/off transitions. Models contact begin/end."""
+    """Step function — abrupt on/off transitions. Models contact begin/end.
+
+    Range: ~[-15, 15]
+      val_before / val_after = N(0,7.5) → ±15; background is 0.
+    """
     x = torch.zeros(B, T_raw, N, c_in, device=device)
     # Random step time
     step_t = random.randint(1, T_raw - 1)
-    val_before = torch.randn(B, 1, N, c_in, device=device) * 1.5
-    val_after  = torch.randn(B, 1, N, c_in, device=device) * 1.5
+    val_before = torch.randn(B, 1, N, c_in, device=device) * 7.5
+    val_after  = torch.randn(B, 1, N, c_in, device=device) * 7.5
     pattern = random.choice(["zero_to_val", "val_to_zero", "val_to_val"])
     if pattern == "zero_to_val":
         x[:, step_t:] = val_after
@@ -301,37 +366,85 @@ def gen_step_function(B, T_raw, N, c_in, device):
 def gen_sparse_constant(B, T_raw, N, c_in, device):
     """Sparse constant segments — mostly zero with sustained non-zero windows.
 
-    Models sustained contact forces / contact points that persist for multiple frames."""
+    Models sustained contact forces / contact points that persist for multiple frames.
+
+    Range: ~[-7.5, 7.5] typical; ~[-22.5, 22.5] worst case
+      val = N(0,3.75) → ±7.5 per window; up to 3 windows added together → ±22.5;
+      background is 0.
+    """
     x = torch.zeros(B, T_raw, N, c_in, device=device)
     n_windows = random.randint(1, 3)
     for _ in range(n_windows):
         dur = random.randint(2, max(2, T_raw // 2))
         start = random.randint(0, T_raw - dur)
-        val = torch.randn(B, 1, N, c_in, device=device) * 2.0
+        val = torch.randn(B, 1, N, c_in, device=device) * 3.75
         point_mask = torch.rand(B, 1, N, 1, device=device) < random.uniform(0.2, 0.7)
         x[:, start:start + dur] += val * point_mask
     return x
 
 
 def gen_smooth_then_sharp(B, T_raw, N, c_in, device):
-    """Smooth trajectory with a sharp discontinuity — collision event mid-trajectory."""
+    """Smooth trajectory with a sharp discontinuity — collision event mid-trajectory.
+
+    Range: ~[-35, 35]
+      Pre-jump: x0=N(0,3)→±6, v·t_max→±10; value at jump_t ≈ ±15.
+      Post-jump adds jump_val=N(0,3)→±6 and v2·t2_max→±10;
+      total ±(15 + 10 + 10) ≈ ±35.
+    """
     t = _time_grid(B, T_raw, N, c_in, device)   # real seconds
-    x0 = torch.randn(B, 1, N, c_in, device=device) * 0.5    # ±0.5 m
-    v  = torch.randn(B, 1, N, c_in, device=device) * 2.0    # ±2 m/s
+    x0 = torch.randn(B, 1, N, c_in, device=device) * 5.0    # ±5 m
+    v  = torch.randn(B, 1, N, c_in, device=device) * 3.0    # ±3 m/s
     x  = x0 + v * t
 
     # Sharp jump at a random time
     jump_t = random.randint(T_raw // 4, 3 * T_raw // 4)
-    jump_val = torch.randn(B, 1, N, c_in, device=device) * 1.0  # ±1 m impulse
-    v2 = torch.randn(B, 1, N, c_in, device=device) * 2.0        # ±2 m/s new velocity
+    jump_val = torch.randn(B, 1, N, c_in, device=device) * 5.0  # ±5 m impulse
+    v2 = torch.randn(B, 1, N, c_in, device=device) * 3.0        # ±3 m/s new velocity
     t2 = _time_grid(B, T_raw - jump_t, N, c_in, device)         # real seconds from jump
     x[:, jump_t:] = x[:, jump_t:jump_t + 1] + jump_val + v2 * t2
     return x
 
 
 def gen_zero(B, T_raw, N, c_in, device):
-    """Pure zeros — the trivial case, common for inactive force channels."""
+    """Pure zeros — the trivial case, common for inactive force channels.
+
+    Range: [0, 0]
+    """
     return torch.zeros(B, T_raw, N, c_in, device=device)
+
+
+# Base generators suitable as the "moving" phase in gen_sudden_stop.
+# Excludes sparse/zero generators — we want clearly visible motion before the stop.
+_SUDDEN_STOP_BASE_GENERATORS = [
+    gen_smooth_fourier,
+    gen_ballistic,
+    gen_sinusoidal,
+    gen_damped_oscillation,
+    gen_circular,
+    gen_constant_velocity,
+    gen_brownian,
+    gen_bounce,
+    gen_piecewise_linear,
+]
+
+
+def gen_sudden_stop(B, T_raw, N, c_in, device):
+    """Normal motion followed by an abrupt freeze at a random time.
+
+    Models an object that suddenly stops (e.g. wall collision, catching, landing).
+    A smooth/physics base trajectory is generated, then all values are held constant
+    at the frozen frame for the remainder of the sequence.
+
+    Range: inherited from the base generator (~[-41, 41] worst case from ballistic).
+      stop_t ~ U[T_raw//4, 3*T_raw//4]; post-stop signal = constant.
+    """
+    base_fn = random.choice(_SUDDEN_STOP_BASE_GENERATORS)
+    x = base_fn(B, T_raw, N, c_in, device)
+
+    # Freeze at stop_t: x[:, stop_t:] = x[:, stop_t-1:stop_t]
+    stop_t = random.randint(T_raw // 4, 3 * T_raw // 4)
+    x[:, stop_t:] = x[:, stop_t - 1 : stop_t]
+    return x
 
 
 # Registry: (generator_fn, weight)
@@ -350,6 +463,7 @@ TRAJECTORY_GENERATORS = [
     # Sharp / discontinuous — contact forces, collisions
     (gen_bounce,               0.07),   # bounce with velocity reversal
     (gen_smooth_then_sharp,    0.05),   # collision mid-trajectory
+    (gen_sudden_stop,          0.05),   # normal motion then abrupt freeze
     (gen_piecewise_linear,     0.05),   # velocity changes at discrete points
     (gen_piecewise_constant,   0.04),   # discrete state changes
 

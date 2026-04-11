@@ -67,14 +67,14 @@ The AE is applied separately to position(3) and velocity(3) channels, producing 
 ```bash
 # Single GPU (sufficient — AE is small ~200K params)
 python scripts/pv_simulator/train_stage0.py \
-    --output_dir outputs/ae \
+    --output_dir outputs/stage0/default \
     --max_train_steps 50000 \
     --batch_size 256 \
     --lr 3e-4
 
 # Multi-GPU (optional)
 accelerate launch --num_processes=4 scripts/pv_simulator/train_stage0.py \
-    --output_dir outputs/ae \
+    --output_dir outputs/stage0/default \
     --max_train_steps 50000
 ```
 
@@ -82,7 +82,7 @@ accelerate launch --num_processes=4 scripts/pv_simulator/train_stage0.py \
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--output_dir` | `outputs/ae` | Checkpoint output directory |
+| `--output_dir` | `outputs/stage0/default` | Checkpoint output directory |
 | `--max_train_steps` | 50000 | Total training steps |
 | `--batch_size` | 256 | Batch size (trajectories per step) |
 | `--n_pts` | 64 | Points per trajectory (batch axis) |
@@ -96,7 +96,7 @@ accelerate launch --num_processes=4 scripts/pv_simulator/train_stage0.py \
 ### Checkpoint layout
 
 ```
-outputs/ae/
+outputs/stage0/default/
   checkpoint-10000/
     causal_ae.pt
     config.pt
@@ -109,7 +109,7 @@ outputs/ae/
 
 ```python
 from videox_fun.models.sim_ae import CausalAE
-ae = CausalAE.load("outputs/ae/final")
+ae = CausalAE.load("outputs/stage0/default/final")
 x = torch.randn(2, 21, 50, 3) * 5
 x_hat, z = ae(x)
 assert x_hat.shape == x.shape        # (2, 21, 50, 3)
@@ -126,7 +126,7 @@ Trains `SimTransformer` + `SimConditionEmbedder` using flow matching diffusion w
 
 ```bash
 python scripts/pv_simulator/train_stage1.py \
-    --ae_ckpt_dir outputs/ae/final \
+    --ae_ckpt_dir outputs/stage0/default/final \
     --dataset_type movi \
     --data_root datasets/movi_ab_10k \
     --output_dir outputs/stage1 \
@@ -142,7 +142,7 @@ python scripts/pv_simulator/train_stage1.py \
 
 ```bash
 accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
-    --ae_ckpt_dir outputs/ae/final \
+    --ae_ckpt_dir outputs/stage0/default/final \
     --dataset_type movi \
     --data_root datasets/movi_ab_10k \
     --output_dir outputs/stage1 \
@@ -160,7 +160,7 @@ Effective batch size = `num_processes × train_batch_size × gradient_accumulati
 
 ```bash
 accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
-    --ae_ckpt_dir outputs/ae/final \
+    --ae_ckpt_dir outputs/stage0/default/final \
     --dataset_type simulation \
     --ann_path /path/to/annotations.json \
     --data_root /path/to/sim_data \
@@ -205,7 +205,7 @@ Pass `--report_to wandb` to switch from TensorBoard to wandb. Both `train_loss` 
 
 ```bash
 accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
-    --ae_ckpt_dir outputs/ae/final \
+    --ae_ckpt_dir outputs/stage0/default/final \
     --dataset_type movi \
     --data_root datasets/movi_ab_10k \
     --output_dir outputs/stage1 \
@@ -225,7 +225,7 @@ By default, each sample has variable `T_raw`, `n_objects`, and `N` (total points
 
 ```bash
 accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
-    --ae_ckpt_dir outputs/ae/final \
+    --ae_ckpt_dir outputs/stage0/default/final \
     --dataset_type movi \
     --data_root datasets/movi_ab_10k \
     --output_dir outputs/stage1_padded \
@@ -269,7 +269,7 @@ Run the trained SimTransformer to generate physics trajectories from pure noise,
 ```bash
 python scripts/pv_simulator/infer_stage1.py \
     --ckpt_dir outputs/stage1/final \
-    --ae_ckpt_dir outputs/ae/final \
+    --ae_ckpt_dir outputs/stage0/default/final \
     --data_dir datasets/movi_ab_10k/00000 \
     --output_dir outputs/infer/00000 \
     --num_inference_steps 50
@@ -284,7 +284,7 @@ This produces:
 ```bash
 python scripts/pv_simulator/infer_stage1.py \
     --ckpt_dir outputs/stage1/final \
-    --ae_ckpt_dir outputs/ae/final \
+    --ae_ckpt_dir outputs/stage0/default/final \
     --point_states_npy /path/to/states.npy \
     --point_obj_idx_npy /path/to/obj_idx.npy \
     --output_dir outputs/infer/custom
@@ -315,7 +315,7 @@ from videox_fun.pipeline.pipeline_simulation import SimulationPipeline
 
 pipeline = SimulationPipeline.from_pretrained(
     ckpt_dir="outputs/stage1/final",
-    ae_ckpt_dir="outputs/ae/final",
+    ae_ckpt_dir="outputs/stage0/default/final",
     device="cuda",
     dtype=torch.bfloat16,
 )

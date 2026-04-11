@@ -35,12 +35,11 @@ python examples/wan2.1_fun/app.py
 
 # PV-Simulator Stage 0: Train Causal AE
 accelerate launch --num_processes=1 scripts/pv_simulator/train_stage0.py \
-  --output_dir outputs/ae \
-  --max_steps 50000
+  --output_dir outputs/stage0/default
 
 # PV-Simulator Stage 1 training (simulation branch only)
 accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
-  --ae_ckpt_dir outputs/ae/final \
+  --ae_ckpt_dir outputs/stage0/default/final \
   --ann_path /path/to/annotations.json \
   --data_root /path/to/sim_data \
   --output_dir outputs/stage1 \
@@ -48,7 +47,7 @@ accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
 
 # PV-Simulator Stage 2 training (joint MoT + LoRA)
 accelerate launch --num_processes=4 scripts/pv_simulator/train_stage2.py \
-  --ae_ckpt_dir outputs/ae/final \
+  --ae_ckpt_dir outputs/stage0/default/final \
   --stage1_ckpt outputs/stage1/final \
   --video_model_path /path/to/Wan2.1-Fun-V1.1-1.3B-InP \
   --ann_path /path/to/annotations.json \

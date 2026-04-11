@@ -214,7 +214,7 @@ def _run_vis(vis_samples, sim_transformer, ae, sim_cond_embedder,
             T_raw = x_s_raw.shape[1]
             T = (T_raw - 1) // 4 + 1
 
-            with torch.cuda.amp.autocast(dtype=weight_dtype):
+            with torch.amp.autocast("cuda", dtype=weight_dtype):
                 result = pipeline(
                     c_floor=c_floor, c_id=c_id, c_mat=c_mat, c_mass=c_mass,
                     c_static=c_static, c_force_raw=c_force_raw,
@@ -535,7 +535,7 @@ def main():
                 )  # (B, T, N, d_cond)
 
                 # --- Forward pass: DiT in latent space, then decode to raw ---
-                with torch.cuda.amp.autocast(dtype=weight_dtype):
+                with torch.amp.autocast("cuda", dtype=weight_dtype):
                     pred_enc = sim_transformer(
                         noisy_enc, init_enc_padded, init_mask, c_sim, timesteps,
                         dtype=weight_dtype, valid_seq_mask=valid_seq_mask,

@@ -457,12 +457,12 @@ def main():
                     # For now, run sim-only path; video branch training requires
                     # a full video loading pipeline (out of scope for this script skeleton).
                     # TODO: integrate video loading and joint forward pass.
-                    with torch.cuda.amp.autocast(dtype=weight_dtype):
+                    with torch.amp.autocast("cuda", dtype=weight_dtype):
                         pred_sim = unwrapped_mot.sim(
                             noisy_x_s_enc, init_enc_padded, init_mask, c_sim,
                             timesteps, dtype=weight_dtype)
                 else:
-                    with torch.cuda.amp.autocast(dtype=weight_dtype):
+                    with torch.amp.autocast("cuda", dtype=weight_dtype):
                         pred_sim = unwrapped_mot.sim(
                             noisy_x_s_enc, init_enc_padded, init_mask, c_sim,
                             timesteps, dtype=weight_dtype)

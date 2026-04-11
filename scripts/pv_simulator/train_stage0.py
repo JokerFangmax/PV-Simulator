@@ -27,6 +27,8 @@ import os
 import random
 import sys
 
+from torch.optim.lr_scheduler import LambdaLR
+
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
@@ -59,71 +61,91 @@ logger = get_logger(__name__, log_level="INFO")
 #   - Sparse: intermittent forces, contact points
 #   - Stationary: objects at rest
 #   - Mixed: real scenes combine all of the above
+#
+# Time convention: T_raw frames captured at FPS=12 Hz.
+# All generators use REAL time in seconds: t = frame_index / FPS.
+# Physical scales for a table-top rigid-body simulation (MOVI-AB style):
+#   positions:     ~[-2, 2] m
+#   velocities:    ~[-4, 4] m/s
+#   accelerations: ~[-15, 15] m/s²  (gravity ≈ 9.8 m/s²)
+#   frequencies:   0.5 – 4 Hz
+
+FPS = 12.0   # capture frame rate (frames per second)
+
 
 def _time_grid(B, T_raw, N, c_in, device):
-    """Normalized time grid [0, 1] → (B, T_raw, 1, 1) broadcast-ready."""
-    t = torch.linspace(0, 1, T_raw, device=device).view(1, T_raw, 1, 1)
-    return t.expand(B, T_raw, 1, 1)
+    """Real time in seconds at FPS=12: shape (B, T_raw, 1, 1), broadcast-ready.
+
+    t[i] = i / FPS  →  t_max = (T_raw-1)/FPS  (e.g. 1.67 s for T_raw=21)
+    """
+    t = torch.arange(T_raw, device=device).float() / FPS
+    return t.view(1, T_raw, 1, 1).expand(B, T_raw, 1, 1)
 
 
 def gen_gaussian_noise(B, T_raw, N, c_in, device):
     """Pure i.i.d. Gaussian noise — baseline, stress-tests reconstruction."""
-    std = torch.empty(B, 1, 1, 1, device=device).uniform_(0.5, 10.0)
+    std = torch.empty(B, 1, 1, 1, device=device).uniform_(0.05, 1.0)
     return torch.randn(B, T_raw, N, c_in, device=device) * std
 
 
 def gen_stationary(B, T_raw, N, c_in, device):
-    """Near-constant signal with tiny jitter — objects at rest."""
-    offset = torch.randn(B, 1, N, c_in, device=device) * 3.0
-    jitter = torch.randn(B, T_raw, N, c_in, device=device) * 0.01
+    """Near-constant signal with tiny sensor jitter — objects at rest."""
+    offset = torch.randn(B, 1, N, c_in, device=device) * 1.0   # ±1 m position
+    jitter = torch.randn(B, T_raw, N, c_in, device=device) * 0.01  # 1 cm jitter
     return offset + jitter
 
 
 def gen_constant_velocity(B, T_raw, N, c_in, device):
     """Linear trajectories x(t) = x0 + v*t — uniform motion."""
     t = _time_grid(B, T_raw, N, c_in, device)
-    x0 = torch.randn(B, 1, N, c_in, device=device) * 3.0
-    v = torch.randn(B, 1, N, c_in, device=device) * 5.0
+    x0 = torch.randn(B, 1, N, c_in, device=device) * 1.0   # ±1 m
+    v = torch.randn(B, 1, N, c_in, device=device) * 2.0    # ±2 m/s
     return x0 + v * t
 
 
 def gen_ballistic(B, T_raw, N, c_in, device):
-    """Parabolic trajectories x(t) = x0 + v0*t + 0.5*a*t^2 — gravity/throws."""
+    """Parabolic trajectories x(t) = x0 + v0*t + 0.5*a*t² — gravity/throws.
+
+    3σ range at T_raw=21 (t=1.667s): 0.9 + 5.5 + 11.3 ≈ ±28.2.
+    """
     t = _time_grid(B, T_raw, N, c_in, device)
-    x0 = torch.randn(B, 1, N, c_in, device=device) * 2.0
-    v0 = torch.randn(B, 1, N, c_in, device=device) * 4.0
-    a = torch.randn(B, 1, N, c_in, device=device) * 6.0
+    x0 = torch.randn(B, 1, N, c_in, device=device) * 0.5   # ±0.5 m
+    v0 = torch.randn(B, 1, N, c_in, device=device) * 2.0   # ±2 m/s
+    a  = torch.randn(B, 1, N, c_in, device=device) * 4.0   # ±4 m/s² (gravity ~9.8)
     return x0 + v0 * t + 0.5 * a * t ** 2
 
 
 def gen_sinusoidal(B, T_raw, N, c_in, device):
     """Sinusoidal oscillation — springs, vibrations, periodic motion."""
     t = _time_grid(B, T_raw, N, c_in, device)
-    amp = torch.empty(B, 1, N, c_in, device=device).uniform_(0.5, 5.0)
-    freq = torch.empty(B, 1, N, c_in, device=device).uniform_(0.5, 8.0)
+    amp = torch.empty(B, 1, N, c_in, device=device).uniform_(0.05, 1.0)  # 5 cm – 1 m
+    freq = torch.empty(B, 1, N, c_in, device=device).uniform_(0.5, 4.0)  # 0.5–4 Hz
     phase = torch.empty(B, 1, N, c_in, device=device).uniform_(0, 2 * math.pi)
-    offset = torch.randn(B, 1, N, c_in, device=device) * 2.0
+    offset = torch.randn(B, 1, N, c_in, device=device) * 0.5
     return offset + amp * torch.sin(2 * math.pi * freq * t + phase)
 
 
 def gen_damped_oscillation(B, T_raw, N, c_in, device):
     """Exponentially damped sinusoid — friction, energy dissipation."""
     t = _time_grid(B, T_raw, N, c_in, device)
-    amp = torch.empty(B, 1, N, c_in, device=device).uniform_(1.0, 8.0)
-    freq = torch.empty(B, 1, N, c_in, device=device).uniform_(1.0, 6.0)
+    amp = torch.empty(B, 1, N, c_in, device=device).uniform_(0.1, 1.5)   # 10 cm – 1.5 m
+    freq = torch.empty(B, 1, N, c_in, device=device).uniform_(0.5, 4.0)  # 0.5–4 Hz
     phase = torch.empty(B, 1, N, c_in, device=device).uniform_(0, 2 * math.pi)
-    decay = torch.empty(B, 1, N, c_in, device=device).uniform_(1.0, 8.0)
-    offset = torch.randn(B, 1, N, c_in, device=device) * 1.0
+    decay = torch.empty(B, 1, N, c_in, device=device).uniform_(0.5, 6.0) # half-life 0.12–1.4 s
+    offset = torch.randn(B, 1, N, c_in, device=device) * 0.3
     return offset + amp * torch.exp(-decay * t) * torch.sin(2 * math.pi * freq * t + phase)
 
 
 def gen_smooth_fourier(B, T_raw, N, c_in, device):
-    """Random smooth curves via low-frequency Fourier basis — general smooth motion."""
-    t = _time_grid(B, T_raw, N, c_in, device)  # (B, T, 1, 1)
-    n_harmonics = random.randint(2, 6)
+    """Random smooth curves via low-frequency Fourier basis — general smooth motion.
+
+    Harmonics at k Hz (k=1..n_harmonics), amplitude falls as 1/k.
+    """
+    t = _time_grid(B, T_raw, N, c_in, device)  # real seconds
+    n_harmonics = random.randint(2, 5)
     x = torch.zeros(B, T_raw, N, c_in, device=device)
     for k in range(1, n_harmonics + 1):
-        amp = torch.randn(B, 1, N, c_in, device=device) * (3.0 / k)
+        amp = torch.randn(B, 1, N, c_in, device=device) * (0.5 / k)  # 0.5 m / k
         phase = torch.empty(B, 1, N, c_in, device=device).uniform_(0, 2 * math.pi)
         x = x + amp * torch.sin(2 * math.pi * k * t + phase)
     return x
@@ -131,13 +153,12 @@ def gen_smooth_fourier(B, T_raw, N, c_in, device):
 
 def gen_circular(B, T_raw, N, c_in, device):
     """Circular/spiral motion — rotation, orbits. Pairs channels for rotation."""
-    t = _time_grid(B, T_raw, N, c_in, device)
-    radius = torch.empty(B, 1, N, 1, device=device).uniform_(0.5, 5.0)
-    freq = torch.empty(B, 1, N, 1, device=device).uniform_(0.5, 4.0)
-    phase = torch.empty(B, 1, N, 1, device=device).uniform_(0, 2 * math.pi)
-    center = torch.randn(B, 1, N, c_in, device=device) * 2.0
-    # Radial growth for spirals
-    growth = torch.empty(B, 1, N, 1, device=device).uniform_(-1.0, 1.0)
+    t = _time_grid(B, T_raw, N, c_in, device)  # real seconds
+    radius = torch.empty(B, 1, N, 1, device=device).uniform_(0.05, 1.0)   # 5 cm – 1 m
+    freq   = torch.empty(B, 1, N, 1, device=device).uniform_(0.3, 2.0)    # 0.3–2 Hz
+    phase  = torch.empty(B, 1, N, 1, device=device).uniform_(0, 2 * math.pi)
+    center = torch.randn(B, 1, N, c_in, device=device) * 0.5              # ±0.5 m
+    growth = torch.empty(B, 1, N, 1, device=device).uniform_(-0.3, 0.3)   # ±0.3 m/s radial
     r = radius + growth * t.expand(B, T_raw, N, 1)
     angle = 2 * math.pi * freq * t.expand(B, T_raw, N, 1) + phase
     x = torch.zeros(B, T_raw, N, c_in, device=device)
@@ -150,20 +171,25 @@ def gen_circular(B, T_raw, N, c_in, device):
 
 
 def gen_brownian(B, T_raw, N, c_in, device):
-    """Brownian motion / random walk — cumulative small steps."""
-    step_std = torch.empty(B, 1, 1, 1, device=device).uniform_(0.1, 2.0)
+    """Brownian motion / random walk — cumulative small steps.
+
+    step_std is per frame (1/FPS s), so diffusion = step_std * sqrt(FPS) m/sqrt(s).
+    """
+    step_std = torch.empty(B, 1, 1, 1, device=device).uniform_(0.005, 0.1)  # 5–100 mm/frame
     steps = torch.randn(B, T_raw, N, c_in, device=device) * step_std
-    steps[:, 0] = torch.randn(B, N, c_in, device=device) * 2.0  # random start
+    steps[:, 0] = torch.randn(B, N, c_in, device=device) * 0.5   # ±0.5 m start
     return steps.cumsum(dim=1)
 
 
 def gen_exponential_decay(B, T_raw, N, c_in, device):
-    """Exponential decay/growth — energy dissipation, temperature cooling."""
+    """Exponential decay/growth — energy dissipation, temperature cooling.
+
+    3σ range at T_raw=21 (t=1.667s, growth): 0.9 + 3.0·exp(1.667) ≈ ±16.8.
+    """
     t = _time_grid(B, T_raw, N, c_in, device)
-    amp = torch.randn(B, 1, N, c_in, device=device) * 5.0
-    rate = torch.empty(B, 1, N, c_in, device=device).uniform_(0.5, 5.0)
-    offset = torch.randn(B, 1, N, c_in, device=device) * 1.0
-    # Randomly choose decay vs growth
+    amp  = torch.randn(B, 1, N, c_in, device=device) * 1.0       # ±1.0 m amplitude
+    rate = torch.empty(B, 1, N, c_in, device=device).uniform_(0.3, 1.0)  # 1/s
+    offset = torch.randn(B, 1, N, c_in, device=device) * 0.3
     sign = torch.sign(torch.randn(B, 1, N, c_in, device=device))
     return offset + amp * torch.exp(sign * rate * t)
 
@@ -177,7 +203,7 @@ def gen_piecewise_constant(B, T_raw, N, c_in, device):
     change_points = [0] + change_points + [T_raw]
     for i in range(len(change_points) - 1):
         t_start, t_end = change_points[i], change_points[i + 1]
-        val = torch.randn(B, 1, N, c_in, device=device) * 4.0
+        val = torch.randn(B, 1, N, c_in, device=device) * 2.0  # ±2 (m or N, 3σ ≈ ±6)
         x[:, t_start:t_end] = val
     return x
 
@@ -190,7 +216,7 @@ def gen_piecewise_linear(B, T_raw, N, c_in, device):
 
     x = torch.zeros(B, T_raw, N, c_in, device=device)
     # Values at each change point
-    vals = [torch.randn(B, 1, N, c_in, device=device) * 4.0
+    vals = [torch.randn(B, 1, N, c_in, device=device) * 2.0  # 3σ ≈ ±6
             for _ in range(len(change_points))]
 
     for i in range(len(change_points) - 1):
@@ -204,21 +230,24 @@ def gen_piecewise_linear(B, T_raw, N, c_in, device):
 
 
 def gen_bounce(B, T_raw, N, c_in, device):
-    """Bounce / collision pattern — smooth parabolas with sudden velocity reversals."""
-    t = torch.linspace(0, 1, T_raw, device=device)
-    # Generate 2-4 bounce events
+    """Bounce / collision pattern — smooth parabolas with sudden velocity reversals.
+
+    Uses real time (seconds) so v0 is in m/s and a is in m/s².
+    """
+    t = torch.arange(T_raw, device=device).float() / FPS   # real seconds
     n_bounces = random.randint(1, 3)
     bounce_times = sorted([random.uniform(0.15, 0.85) for _ in range(n_bounces)])
 
-    x0 = torch.randn(B, 1, N, c_in, device=device) * 2.0
-    v0 = torch.randn(B, 1, N, c_in, device=device) * 4.0
-    a = torch.randn(B, 1, N, c_in, device=device) * 8.0
+    x0 = torch.randn(B, 1, N, c_in, device=device) * 0.5   # ±0.5 m
+    v0 = torch.randn(B, 1, N, c_in, device=device) * 2.0   # ±2 m/s
+    a  = torch.randn(B, 1, N, c_in, device=device) * 5.0   # ±5 m/s²
     restitution = torch.empty(B, 1, N, c_in, device=device).uniform_(0.4, 0.95)
 
     x = torch.zeros(B, T_raw, N, c_in, device=device)
     seg_start = 0
     cur_x0, cur_v0 = x0, v0
 
+    t_max = t[-1].item()
     for bounce_t in bounce_times + [1.0]:
         seg_end = int(bounce_t * (T_raw - 1)) + 1
         seg_end = min(seg_end, T_raw)
@@ -228,7 +257,7 @@ def gen_bounce(B, T_raw, N, c_in, device):
         x[:, seg_start:seg_end] = cur_x0 + cur_v0 * dt + 0.5 * a * dt ** 2
         # Compute velocity at end of segment for next segment
         seg_dur = t[min(seg_end, T_raw) - 1].item() - t[seg_start].item()
-        cur_v0 = -(cur_v0 + a * seg_dur) * restitution  # reverse + dampen
+        cur_v0 = -(cur_v0 + a * seg_dur) * restitution
         cur_x0 = x[:, seg_end - 1:seg_end]
         seg_start = seg_end
 
@@ -246,7 +275,7 @@ def gen_sparse_impulse(B, T_raw, N, c_in, device):
         start = random.randint(0, T_raw - dur)
         # Only affect a random subset of points (~30-80%)
         point_mask = torch.rand(B, 1, N, 1, device=device) < random.uniform(0.3, 0.8)
-        impulse_val = torch.randn(B, dur, N, c_in, device=device) * 5.0
+        impulse_val = torch.randn(B, dur, N, c_in, device=device) * 2.0  # ±2 N
         x[:, start:start + dur] += impulse_val * point_mask
     return x
 
@@ -256,9 +285,8 @@ def gen_step_function(B, T_raw, N, c_in, device):
     x = torch.zeros(B, T_raw, N, c_in, device=device)
     # Random step time
     step_t = random.randint(1, T_raw - 1)
-    val_before = torch.randn(B, 1, N, c_in, device=device) * 3.0
-    val_after = torch.randn(B, 1, N, c_in, device=device) * 3.0
-    # Randomly choose: zero→nonzero, nonzero→zero, or nonzero→nonzero
+    val_before = torch.randn(B, 1, N, c_in, device=device) * 1.5
+    val_after  = torch.randn(B, 1, N, c_in, device=device) * 1.5
     pattern = random.choice(["zero_to_val", "val_to_zero", "val_to_val"])
     if pattern == "zero_to_val":
         x[:, step_t:] = val_after
@@ -279,8 +307,7 @@ def gen_sparse_constant(B, T_raw, N, c_in, device):
     for _ in range(n_windows):
         dur = random.randint(2, max(2, T_raw // 2))
         start = random.randint(0, T_raw - dur)
-        val = torch.randn(B, 1, N, c_in, device=device) * 4.0
-        # Apply to random subset of points
+        val = torch.randn(B, 1, N, c_in, device=device) * 2.0
         point_mask = torch.rand(B, 1, N, 1, device=device) < random.uniform(0.2, 0.7)
         x[:, start:start + dur] += val * point_mask
     return x
@@ -288,17 +315,16 @@ def gen_sparse_constant(B, T_raw, N, c_in, device):
 
 def gen_smooth_then_sharp(B, T_raw, N, c_in, device):
     """Smooth trajectory with a sharp discontinuity — collision event mid-trajectory."""
-    t = _time_grid(B, T_raw, N, c_in, device)
-    # Smooth part
-    x0 = torch.randn(B, 1, N, c_in, device=device) * 2.0
-    v = torch.randn(B, 1, N, c_in, device=device) * 4.0
-    x = x0 + v * t
+    t = _time_grid(B, T_raw, N, c_in, device)   # real seconds
+    x0 = torch.randn(B, 1, N, c_in, device=device) * 0.5    # ±0.5 m
+    v  = torch.randn(B, 1, N, c_in, device=device) * 2.0    # ±2 m/s
+    x  = x0 + v * t
 
     # Sharp jump at a random time
     jump_t = random.randint(T_raw // 4, 3 * T_raw // 4)
-    jump_val = torch.randn(B, 1, N, c_in, device=device) * 5.0
-    v2 = torch.randn(B, 1, N, c_in, device=device) * 4.0  # new velocity after jump
-    t2 = _time_grid(B, T_raw - jump_t, N, c_in, device)
+    jump_val = torch.randn(B, 1, N, c_in, device=device) * 1.0  # ±1 m impulse
+    v2 = torch.randn(B, 1, N, c_in, device=device) * 2.0        # ±2 m/s new velocity
+    t2 = _time_grid(B, T_raw - jump_t, N, c_in, device)         # real seconds from jump
     x[:, jump_t:] = x[:, jump_t:jump_t + 1] + jump_val + v2 * t2
     return x
 
@@ -456,6 +482,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Stage 0: Train Causal AE")
     # Output
     parser.add_argument("--output_dir", type=str, default="outputs/ae")
+    parser.add_argument("--resume_from", type=str, default=None,
+                        help="Checkpoint dir to resume from (loads model weights; optimizer/scheduler reset)")
+    parser.add_argument("--start_step", type=int, default=0,
+                        help="Step to treat as the starting point (used with --resume_from). "
+                             "--max_train_steps is the TOTAL target, so only "
+                             "(max_train_steps - start_step) more steps will run.")
     # Model
     parser.add_argument("--c_in", type=int, default=3)
     parser.add_argument("--c_mid", type=int, default=64)
@@ -474,10 +506,16 @@ def parse_args():
     parser.add_argument("--lr_scheduler", type=str, default="cosine",
                         choices=["cosine", "constant", "linear"])
     parser.add_argument("--lr_warmup_steps", type=int, default=500)
+    parser.add_argument("--lr_total_steps", type=int, default=None,
+                        help="Total steps for the LR schedule cycle. Defaults to max_train_steps. "
+                             "Set this to the FULL planned training length when doing a partial run "
+                             "that will later be resumed, so the schedule matches across both runs.")
+    parser.add_argument("--grad_clip", type=float, default=1.0,
+                        help="Max gradient norm (0 to disable)")
     parser.add_argument("--seed", type=int, default=42)
     # Loss weights
     parser.add_argument("--lambda_mmd", type=float, default=0.1)
-    parser.add_argument("--lambda_smooth", type=float, default=0.01)
+    parser.add_argument("--lambda_smooth", type=float, default=0.0)
     parser.add_argument("--lambda_interp", type=float, default=0.1)
     # Logging
     parser.add_argument("--logging_steps", type=int, default=100)
@@ -522,20 +560,53 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
 
     # --- Model ---
-    ae = CausalAE(c_in=args.c_in, c_mid=args.c_mid, d_latent=args.d_latent)
+    if args.resume_from:
+        logger.info(f"Resuming from checkpoint: {args.resume_from}")
+        ae = CausalAE.load(args.resume_from)
+    else:
+        ae = CausalAE(c_in=args.c_in, c_mid=args.c_mid, d_latent=args.d_latent)
     n_params = sum(p.numel() for p in ae.parameters())
     logger.info(f"CausalAE params: {n_params:,}")
 
-    # --- Optimizer & Scheduler ---
+    # --- Optimizer ---
     optimizer = torch.optim.AdamW(ae.parameters(), lr=args.lr, weight_decay=1e-4)
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.max_train_steps, eta_min=0.0,
-    ) if args.lr_scheduler == "cosine" else None
 
-    # Prepare with accelerator
+    # Prepare with accelerator before creating scheduler (scheduler must reference prepared optimizer)
     ae, optimizer = accelerator.prepare(ae, optimizer)
-    if lr_scheduler is not None:
-        lr_scheduler = accelerator.prepare(lr_scheduler)
+
+    # --- Scheduler (created after prepare so it references the wrapped optimizer) ---
+    # lr_lambda receives a *relative* step (0-indexed from resume point).
+    # We convert to *absolute* step by adding start_step so the cosine curve
+    # continues from the right position rather than restarting from the peak.
+    # lr_total_steps sets the cosine cycle length independently of max_train_steps,
+    # so a screening run (max=20k) and its continuation (max=50k) share the same curve.
+    def _make_scheduler(optimizer):
+        warmup = args.lr_warmup_steps
+        total = args.lr_total_steps if args.lr_total_steps is not None else args.max_train_steps
+        start = args.start_step
+        sched = args.lr_scheduler
+        if sched == "cosine":
+            def lr_lambda(rel_step):
+                step = rel_step + start  # absolute step
+                if step < warmup:
+                    return float(step) / max(1, warmup)
+                progress = float(step - warmup) / max(1, total - warmup)
+                return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+        elif sched == "linear":
+            def lr_lambda(rel_step):
+                step = rel_step + start
+                if step < warmup:
+                    return float(step) / max(1, warmup)
+                return max(0.0, float(total - step) / max(1, total - warmup))
+        else:  # constant
+            def lr_lambda(rel_step):
+                step = rel_step + start
+                if step < warmup:
+                    return float(step) / max(1, warmup)
+                return 1.0
+        return LambdaLR(optimizer, lr_lambda)
+
+    lr_scheduler = accelerator.prepare(_make_scheduler(optimizer))
 
     weight_dtype = torch.float32
     if args.mixed_precision == "bf16":
@@ -552,18 +623,33 @@ def main():
             accelerator.init_trackers(args.wandb_project, config=vars(args),
                                       init_kwargs=init_kwargs)
 
+    remaining_steps = args.max_train_steps - args.start_step
+    logger.info(f"Training from step {args.start_step} to {args.max_train_steps} "
+                f"({remaining_steps} steps remaining)")
+
     # --- Training loop ---
     progress_bar = tqdm(
-        range(args.max_train_steps),
+        range(remaining_steps),
         desc="Steps",
         disable=not accelerator.is_local_main_process,
     )
 
     ae.train()
-    global_step = 0
+    global_step = args.start_step
     rng = random.Random(args.seed + accelerator.process_index)
 
-    for step in range(args.max_train_steps):
+    # EMA accumulators for smooth logging (alpha=0.98 ≈ 50-step window)
+    # Initialized on first step to avoid zero-bias at resume.
+    _ema_alpha = 0.98
+    ema = {}
+
+    def _update_ema(key, val):
+        if key not in ema:
+            ema[key] = val
+        else:
+            ema[key] = _ema_alpha * ema[key] + (1 - _ema_alpha) * val
+
+    for step in range(remaining_steps):
         # --- Generate synthetic data ---
         k = rng.randint(args.min_k, args.max_k)
         T_raw = 4 * k + 1
@@ -574,7 +660,7 @@ def main():
         )
 
         # --- Forward ---
-        with torch.cuda.amp.autocast(dtype=weight_dtype):
+        with torch.amp.autocast("cuda", dtype=weight_dtype):
             x_hat, z = ae(x)  # x_hat: (B, T_raw, N, 3), z: (B, T, N, 16)
 
             # 1. MSE reconstruction loss
@@ -606,31 +692,38 @@ def main():
 
         # --- Backward ---
         accelerator.backward(loss)
+        if args.grad_clip > 0:
+            accelerator.clip_grad_norm_(ae.parameters(), args.grad_clip)
         optimizer.step()
         optimizer.zero_grad()
-        if lr_scheduler is not None:
-            lr_scheduler.step()
+        lr_scheduler.step()
 
         global_step += 1
         progress_bar.update(1)
 
+        # Update EMA every step
+        _update_ema("loss",        loss.item())
+        _update_ema("loss_mse",    loss_mse.item())
+        _update_ema("loss_mmd",    loss_mmd.item())
+        _update_ema("loss_smooth", loss_smooth.item())
+        _update_ema("loss_interp", loss_interp.item())
+
         # --- Logging ---
         if global_step % args.logging_steps == 0:
-            current_lr = (lr_scheduler.get_last_lr()[0]
-                          if lr_scheduler is not None else args.lr)
+            current_lr = lr_scheduler.get_last_lr()[0]
             log_dict = {
-                "loss": loss.item(),
-                "loss_mse": loss_mse.item(),
-                "loss_mmd": loss_mmd.item(),
-                "loss_smooth": loss_smooth.item(),
-                "loss_interp": loss_interp.item(),
+                "loss":        ema["loss"],
+                "loss_mse":    ema["loss_mse"],
+                "loss_mmd":    ema["loss_mmd"],
+                "loss_smooth": ema["loss_smooth"],
+                "loss_interp": ema["loss_interp"],
                 "lr": current_lr,
             }
             accelerator.log(log_dict, step=global_step)
             logger.info(
-                f"Step {global_step}: loss={loss.item():.4f} "
-                f"mse={loss_mse.item():.4f} mmd={loss_mmd.item():.4f} "
-                f"smooth={loss_smooth.item():.4f} interp={loss_interp.item():.4f}"
+                f"Step {global_step}: loss={ema['loss']:.4f} "
+                f"mse={ema['loss_mse']:.4f} mmd={ema['loss_mmd']:.4f} "
+                f"smooth={ema['loss_smooth']:.4f} interp={ema['loss_interp']:.4f}"
             )
 
         # --- Checkpoint ---

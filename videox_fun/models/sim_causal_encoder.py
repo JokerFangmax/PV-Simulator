@@ -15,11 +15,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class CausalConv1d(nn.Conv1d):
-    """1D causal convolution: moves all padding to the left (past frames only).
+CACHE_T = 2
 
-    Follows the same pattern as CausalConv3d in wan_vae.py:
-    causal_pad = 2 * padding[0], applied only on the left.
+
+class CausalConv1d(nn.Conv1d):
+    """1D causal convolution with optional cache for chunked processing.
+
+    Follows CausalConv3d in wan_vae.py: all temporal padding goes to the left.
+    When ``cache_x`` is provided, it replaces part of the zero-padding with
+    real data from the previous chunk.
     """
 
     def __init__(self, *args, **kwargs):
@@ -27,9 +31,14 @@ class CausalConv1d(nn.Conv1d):
         self._causal_pad = 2 * self.padding[0]
         self.padding = (0,)
 
-    def forward(self, x):
-        if self._causal_pad > 0:
-            x = F.pad(x, (self._causal_pad, 0))
+    def forward(self, x, cache_x=None):
+        pad = self._causal_pad
+        if cache_x is not None and pad > 0:
+            cache_x = cache_x.to(x.device)
+            x = torch.cat([cache_x, x], dim=2)
+            pad -= cache_x.shape[2]
+        if pad > 0:
+            x = F.pad(x, (pad, 0))
         return super().forward(x)
 
 
@@ -49,9 +58,14 @@ class RMSNorm1d(nn.Module):
 
 
 class ResidualBlock1d(nn.Module):
-    """Residual block for 1D temporal data: RMSNorm → SiLU → CausalConv1d × 2 + shortcut.
+    """Residual block with optional cache support for chunked processing.
 
-    Mirrors wan_vae.py's ResidualBlock but adapted to 1D (no spatial dims).
+    Architecture: RMSNorm → SiLU → CausalConv1d → RMSNorm → SiLU → CausalConv1d
+    Plus shortcut (identity or 1×1 conv).
+
+    When ``feat_cache`` / ``feat_idx`` are provided, each CausalConv1d layer
+    stores and retrieves its tail frames from the cache, exactly like
+    wan_vae.py's ResidualBlock.
     """
 
     def __init__(self, in_dim, out_dim):
@@ -70,8 +84,23 @@ class ResidualBlock1d(nn.Module):
             else nn.Identity()
         )
 
-    def forward(self, x):
-        return self.shortcut(x) + self.residual(x)
+    def forward(self, x, feat_cache=None, feat_idx=None):
+        h = self.shortcut(x)
+        for layer in self.residual:
+            if isinstance(layer, CausalConv1d) and feat_cache is not None:
+                idx = feat_idx[0]
+                cache_x = x[:, :, -CACHE_T:].clone()
+                if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
+                    cache_x = torch.cat([
+                        feat_cache[idx][:, :, -1:].to(cache_x.device),
+                        cache_x,
+                    ], dim=2)
+                x = layer(x, feat_cache[idx])
+                feat_cache[idx] = cache_x
+                feat_idx[0] += 1
+            else:
+                x = layer(x)
+        return x + h
 
 
 class CausalDownsample1d(nn.Module):

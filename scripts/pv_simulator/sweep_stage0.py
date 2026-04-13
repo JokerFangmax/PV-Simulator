@@ -388,6 +388,8 @@ def build_train_command(run, out_dir, wandb_project):
             cmd += ["--lr_decay_steps", str(cfg["lr_decay_steps"])]
         if "lr_min_ratio" in cfg:
             cmd += ["--lr_min_ratio", str(cfg["lr_min_ratio"])]
+    if cfg.get("loss_reweight", False):
+        cmd.append("--loss_reweight")
     return cmd
 
 

@@ -649,6 +649,14 @@ def parse_args():
     parser.add_argument("--huber_delta", type=float, default=0.1,
                         help="Beta for smooth L1 (Huber) — quadratic below |x|<delta, "
                              "linear above. Only used when --loss_type huber.")
+    parser.add_argument("--loss_reweight", action="store_true",
+                        help="Per-sample loss reweighting: divide each sample's reconstruction "
+                             "loss by its variance so all dynamic ranges contribute equally. "
+                             "AE input/output and latent space are unchanged.")
+    parser.add_argument("--compress_var_max", type=float, default=None,
+                        help="Cap per-trajectory temporal variance. Trajectories with var > this "
+                             "value are scaled down to match. Focuses training on detail "
+                             "reconstruction by compressing large dynamic ranges.")
     # Logging
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--checkpointing_steps", type=int, default=5000)
@@ -904,6 +912,15 @@ def main():
             device=accelerator.device,
         )
 
+        # Optional dynamic-range compression: scale down high-variance
+        # trajectories so the AE focuses on detail reconstruction.
+        if args.compress_var_max is not None:
+            with torch.no_grad():
+                x_mean = x.mean(dim=1, keepdim=True)
+                x_var = x.var(dim=1, keepdim=True).clamp(min=1e-8)
+                scale = (args.compress_var_max / x_var).sqrt().clamp(max=1.0)
+                x = x_mean + (x - x_mean) * scale
+
         # --- Forward ---
         with torch.amp.autocast("cuda", dtype=weight_dtype):
             x_hat, z = ae(x)  # x_hat: (B, T_raw, N, 3), z: (B, T, N, 16)
@@ -911,9 +928,22 @@ def main():
             # 1. Reconstruction — MSE, MAE, and Huber are all computed each
             #    step so any of the three can be compared post-hoc.
             #    Optimizer sees whichever --loss_type names.
-            loss_mse   = F.mse_loss(x_hat, x)
-            loss_mae   = F.l1_loss(x_hat, x)
-            loss_huber = F.smooth_l1_loss(x_hat, x, beta=args.huber_delta)
+            if args.loss_reweight:
+                # Per-trajectory reweighting: each (b,:,n,c) trajectory is
+                # divided by its own temporal variance (MSE) or std (MAE)
+                # so all dynamic ranges contribute equally.
+                with torch.no_grad():
+                    x_var = x.var(dim=1, keepdim=True).clamp(min=1e-8)  # (B,1,N,c_in)
+                    x_std = x_var.sqrt()
+                loss_mse   = ((x_hat - x).pow(2) / x_var).mean()
+                loss_mae   = ((x_hat - x).abs() / x_std).mean()
+                loss_huber = (F.smooth_l1_loss(
+                    x_hat, x, beta=args.huber_delta, reduction='none'
+                ) / x_std).mean()
+            else:
+                loss_mse   = F.mse_loss(x_hat, x)
+                loss_mae   = F.l1_loss(x_hat, x)
+                loss_huber = F.smooth_l1_loss(x_hat, x, beta=args.huber_delta)
             loss_recon = {
                 "mse":   loss_mse,
                 "mae":   loss_mae,

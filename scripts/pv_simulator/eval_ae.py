@@ -61,7 +61,7 @@ GENERATOR_CATEGORIES = {
 CATEGORY_ORDER = ["smooth", "sharp", "sparse", "other"]
 
 
-METRIC_NAMES = ["mse", "mmd", "interp"]
+METRIC_NAMES = ["mse", "mae", "mmd", "interp"]
 
 
 @torch.no_grad()
@@ -92,8 +92,9 @@ def eval_checkpoint(ckpt_path: str, device: str = "cpu", n_eval: int = 512, seed
             x = gen_fn(batch_size, T_raw, 16, 3, device)
             x_hat, z = ae(x)
 
-            # MSE
+            # MSE + MAE (both logged so MSE and MAE sweeps are comparable)
             totals["mse"] += F.mse_loss(x_hat.float(), x.float()).item()
+            totals["mae"] += F.l1_loss(x_hat.float(), x.float()).item()
 
             # MMD
             z_flat = z.reshape(-1, d_latent).float()
@@ -192,7 +193,8 @@ def main():
     if len(results_list) > 1:
         best = min(results_list, key=lambda r: r["overall"]["mse"])
         print(f"\nBest by MSE: {best['checkpoint']} (MSE={best['overall']['mse']:.4f}, "
-              f"MMD={best['overall']['mmd']:.4f}, interp={best['overall']['interp']:.4f})")
+              f"MAE={best['overall']['mae']:.4f}, MMD={best['overall']['mmd']:.4f}, "
+              f"interp={best['overall']['interp']:.4f})")
 
 
 if __name__ == "__main__":

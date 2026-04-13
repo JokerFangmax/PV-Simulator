@@ -56,6 +56,86 @@ CATEGORY_COLORS = {
 }
 
 
+def build_reconstruction_figure(ae, device, t_raw=21, n_points=16,
+                                c_in=3, component=0, seed=123):
+    """Build a reconstruction figure with GT vs AE output for every generator.
+
+    Args:
+        ae: Loaded CausalAE (already on `device`, eval mode set by caller).
+        device: torch device the model lives on.
+        t_raw: Number of raw frames (must be 4k+1).
+        n_points: Number of point trajectories per sample.
+        c_in: Input channel count (typically 3).
+        component: Which channel to plot (0..c_in-1).
+        seed: Seed base so figures are reproducible across runs.
+
+    Returns:
+        (fig, overall_mse) — matplotlib Figure (caller must close) and the
+        average MSE across all generators (for logging).
+    """
+    gens = [(fn, w) for fn, w in TRAJECTORY_GENERATORS]
+    gens.sort(key=lambda x: (
+        ["smooth", "sharp", "sparse", "other"].index(CATEGORY_MAP[x[0].__name__]),
+        x[0].__name__,
+    ))
+
+    n = len(gens)
+    ncols = 3
+    nrows = (n + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14, 2.5 * nrows), sharex=True)
+    axes = axes.flatten()
+
+    t_idx = torch.arange(t_raw).cpu().numpy()
+
+    mse_sum = 0.0
+    mse_count = 0
+
+    for i, (gen_fn, _) in enumerate(gens):
+        ax = axes[i]
+        name = gen_fn.__name__
+        cat = CATEGORY_MAP[name]
+        color = CATEGORY_COLORS[cat]
+
+        torch.manual_seed(seed + i)
+        with torch.no_grad():
+            x = gen_fn(1, t_raw, n_points, c_in, device)  # (1, T_raw, N, c_in)
+            x_hat, _ = ae(x)
+
+        gt = x[0, :, 0, component].float().cpu().numpy()
+        rec = x_hat[0, :, 0, component].float().cpu().numpy()
+
+        mse = float(((gt - rec) ** 2).mean())
+        mse_sum += mse
+        mse_count += 1
+
+        ax.plot(t_idx, gt, "-o", color=color, markersize=4, linewidth=1.8,
+                label="GT", alpha=0.9)
+        ax.plot(t_idx, rec, "--x", color="black", markersize=5, linewidth=1.3,
+                label="AE rec", alpha=0.85)
+
+        short_name = name.replace("gen_", "")
+        ax.set_title(f"[{cat}] {short_name}  (MSE={mse:.3f})",
+                     fontsize=10, color=color)
+        ax.grid(True, alpha=0.3)
+        ax.tick_params(labelsize=8)
+        if i == 0:
+            ax.legend(fontsize=8, loc="best")
+
+    for j in range(n, len(axes)):
+        axes[j].axis("off")
+
+    fig.suptitle(
+        f"CausalAE reconstruction  (c_mid={ae.c_mid}, d_latent={ae.d_latent}, "
+        f"T_raw={t_raw}, component={component})",
+        fontsize=13, y=1.00,
+    )
+    fig.tight_layout()
+
+    overall_mse = mse_sum / max(1, mse_count)
+    return fig, overall_mse
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=str,
@@ -80,66 +160,19 @@ def main():
     ae = ae.to(device).eval()
     print(f"  c_mid={ae.c_mid}, d_latent={ae.d_latent}")
 
-    # Generators sorted by category, then name
-    gens = [(fn, w) for fn, w in TRAJECTORY_GENERATORS]
-    gens.sort(key=lambda x: (
-        ["smooth", "sharp", "sparse", "other"].index(CATEGORY_MAP[x[0].__name__]),
-        x[0].__name__,
-    ))
-
-    n = len(gens)
-    ncols = 3
-    nrows = (n + ncols - 1) // ncols
-
-    fig, axes = plt.subplots(nrows, ncols, figsize=(14, 2.5 * nrows), sharex=True)
-    axes = axes.flatten()
-
-    t_idx = torch.arange(args.t_raw).cpu().numpy()
-
-    for i, (gen_fn, _) in enumerate(gens):
-        ax = axes[i]
-        name = gen_fn.__name__
-        cat = CATEGORY_MAP[name]
-        color = CATEGORY_COLORS[cat]
-
-        # Generate batch of 1 (use same seed per gen for reproducibility)
-        torch.manual_seed(args.seed + i)
-        with torch.no_grad():
-            x = gen_fn(1, args.t_raw, args.n_points, args.c_in, device)  # (1, T_raw, N, c_in)
-            x_hat, z = ae(x)
-
-        # Pick first sample, first point, chosen component
-        gt = x[0, :, 0, args.component].float().cpu().numpy()
-        rec = x_hat[0, :, 0, args.component].float().cpu().numpy()
-
-        mse = float(((gt - rec) ** 2).mean())
-
-        ax.plot(t_idx, gt, "-o", color=color, markersize=4, linewidth=1.8,
-                label="GT", alpha=0.9)
-        ax.plot(t_idx, rec, "--x", color="black", markersize=5, linewidth=1.3,
-                label="AE rec", alpha=0.85)
-
-        short_name = name.replace("gen_", "")
-        ax.set_title(f"[{cat}] {short_name}  (MSE={mse:.3f})",
-                     fontsize=10, color=color)
-        ax.grid(True, alpha=0.3)
-        ax.tick_params(labelsize=8)
-        if i == 0:
-            ax.legend(fontsize=8, loc="best")
-
-    # Hide unused axes
-    for j in range(n, len(axes)):
-        axes[j].axis("off")
-
-    fig.suptitle(
-        f"CausalAE reconstruction  (c_mid={ae.c_mid}, d_latent={ae.d_latent}, "
-        f"T_raw={args.t_raw}, component={args.component})",
-        fontsize=13, y=1.00,
+    fig, overall_mse = build_reconstruction_figure(
+        ae, device,
+        t_raw=args.t_raw,
+        n_points=args.n_points,
+        c_in=args.c_in,
+        component=args.component,
+        seed=args.seed,
     )
-    fig.tight_layout()
+    print(f"  overall MSE: {overall_mse:.4f}")
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     fig.savefig(args.out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
     print(f"Saved plot to {args.out}")
 
 

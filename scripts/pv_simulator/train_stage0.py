@@ -606,6 +606,9 @@ def parse_args():
     parser.add_argument("--c_in", type=int, default=3)
     parser.add_argument("--c_mid", type=int, default=64)
     parser.add_argument("--d_latent", type=int, default=16)
+    parser.add_argument("--n_res_blocks", type=int, default=1,
+                        help="ResidualBlock1d stacks per level (depth knob). "
+                             "Default 1 reproduces the original AE architecture.")
     # Data generation
     parser.add_argument("--n_pts", type=int, default=64,
                         help="Number of independent point trajectories per sample")
@@ -618,12 +621,19 @@ def parse_args():
     parser.add_argument("--max_train_steps", type=int, default=50000)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--lr_scheduler", type=str, default="cosine",
-                        choices=["cosine", "constant", "linear"])
+                        choices=["cosine", "constant", "linear", "cosine_floor"])
     parser.add_argument("--lr_warmup_steps", type=int, default=500)
     parser.add_argument("--lr_total_steps", type=int, default=None,
                         help="Total steps for the LR schedule cycle. Defaults to max_train_steps. "
                              "Set this to the FULL planned training length when doing a partial run "
                              "that will later be resumed, so the schedule matches across both runs.")
+    parser.add_argument("--lr_decay_steps", type=int, default=None,
+                        help="(cosine_floor only) Steps over which cosine decays from lr to "
+                             "lr*lr_min_ratio. After this, LR holds at the floor. "
+                             "Defaults to lr_total_steps (i.e. standard cosine).")
+    parser.add_argument("--lr_min_ratio", type=float, default=0.01,
+                        help="(cosine_floor only) Floor LR as a fraction of peak LR. "
+                             "E.g. 0.01 means floor = lr * 0.01.")
     parser.add_argument("--grad_clip", type=float, default=1.0,
                         help="Max gradient norm (0 to disable)")
     parser.add_argument("--seed", type=int, default=42)
@@ -631,6 +641,14 @@ def parse_args():
     parser.add_argument("--lambda_mmd", type=float, default=0.1)
     parser.add_argument("--lambda_smooth", type=float, default=0.0)
     parser.add_argument("--lambda_interp", type=float, default=0.1)
+    parser.add_argument("--loss_type", type=str, default="mse",
+                        choices=["mse", "mae", "huber"],
+                        help="Reconstruction loss used as the training objective. "
+                             "MSE and MAE are always logged; huber uses smooth_l1 with "
+                             "beta=--huber_delta and is logged as loss_huber.")
+    parser.add_argument("--huber_delta", type=float, default=0.1,
+                        help="Beta for smooth L1 (Huber) — quadratic below |x|<delta, "
+                             "linear above. Only used when --loss_type huber.")
     # Logging
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--checkpointing_steps", type=int, default=5000)
@@ -638,10 +656,111 @@ def parse_args():
                         choices=["tensorboard", "wandb", "none"])
     parser.add_argument("--wandb_project", type=str, default="pv-sim-ae")
     parser.add_argument("--wandb_run_name", type=str, default=None)
+    # Validation
+    parser.add_argument("--val_every", type=int, default=0,
+                        help="Run a validation step every N training steps (0 disables). "
+                             "Logs val/mse, val/mmd, val/interp, and a reconstruction image to wandb.")
+    parser.add_argument("--val_batch_size", type=int, default=256,
+                        help="Batch size for the validation synthetic batch.")
+    parser.add_argument("--val_t_raw", type=int, default=21,
+                        help="T_raw for validation (fixed, must be 4k+1).")
+    parser.add_argument("--val_n_points", type=int, default=16,
+                        help="N points per sample for the reconstruction figure.")
+    parser.add_argument("--val_seed", type=int, default=123,
+                        help="Seed for the reconstruction figure generators.")
     # Mixed precision
     parser.add_argument("--mixed_precision", type=str, default="bf16",
                         choices=["no", "fp16", "bf16"])
     return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def run_validation(ae, accelerator, args, global_step, weight_dtype):
+    """Evaluate on a fresh synthetic batch and log metrics + reconstruction image.
+
+    Called only from the main process. Assumes `ae` is the accelerator-wrapped
+    model and that `accelerator.is_main_process` is True.
+    """
+    unwrapped = accelerator.unwrap_model(ae)
+    was_training = unwrapped.training
+    unwrapped.eval()
+
+    device = accelerator.device
+    T_raw = args.val_t_raw
+    B = args.val_batch_size
+
+    with torch.amp.autocast("cuda", dtype=weight_dtype):
+        x = generate_synthetic_batch(B, T_raw, args.n_pts, args.c_in, device=device)
+        x_hat, z = unwrapped(x)
+        loss_mse = F.mse_loss(x_hat, x)
+        loss_mae = F.l1_loss(x_hat, x)
+        loss_huber = F.smooth_l1_loss(x_hat, x, beta=args.huber_delta)
+        z_flat = z.reshape(-1, args.d_latent).float()
+        p = torch.randn_like(z_flat)
+        loss_mmd = mmd_imq(z_flat, p)
+        alpha = torch.rand(B, 1, 1, 1, device=device)
+        perm = torch.randperm(B, device=device)
+        x2 = x[perm]
+        x_interp = alpha * x + (1.0 - alpha) * x2
+        _, z_interp = unwrapped(x_interp)
+        _, z2 = unwrapped(x2)
+        z_target = alpha * z + (1.0 - alpha) * z2
+        loss_interp = F.mse_loss(z_interp, z_target)
+
+    val_metrics = {
+        "val/mse":    float(loss_mse.item()),
+        "val/mae":    float(loss_mae.item()),
+        "val/huber":  float(loss_huber.item()),
+        "val/mmd":    float(loss_mmd.item()),
+        "val/interp": float(loss_interp.item()),
+    }
+
+    # Build reconstruction figure and log as wandb image.
+    try:
+        from scripts.pv_simulator.plot_ae_reconstruction import build_reconstruction_figure
+        import matplotlib.pyplot as plt
+
+        fig, fig_mse = build_reconstruction_figure(
+            unwrapped, device,
+            t_raw=args.val_t_raw,
+            n_points=args.val_n_points,
+            c_in=args.c_in,
+            component=0,
+            seed=args.val_seed,
+        )
+        val_metrics["val/recon_figure_mse"] = float(fig_mse)
+
+        if args.report_to == "wandb":
+            try:
+                import wandb
+                tracker = accelerator.get_tracker("wandb", unwrap=True)
+                if tracker is not None:
+                    tracker.log(
+                        {"val/reconstruction": wandb.Image(fig),
+                         **val_metrics},
+                        step=global_step,
+                    )
+            except Exception as e:
+                logger.warning(f"[val] wandb image log failed: {e}")
+                accelerator.log(val_metrics, step=global_step)
+        else:
+            accelerator.log(val_metrics, step=global_step)
+        plt.close(fig)
+    except Exception as e:
+        logger.warning(f"[val] reconstruction figure failed: {e}")
+        accelerator.log(val_metrics, step=global_step)
+    logger.info(
+        f"[val @ {global_step}] mse={val_metrics['val/mse']:.4f} "
+        f"mae={val_metrics['val/mae']:.4f} "
+        f"mmd={val_metrics['val/mmd']:.4f} interp={val_metrics['val/interp']:.4f}"
+    )
+
+    if was_training:
+        unwrapped.train()
 
 
 # ---------------------------------------------------------------------------
@@ -678,7 +797,8 @@ def main():
         logger.info(f"Resuming from checkpoint: {args.resume_from}")
         ae = CausalAE.load(args.resume_from)
     else:
-        ae = CausalAE(c_in=args.c_in, c_mid=args.c_mid, d_latent=args.d_latent)
+        ae = CausalAE(c_in=args.c_in, c_mid=args.c_mid, d_latent=args.d_latent,
+                      n_res_blocks=args.n_res_blocks)
     n_params = sum(p.numel() for p in ae.parameters())
     logger.info(f"CausalAE params: {n_params:,}")
 
@@ -706,6 +826,17 @@ def main():
                     return float(step) / max(1, warmup)
                 progress = float(step - warmup) / max(1, total - warmup)
                 return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+        elif sched == "cosine_floor":
+            decay_steps = args.lr_decay_steps if args.lr_decay_steps is not None else total
+            min_ratio = args.lr_min_ratio
+            def lr_lambda(rel_step):
+                step = rel_step + start
+                if step < warmup:
+                    return float(step) / max(1, warmup)
+                if step >= decay_steps:
+                    return min_ratio
+                progress = float(step - warmup) / max(1, decay_steps - warmup)
+                return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
         elif sched == "linear":
             def lr_lambda(rel_step):
                 step = rel_step + start
@@ -777,8 +908,17 @@ def main():
         with torch.amp.autocast("cuda", dtype=weight_dtype):
             x_hat, z = ae(x)  # x_hat: (B, T_raw, N, 3), z: (B, T, N, 16)
 
-            # 1. MSE reconstruction loss
-            loss_mse = F.mse_loss(x_hat, x)
+            # 1. Reconstruction — MSE, MAE, and Huber are all computed each
+            #    step so any of the three can be compared post-hoc.
+            #    Optimizer sees whichever --loss_type names.
+            loss_mse   = F.mse_loss(x_hat, x)
+            loss_mae   = F.l1_loss(x_hat, x)
+            loss_huber = F.smooth_l1_loss(x_hat, x, beta=args.huber_delta)
+            loss_recon = {
+                "mse":   loss_mse,
+                "mae":   loss_mae,
+                "huber": loss_huber,
+            }[args.loss_type]
 
             # 2. MMD regularization (WAE-MMD with IMQ kernel)
             z_flat = z.reshape(-1, args.d_latent).float()
@@ -799,7 +939,7 @@ def main():
             z_target = alpha * z.detach() + (1.0 - alpha) * z2
             loss_interp = F.mse_loss(z_interp, z_target)
 
-            loss = (loss_mse
+            loss = (loss_recon
                     + args.lambda_mmd * loss_mmd
                     + args.lambda_smooth * loss_smooth
                     + args.lambda_interp * loss_interp)
@@ -818,6 +958,8 @@ def main():
         # Update EMA every step
         _update_ema("loss",        loss.item())
         _update_ema("loss_mse",    loss_mse.item())
+        _update_ema("loss_mae",    loss_mae.item())
+        _update_ema("loss_huber",  loss_huber.item())
         _update_ema("loss_mmd",    loss_mmd.item())
         _update_ema("loss_smooth", loss_smooth.item())
         _update_ema("loss_interp", loss_interp.item())
@@ -828,6 +970,8 @@ def main():
             log_dict = {
                 "loss":        ema["loss"],
                 "loss_mse":    ema["loss_mse"],
+                "loss_mae":    ema["loss_mae"],
+                "loss_huber":  ema["loss_huber"],
                 "loss_mmd":    ema["loss_mmd"],
                 "loss_smooth": ema["loss_smooth"],
                 "loss_interp": ema["loss_interp"],
@@ -836,7 +980,8 @@ def main():
             accelerator.log(log_dict, step=global_step)
             logger.info(
                 f"Step {global_step}: loss={ema['loss']:.4f} "
-                f"mse={ema['loss_mse']:.4f} mmd={ema['loss_mmd']:.4f} "
+                f"mse={ema['loss_mse']:.4f} mae={ema['loss_mae']:.4f} "
+                f"mmd={ema['loss_mmd']:.4f} "
                 f"smooth={ema['loss_smooth']:.4f} interp={ema['loss_interp']:.4f}"
             )
 
@@ -846,6 +991,12 @@ def main():
             unwrapped = accelerator.unwrap_model(ae)
             unwrapped.save(save_dir)
             logger.info(f"Saved checkpoint to {save_dir}")
+
+        # --- Validation ---
+        if (args.val_every > 0
+                and global_step % args.val_every == 0
+                and accelerator.is_main_process):
+            run_validation(ae, accelerator, args, global_step, weight_dtype)
 
     # --- Save final ---
     if accelerator.is_main_process:

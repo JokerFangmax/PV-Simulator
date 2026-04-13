@@ -111,29 +111,37 @@ class _Upsample1d(nn.Module):
 class CausalAEEncoder(nn.Module):
     """4x causal temporal encoder with cache support.
 
-    Architecture::
+    Architecture (``n_res_blocks=k``)::
 
         CausalConv1d(c_in → c_mid, k=3)
-        ResidualBlock1d(c_mid → c_mid)
-        Downsample(c_mid)                  # T → ~T/2 (via cache)
-        ResidualBlock1d(c_mid → c_mid)
-        Downsample(c_mid)                  # → ~T/4 (via cache)
-        ResidualBlock1d(c_mid → d_latent)
+        [ResidualBlock1d(c_mid → c_mid)] × k   # level 0
+        Downsample(c_mid)                      # T → ~T/2 (via cache)
+        [ResidualBlock1d(c_mid → c_mid)] × k   # level 1
+        Downsample(c_mid)                      # → ~T/4 (via cache)
+        [ResidualBlock1d(c_mid → c_mid)] × (k-1)
+        ResidualBlock1d(c_mid → d_latent)      # bottleneck projection
 
+    With ``k=1`` this collapses to the original 3-ResBlock architecture.
     Must be called with ``feat_cache`` / ``feat_idx`` for correct temporal
     compression (see :class:`CausalAE`).
     """
 
-    def __init__(self, c_in: int = 3, c_mid: int = 64, d_latent: int = 16):
+    def __init__(self, c_in: int = 3, c_mid: int = 64, d_latent: int = 16,
+                 n_res_blocks: int = 1):
         super().__init__()
+        assert n_res_blocks >= 1
         self.conv1 = CausalConv1d(c_in, c_mid, kernel_size=3, padding=1)
-        self.blocks = nn.ModuleList([
-            ResidualBlock1d(c_mid, c_mid),
-            _Downsample1d(c_mid),
-            ResidualBlock1d(c_mid, c_mid),
-            _Downsample1d(c_mid),
-            ResidualBlock1d(c_mid, d_latent),
-        ])
+        blocks = []
+        for _ in range(n_res_blocks):
+            blocks.append(ResidualBlock1d(c_mid, c_mid))
+        blocks.append(_Downsample1d(c_mid))
+        for _ in range(n_res_blocks):
+            blocks.append(ResidualBlock1d(c_mid, c_mid))
+        blocks.append(_Downsample1d(c_mid))
+        for _ in range(n_res_blocks - 1):
+            blocks.append(ResidualBlock1d(c_mid, c_mid))
+        blocks.append(ResidualBlock1d(c_mid, d_latent))
+        self.blocks = nn.ModuleList(blocks)
 
     def forward(self, x, feat_cache=None, feat_idx=None):
         # conv1 with cache
@@ -163,27 +171,35 @@ class CausalAEEncoder(nn.Module):
 class CausalAEDecoder(nn.Module):
     """4x causal temporal decoder with cache support.
 
-    Architecture::
+    Architecture (``n_res_blocks=k``)::
 
         CausalConv1d(d_latent → c_mid, k=3)
-        ResidualBlock1d(c_mid → c_mid)
-        Upsample(c_mid)                    # T → 2T (via cache)
-        ResidualBlock1d(c_mid → c_mid)
-        Upsample(c_mid)                    # → 4T (via cache)
-        CausalConv1d(c_mid → c_out, k=3)   # head
+        [ResidualBlock1d(c_mid → c_mid)] × k    # level 0
+        Upsample(c_mid)                         # T → 2T (via cache)
+        [ResidualBlock1d(c_mid → c_mid)] × k    # level 1
+        Upsample(c_mid)                         # → 4T (via cache)
+        [ResidualBlock1d(c_mid → c_mid)] × (k-1)
+        CausalConv1d(c_mid → c_out, k=3)        # head
 
+    With ``k=1`` this collapses to the original 2-ResBlock decoder.
     Must be called with ``feat_cache`` / ``feat_idx`` (see :class:`CausalAE`).
     """
 
-    def __init__(self, d_latent: int = 16, c_mid: int = 64, c_out: int = 3):
+    def __init__(self, d_latent: int = 16, c_mid: int = 64, c_out: int = 3,
+                 n_res_blocks: int = 1):
         super().__init__()
+        assert n_res_blocks >= 1
         self.conv1 = CausalConv1d(d_latent, c_mid, kernel_size=3, padding=1)
-        self.blocks = nn.ModuleList([
-            ResidualBlock1d(c_mid, c_mid),
-            _Upsample1d(c_mid),
-            ResidualBlock1d(c_mid, c_mid),
-            _Upsample1d(c_mid),
-        ])
+        blocks = []
+        for _ in range(n_res_blocks):
+            blocks.append(ResidualBlock1d(c_mid, c_mid))
+        blocks.append(_Upsample1d(c_mid))
+        for _ in range(n_res_blocks):
+            blocks.append(ResidualBlock1d(c_mid, c_mid))
+        blocks.append(_Upsample1d(c_mid))
+        for _ in range(n_res_blocks - 1):
+            blocks.append(ResidualBlock1d(c_mid, c_mid))
+        self.blocks = nn.ModuleList(blocks)
         self.head = CausalConv1d(c_mid, c_out, kernel_size=3, padding=1)
 
     def forward(self, x, feat_cache=None, feat_idx=None):
@@ -242,15 +258,19 @@ class CausalAE(nn.Module):
         c_in: Input/output channels (default 3 for pos or vel).
         c_mid: Intermediate channel width.
         d_latent: Latent dimension per channel group.
+        n_res_blocks: Number of ResidualBlock1d stacked at each level (depth knob).
+            Default 1 reproduces the original architecture.
     """
 
-    def __init__(self, c_in: int = 3, c_mid: int = 64, d_latent: int = 16):
+    def __init__(self, c_in: int = 3, c_mid: int = 64, d_latent: int = 16,
+                 n_res_blocks: int = 1):
         super().__init__()
         self.c_in = c_in
         self.c_mid = c_mid
         self.d_latent = d_latent
-        self.encoder = CausalAEEncoder(c_in, c_mid, d_latent)
-        self.decoder = CausalAEDecoder(d_latent, c_mid, c_in)
+        self.n_res_blocks = n_res_blocks
+        self.encoder = CausalAEEncoder(c_in, c_mid, d_latent, n_res_blocks)
+        self.decoder = CausalAEDecoder(d_latent, c_mid, c_in, n_res_blocks)
 
     @staticmethod
     def _init_cache(model):
@@ -372,6 +392,7 @@ class CausalAE(nn.Module):
             'c_in': self.c_in,
             'c_mid': self.c_mid,
             'd_latent': self.d_latent,
+            'n_res_blocks': self.n_res_blocks,
         }
         torch.save(config, os.path.join(path, 'config.pt'))
         torch.save(self.state_dict(), os.path.join(path, 'causal_ae.pt'))
@@ -383,6 +404,8 @@ class CausalAE(nn.Module):
             os.path.join(path, 'config.pt'),
             map_location=map_location, weights_only=True,
         )
+        # Backward compat: older checkpoints predate the n_res_blocks knob.
+        config.setdefault('n_res_blocks', 1)
         model = cls(**config)
         state_dict = torch.load(
             os.path.join(path, 'causal_ae.pt'),

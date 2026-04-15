@@ -65,8 +65,13 @@ class SimSelfAttention(nn.Module):
         k = self.norm_k(self.k(x.to(w_dtype))).view(b, s, n, d)
         v = self.v(x.to(w_dtype)).view(b, s, n, d)
 
-        # No RoPE for simulation tokens
-        x = attention(q.to(dtype), k.to(dtype), v=v.to(dtype), attn_mask=attn_mask)
+        # No RoPE for simulation tokens.
+        # Force SDPA when attn_mask is provided: the shared wrapper would otherwise
+        # convert attn_mask → k_lens for Flash Attention and silently drop the mask
+        # if FA isn't installed (falling back to SDPA without the mask).
+        attention_type = "SDPA" if attn_mask is not None else None
+        x = attention(q.to(dtype), k.to(dtype), v=v.to(dtype),
+                      attn_mask=attn_mask, attention_type=attention_type)
         x = x.to(w_dtype).flatten(2)
         x = self.o(x)
         return x

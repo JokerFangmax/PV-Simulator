@@ -46,7 +46,7 @@ for _root in [
     if _root not in sys.path:
         sys.path.insert(0, _root)
 
-from videox_fun.models.sim_ae import CausalAE
+from videox_fun.models.sim_ae import CausalAE, MLPAE
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -609,6 +609,11 @@ def parse_args():
     parser.add_argument("--n_res_blocks", type=int, default=1,
                         help="ResidualBlock1d stacks per level (depth knob). "
                              "Default 1 reproduces the original AE architecture.")
+    parser.add_argument("--ae_type", type=str, default="causal",
+                        choices=["causal", "mlp"],
+                        help="AE architecture: 'causal' (CausalAE with conv) or 'mlp' (MLPAE).")
+    parser.add_argument("--n_hidden_layers", type=int, default=2,
+                        help="Number of hidden layers in MLPAE MLPs (ignored for causal).")
     # Data generation
     parser.add_argument("--n_pts", type=int, default=64,
                         help="Number of independent point trajectories per sample")
@@ -803,12 +808,15 @@ def main():
     # --- Model ---
     if args.resume_from:
         logger.info(f"Resuming from checkpoint: {args.resume_from}")
-        ae = CausalAE.load(args.resume_from)
+        ae = CausalAE.load(args.resume_from)  # auto-dispatches to MLPAE if needed
+    elif args.ae_type == "mlp":
+        ae = MLPAE(c_in=args.c_in, hidden_dim=args.c_mid, d_latent=args.d_latent,
+                   n_hidden_layers=args.n_hidden_layers)
     else:
         ae = CausalAE(c_in=args.c_in, c_mid=args.c_mid, d_latent=args.d_latent,
                       n_res_blocks=args.n_res_blocks)
     n_params = sum(p.numel() for p in ae.parameters())
-    logger.info(f"CausalAE params: {n_params:,}")
+    logger.info(f"{type(ae).__name__} params: {n_params:,}")
 
     # --- Optimizer ---
     optimizer = torch.optim.AdamW(ae.parameters(), lr=args.lr, weight_decay=1e-4)

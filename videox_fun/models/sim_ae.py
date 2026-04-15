@@ -22,6 +22,151 @@ from videox_fun.models.sim_causal_encoder import (
 )
 
 
+# ---------------------------------------------------------------------------
+# MLP-based AE  (no causal convolutions — pure pointwise MLPs)
+# ---------------------------------------------------------------------------
+
+def _build_mlp(in_dim: int, hidden_dim: int, out_dim: int, n_hidden: int = 2):
+    """Build a simple MLP: Linear → GELU → ... → Linear."""
+    layers = [nn.Linear(in_dim, hidden_dim), nn.GELU()]
+    for _ in range(n_hidden - 1):
+        layers += [nn.Linear(hidden_dim, hidden_dim), nn.GELU()]
+    layers.append(nn.Linear(hidden_dim, out_dim))
+    return nn.Sequential(*layers)
+
+
+class MLPAE(nn.Module):
+    """MLP-based Autoencoder: 4x temporal compression for 3D trajectories.
+
+    Uses two separate MLPs for encoder and decoder:
+    - MLP_first: handles the first frame (1→1 mapping)
+    - MLP_rest: handles remaining frames in groups of 4 (4→1 compression)
+
+    Args:
+        c_in: Input/output channels (default 3).
+        hidden_dim: MLP hidden layer width (reported as c_mid for compat).
+        d_latent: Latent dimension.
+        n_hidden_layers: Number of hidden layers in each MLP.
+    """
+
+    def __init__(self, c_in: int = 3, hidden_dim: int = 128,
+                 d_latent: int = 16, n_hidden_layers: int = 2):
+        super().__init__()
+        self.c_in = c_in
+        self.c_mid = hidden_dim  # compat with CausalAE interface
+        self.d_latent = d_latent
+        self.n_hidden_layers = n_hidden_layers
+
+        # Encoder MLPs
+        self.enc_first = _build_mlp(c_in, hidden_dim, d_latent, n_hidden_layers)
+        self.enc_rest = _build_mlp(4 * c_in, hidden_dim, d_latent, n_hidden_layers)
+
+        # Decoder MLPs
+        self.dec_first = _build_mlp(d_latent, hidden_dim, c_in, n_hidden_layers)
+        self.dec_rest = _build_mlp(d_latent, hidden_dim, 4 * c_in, n_hidden_layers)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode (B, T_raw, N, c_in) → (B, T, N, d_latent) where T=(T_raw-1)//4+1."""
+        squeeze = x.ndim == 3
+        if squeeze:
+            x = x.unsqueeze(2)
+
+        B, T_raw, N, C = x.shape
+        # First frame: (B, 1, N, c_in) → (B, 1, N, d_latent)
+        z_first = self.enc_first(x[:, :1])  # (B, 1, N, d_latent)
+
+        if T_raw > 1:
+            # Remaining frames: (B, 4k, N, c_in) → (B, k, N, 4*c_in) → (B, k, N, d_latent)
+            rest = x[:, 1:]  # (B, 4k, N, C)
+            k = rest.shape[1] // 4
+            rest = rest.reshape(B, k, 4, N, C).permute(0, 1, 3, 2, 4)  # (B, k, N, 4, C)
+            rest = rest.reshape(B, k, N, 4 * C)  # (B, k, N, 4*C)
+            z_rest = self.enc_rest(rest)  # (B, k, N, d_latent)
+            z = torch.cat([z_first, z_rest], dim=1)  # (B, k+1, N, d_latent)
+        else:
+            z = z_first
+
+        if squeeze:
+            z = z.squeeze(2)
+        return z
+
+    def decode(self, z: torch.Tensor, t_raw: int) -> torch.Tensor:
+        """Decode (B, T, N, d_latent) → (B, T_raw, N, c_in)."""
+        squeeze = z.ndim == 3
+        if squeeze:
+            z = z.unsqueeze(2)
+
+        B, T, N, D = z.shape
+        # First latent → first frame
+        x_first = self.dec_first(z[:, :1])  # (B, 1, N, c_in)
+
+        if T > 1:
+            # Remaining latents → groups of 4 frames
+            z_rest = z[:, 1:]  # (B, k, N, d_latent)
+            k = z_rest.shape[1]
+            out_rest = self.dec_rest(z_rest)  # (B, k, N, 4*c_in)
+            C = self.c_in
+            out_rest = out_rest.reshape(B, k, N, 4, C).permute(0, 1, 3, 2, 4)  # (B, k, 4, N, C)
+            out_rest = out_rest.reshape(B, k * 4, N, C)  # (B, 4k, N, C)
+            x_hat = torch.cat([x_first, out_rest], dim=1)  # (B, 4k+1, N, C)
+        else:
+            x_hat = x_first
+
+        x_hat = x_hat[:, :t_raw]
+
+        if squeeze:
+            x_hat = x_hat.squeeze(2)
+        return x_hat
+
+    def forward(self, x: torch.Tensor):
+        """Full encode-decode pass. Returns (x_hat, z)."""
+        squeeze = x.ndim == 3
+        if squeeze:
+            x = x.unsqueeze(2)
+
+        t_raw = x.shape[1]
+        z = self.encode(x)
+        x_hat = self.decode(z, t_raw)
+
+        if squeeze:
+            x_hat = x_hat.squeeze(2)
+            z = z.squeeze(2)
+        return x_hat, z
+
+    def save(self, path: str):
+        """Save model config and weights."""
+        os.makedirs(path, exist_ok=True)
+        config = {
+            'ae_type': 'mlp',
+            'c_in': self.c_in,
+            'c_mid': self.c_mid,
+            'd_latent': self.d_latent,
+            'n_hidden_layers': self.n_hidden_layers,
+        }
+        torch.save(config, os.path.join(path, 'config.pt'))
+        torch.save(self.state_dict(), os.path.join(path, 'causal_ae.pt'))
+
+    @classmethod
+    def load(cls, path: str, map_location='cpu') -> 'MLPAE':
+        """Load MLPAE from checkpoint directory."""
+        config = torch.load(
+            os.path.join(path, 'config.pt'),
+            map_location=map_location, weights_only=True,
+        )
+        model = cls(
+            c_in=config['c_in'],
+            hidden_dim=config['c_mid'],
+            d_latent=config['d_latent'],
+            n_hidden_layers=config.get('n_hidden_layers', 2),
+        )
+        state_dict = torch.load(
+            os.path.join(path, 'causal_ae.pt'),
+            map_location=map_location, weights_only=True,
+        )
+        model.load_state_dict(state_dict)
+        return model
+
+
 def _count_causal_conv1d(model):
     """Count CausalConv1d modules for cache slot allocation."""
     return sum(1 for m in model.modules() if isinstance(m, CausalConv1d))
@@ -398,12 +543,19 @@ class CausalAE(nn.Module):
         torch.save(self.state_dict(), os.path.join(path, 'causal_ae.pt'))
 
     @classmethod
-    def load(cls, path: str, map_location='cpu') -> 'CausalAE':
-        """Load model from checkpoint directory."""
+    def load(cls, path: str, map_location='cpu'):
+        """Load model from checkpoint directory.
+
+        Auto-dispatches to MLPAE if the saved config has ae_type='mlp'.
+        """
         config = torch.load(
             os.path.join(path, 'config.pt'),
             map_location=map_location, weights_only=True,
         )
+        # Dispatch to MLPAE if saved as such
+        ae_type = config.pop('ae_type', 'causal')
+        if ae_type == 'mlp':
+            return MLPAE.load(path, map_location=map_location)
         # Backward compat: older checkpoints predate the n_res_blocks knob.
         config.setdefault('n_res_blocks', 1)
         model = cls(**config)

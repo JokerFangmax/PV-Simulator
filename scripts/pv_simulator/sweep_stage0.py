@@ -245,6 +245,39 @@ def phase_g_configs():
     return runs
 
 
+def phase_mlp_configs():
+    """Stage MLP — MLP-based AE capacity sweep.
+
+    Sweeps hidden_dim × n_hidden_layers at fixed d_latent=16.
+    All runs use MAE loss, 15k steps, lr=1e-3, cosine schedule.
+
+    lambda_mmd and lambda_interp are set to 0 because the MLP latent has no
+    architectural constraint on its magnitude — any nonzero interp/mmd weight
+    causes latent explosion and divergence.  Latent regularization (if needed)
+    should be done via architectural constraints (LayerNorm, tanh) instead.
+    """
+    common = dict(DEFAULTS)
+    common["lambda_mmd"]    = 0.0
+    common["lambda_interp"] = 0.0
+    common["lr"]            = 1e-3
+    common["lr_scheduler"]  = "cosine"
+    common["d_latent"]      = 16
+    common["max_train_steps"] = 15000
+    common["loss_type"]     = "mae"
+    common["lr_total_steps_override"] = 15000
+    common["ae_type"]       = "mlp"
+
+    runs = []
+    for hidden_dim in [64, 128, 256]:
+        for n_hidden in [1, 2]:
+            cfg = dict(common)
+            cfg["c_mid"] = hidden_dim  # c_mid stores hidden_dim for MLPAE
+            cfg["n_hidden_layers"] = n_hidden
+            name = f"h{hidden_dim}-L{n_hidden}-d16"
+            runs.append({"name": name, "category": "stage_mlp", "cfg": cfg})
+    return runs
+
+
 def phase_d_configs(winner_abc, depths=(1, 2, 3)):
     """Phase D: sweep n_res_blocks (depth) at the A+B+C winner config.
 
@@ -390,6 +423,10 @@ def build_train_command(run, out_dir, wandb_project):
             cmd += ["--lr_min_ratio", str(cfg["lr_min_ratio"])]
     if cfg.get("loss_reweight", False):
         cmd.append("--loss_reweight")
+    if cfg.get("ae_type", "causal") != "causal":
+        cmd += ["--ae_type", cfg["ae_type"]]
+    if "n_hidden_layers" in cfg:
+        cmd += ["--n_hidden_layers", str(cfg["n_hidden_layers"])]
     return cmd
 
 
@@ -471,7 +508,7 @@ def write_tracker(state):
     lines.append("- λ_smooth pinned to 0 per user feedback.")
     lines.append("")
 
-    for phase_key in ["A", "B", "C", "D", "E", "F", "G"]:
+    for phase_key in ["A", "B", "C", "D", "E", "F", "G", "MLP"]:
         phase = state["phases"].get(phase_key)
         if phase is None:
             continue
@@ -483,6 +520,7 @@ def write_tracker(state):
             "E": "Stage E — Depth + budget diagnostic",
             "F": "Stage F — Huber loss sweep",
             "G": "Stage G — cosine_floor LR schedule",
+            "MLP": "Stage MLP — MLP-based AE capacity sweep",
         }[phase_key]
         lines.append(f"## {title}  (status: {phase['status']})\n")
         if phase.get("note"):
@@ -761,6 +799,9 @@ def main():
     parser.add_argument("--run_stage_g", action="store_true",
                         help="Run Stage G: cosine_floor LR schedule sweep "
                              "(decay_steps x min_ratio) at 15k steps.")
+    parser.add_argument("--run_stage_mlp", action="store_true",
+                        help="Run Stage MLP: MLP-based AE capacity sweep "
+                             "(hidden_dim × n_hidden_layers) at 15k steps.")
     parser.add_argument("--d_depths", type=int, nargs="+", default=[1, 2, 3],
                         help="n_res_blocks values to sweep in Phase D.")
     parser.add_argument("--force_c_lr", type=float, default=None,
@@ -780,7 +821,7 @@ def main():
 
     configure_paths_for_loss_type(args.loss_type)
 
-    if args.run_stage_e or args.run_stage_f or args.run_stage_g:
+    if args.run_stage_e or args.run_stage_f or args.run_stage_g or args.run_stage_mlp:
         global OUT_ROOT, TRACKER, WANDB_PREFIX, RECON_METRIC
         RECON_METRIC = "mae"
 
@@ -793,6 +834,11 @@ def main():
         OUT_ROOT     = ROOT / "outputs" / "stage0" / "diag"
         TRACKER      = SWEEP_DIR / "experiments_stage_f.md"
         WANDB_PREFIX = "pv-ae-stage-f"
+
+    if args.run_stage_mlp:
+        OUT_ROOT     = ROOT / "outputs" / "stage0" / "diag"
+        TRACKER      = SWEEP_DIR / "experiments_stage_mlp.md"
+        WANDB_PREFIX = "pv-ae-stage-mlp"
 
     if args.run_stage_g:
         OUT_ROOT     = ROOT / "outputs" / "stage0" / "diag"
@@ -867,6 +913,41 @@ def main():
                 f"(delta={winner_f['cfg'].get('huber_delta', '?')})"
             )
         state["summary"].append("Stage F complete.")
+        write_tracker(state)
+        return
+
+    if args.run_stage_mlp:
+        state = {
+            "phases": {
+                "MLP": {"runs": [], "status": "pending", "winner": None,
+                        "note": "Stage MLP: MLP-based AE capacity sweep "
+                                "(hidden_dim ∈ {64,128,256} × n_hidden_layers ∈ {1,2}), "
+                                "MAE loss, 15k steps"},
+            },
+            "summary": [],
+        }
+        write_tracker(state)
+        runs_mlp = run_phase("MLP", phase_mlp_configs(), state, WANDB_PREFIX)
+        winner_mlp = pick_winner_best_score(runs_mlp)
+        state["phases"]["MLP"]["winner"] = winner_mlp
+        for r in runs_mlp:
+            if r.get("status") != "done":
+                continue
+            m = r["metrics"]["overall"]
+            state["summary"].append(
+                f"`{r['name']}` (hidden={r['cfg']['c_mid']}, "
+                f"layers={r['cfg'].get('n_hidden_layers', 2)}): "
+                f"MSE={m['mse']:.6f}, MAE={m.get('mae', float('nan')):.4f}, "
+                f"MMD={m['mmd']:.4f}, interp={m['interp']:.4f}, "
+                f"score={r.get('score', float('nan')):.3f}"
+            )
+        if winner_mlp is not None:
+            state["summary"].append(
+                f"Best by composite: `{winner_mlp['name']}` "
+                f"(hidden={winner_mlp['cfg']['c_mid']}, "
+                f"layers={winner_mlp['cfg'].get('n_hidden_layers', 2)})"
+            )
+        state["summary"].append("Stage MLP complete.")
         write_tracker(state)
         return
 

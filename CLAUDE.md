@@ -66,7 +66,7 @@ There are **no automated tests** in this repository.
 |------|---------|
 | `videox_fun/models/sim_ae.py` | `CausalAE`: 4x causal autoencoder for temporal compression `(T_raw, 3) → (T, 16)`; trained in Stage 0, frozen after |
 | `videox_fun/models/sim_causal_encoder.py` | Building blocks (CausalConv1d, ResidualBlock1d, CausalDownsample1d, CausalUpsample1d); used by `sim_ae.py` and `sim_condition.py` force encoder |
-| `videox_fun/models/sim_condition.py` | `SimConditionEmbedder`: encodes physics conditions (floor, object ID, material, mass, static flag, force) → d_cond=368 |
+| `videox_fun/models/sim_condition.py` | `SimConditionEmbedder`: encodes physics conditions (floor, object ID, material, mass, static flag, force) → d_cond=60. Force is pre-encoded by the frozen CausalAE upstream. |
 | `videox_fun/models/sim_transformer.py` | `SimTransformer`: 10-block DiT for physics simulation (d=512, 8 heads) |
 | `videox_fun/models/joint_attention.py` | `JointAttention`: gated cross-modal attention between video and sim branches |
 | `videox_fun/models/mot_wrapper.py` | `MoTWrapper`: orchestrates paired forward pass of both branches |
@@ -92,10 +92,10 @@ There are **no automated tests** in this repository.
   - `valid_seq_mask (B, T*N)` bool: True for valid latent (t, n) pairs; used as additive attention key bias in DiT (padded tokens → −∞)
   - Loss uses a **raw-space mask** `(B, T_raw, N)` combining temporal and point validity; averaged only over valid positions
 - **max_objects=5**: Default cap on objects per scene (used in both modes).
-- **4x causal AE (Stage 0)**: `CausalAE` encodes `(T_raw, 3) → (T, 16)` per pos/vel channel group via 2 stride-2 causal conv layers. Applied separately to pos(3) and vel(3) → concatenated d_state=64 (2×16×2). Frozen after Stage 0, used in all subsequent stages. Matches video VAE's 4× temporal compression ratio.
-- **Initial state conditioning**: First frame `x_s_raw[:, :1]` is encoded with the same frozen AE, zero-padded to T latent frames, and concatenated with a binary inpainting mask `(B, T, N, 1)` where 0=given (t=0) and 1=unknown. DiT `input_proj` takes `[x_enc, init_enc, init_mask, c_sim]` → `Linear(2×64+1+368=697, 512)`.
+- **4x causal AE (Stage 0)**: `CausalAE` encodes `(T_raw, 3) → (T, 16)` per 3D channel group via 2 stride-2 causal conv layers. Applied separately to pos(3) and vel(3) → concatenated d_state=32 (2×16). The same frozen AE also encodes the force(3) and contact(3) channels of `c_force_raw` → 32-d per-point force feature. Frozen after Stage 0, used in all subsequent stages. Matches video VAE's 4× temporal compression ratio.
+- **Initial state conditioning**: First frame `x_s_raw[:, :1]` is encoded with the same frozen AE, zero-padded to T latent frames, and concatenated with a binary inpainting mask `(B, T, N, 1)` where 0=given (t=0) and 1=unknown. DiT `input_proj` takes `[x_enc, init_enc, init_mask, c_sim]` → `Linear(2×32+1+60=125, 256)`.
 - **Variable N**: Objects have different numbers of surface points N_i. All points are concatenated: N = ΣN_i. Per-object properties are expanded to per-point via `point_obj_idx` (gather-based, works in both modes).
-- **Flow matching diffusion**: Noise is added in **raw state space** `(B, T_raw, N, 6)`. The full denoising network is `frozen AE Encoder → DiT → frozen AE Decoder`. Training target = `noise - x_s_raw` and loss is computed in raw space. At each inference step: `noisy_raw → AE encode → DiT → AE decode → velocity_raw → scheduler step in raw space`.
+- **Flow matching diffusion (LDM-style)**: Raw states are encoded **once** via the frozen AE into `x_s_enc (B, T, N, d_state=32)`. Noise, noisy latents, target = `noise - x_s_enc`, DiT prediction, and loss are all in **latent space**. The AE is fully detached from the DiT gradient path (no `ae.decode` during training). At inference: start from pure latent noise, iterate DiT → scheduler step in latent space, then apply `ae.decode` **once** at the end to recover raw trajectories `(B, T_raw, N, 6)`.
 
 ### Block Pairing (Video ↔ Sim)
 

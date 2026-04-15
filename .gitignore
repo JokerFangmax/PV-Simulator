@@ -171,4 +171,5 @@ cython_debug/
 
 mutagen.yml
 mutagen.yml.lock
-wandb/
+/wandb
+/tmp

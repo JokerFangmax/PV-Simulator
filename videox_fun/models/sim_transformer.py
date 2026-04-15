@@ -151,8 +151,8 @@ class SimTransformer(nn.Module):
     Output: predicted value in latent space (B, T, N, d_state).
 
     Args:
-        d_state: Dimension of encoded point states (AE pos+vel concat = 64).
-        d_cond: Dimension of condition embedding (368).
+        d_state: Dimension of encoded point states (AE pos+vel concat = 32).
+        d_cond: Dimension of condition embedding (60).
         d_sim: Hidden dimension of the transformer.
         ffn_dim: FFN intermediate dimension.
         num_heads: Number of attention heads.
@@ -164,10 +164,10 @@ class SimTransformer(nn.Module):
 
     def __init__(
         self,
-        d_state: int = 64,
-        d_cond: int = 368,
-        d_sim: int = 512,
-        ffn_dim: int = 2048,
+        d_state: int = 32,
+        d_cond: int = 60,
+        d_sim: int = 256,
+        ffn_dim: int = 1024,
         num_heads: int = 8,
         num_layers: int = 10,
         freq_dim: int = 256,

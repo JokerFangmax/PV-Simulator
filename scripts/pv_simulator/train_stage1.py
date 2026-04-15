@@ -1,8 +1,11 @@
 """Stage 1 training for PV-Simulator: Simulation Branch only.
 
 Trains the SimTransformer + SimConditionEmbedder on physics trajectory data
-using flow matching diffusion loss. Uses a frozen CausalAE (pre-trained in
-Stage 0) for temporal encoding/decoding.
+using LDM-style flow matching diffusion in the frozen CausalAE's latent
+space (pre-trained in Stage 0). Raw states are encoded once to x_s_enc;
+noise, target (noise - x_s_enc), DiT prediction, and loss are all in
+latent space. The AE decoder is not used during training — gradients are
+completely independent of the AE.
 
 No video branch is loaded. No Joint Attention is used.
 
@@ -92,10 +95,10 @@ def parse_args():
                         help="Path to Stage 0 CausalAE checkpoint directory (e.g. outputs/ae/final)")
 
     # Model architecture
-    parser.add_argument("--d_state", type=int, default=64,
+    parser.add_argument("--d_state", type=int, default=32,
                         help="Encoded point state dimension (2 * AE d_latent for pos+vel concat).")
-    parser.add_argument("--d_sim", type=int, default=512, help="SimTransformer hidden dimension.")
-    parser.add_argument("--sim_ffn_dim", type=int, default=2048, help="SimTransformer FFN dimension.")
+    parser.add_argument("--d_sim", type=int, default=256, help="SimTransformer hidden dimension.")
+    parser.add_argument("--sim_ffn_dim", type=int, default=1024, help="SimTransformer FFN dimension.")
     parser.add_argument("--sim_num_heads", type=int, default=8, help="SimTransformer attention heads.")
     parser.add_argument("--sim_num_layers", type=int, default=10, help="SimTransformer blocks.")
     parser.add_argument("--max_objects", type=int, default=5, help="Maximum number of objects per scene.")
@@ -127,7 +130,7 @@ def parse_args():
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2)
     parser.add_argument("--adam_epsilon", type=float, default=1e-8)
     parser.add_argument("--use_8bit_adam", action="store_true")
-    parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
+    parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"])
     parser.add_argument("--allow_tf32", action="store_true")
     parser.add_argument("--dataloader_num_workers", type=int, default=4)
 
@@ -294,7 +297,11 @@ def main():
     logger.info(f"Loaded frozen CausalAE from {args.ae_ckpt_dir} (d_latent={d_latent})")
 
     # --- Build Models ---
-    sim_cond_embedder = SimConditionEmbedder(max_objects=args.max_objects)
+    # d_force = 2 * d_latent to match the AE-encoded force+contact representation.
+    sim_cond_embedder = SimConditionEmbedder(
+        max_objects=args.max_objects,
+        d_force=2 * d_latent,
+    )
     d_cond = sim_cond_embedder.d_cond
 
     sim_transformer = SimTransformer(
@@ -454,12 +461,23 @@ def main():
                     point_mask = None
                     T_raw_tensor = None
 
-                # --- Flow matching noise (in raw space) ---
+                # --- Encode x_s_raw and c_force_raw once via frozen AE (LDM-style) ---
                 B_sz = x_s_raw.shape[0]
                 T_raw_dim = x_s_raw.shape[1]
                 N_sz = x_s_raw.shape[2]
-                noise = torch.randn_like(x_s_raw)   # (B, T_raw, N, 6)
                 bsz = B_sz
+                with torch.no_grad():
+                    pos_enc = ae.encode(x_s_raw[..., :3])        # (B, T, N, d_latent)
+                    vel_enc = ae.encode(x_s_raw[..., 3:6])       # (B, T, N, d_latent)
+                    # c_force_raw: force(3) and contact(3) each → d_latent via frozen AE
+                    force_enc   = ae.encode(c_force_raw[..., :3])
+                    contact_enc = ae.encode(c_force_raw[..., 3:6])
+                x_s_enc = torch.cat([pos_enc, vel_enc], dim=-1)  # (B, T, N, d_state)
+                c_force_enc = torch.cat([force_enc, contact_enc], dim=-1)  # (B, T, N, 2*d_latent)
+                T = x_s_enc.shape[1]
+
+                # --- Flow matching noise (in latent space) ---
+                noise = torch.randn_like(x_s_enc)   # (B, T, N, d_state)
 
                 if not args.uniform_sampling:
                     u = compute_density_for_timestep_sampling(
@@ -481,27 +499,17 @@ def main():
                 schedule_timesteps = noise_scheduler.timesteps.to(accelerator.device)
                 step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
                 sigma = sigmas[step_indices].flatten()
-                while len(sigma.shape) < x_s_raw.ndim:
+                while len(sigma.shape) < x_s_enc.ndim:
                     sigma = sigma.unsqueeze(-1)
 
-                # Noisy raw states: zt = (1 - sigma) * x + sigma * noise
-                noisy_x_s_raw = (1.0 - sigma) * x_s_raw + sigma * noise
+                # Noisy latents: zt = (1 - sigma) * z + sigma * noise
+                noisy_x_s_enc = (1.0 - sigma) * x_s_enc + sigma * noise
 
-                # Flow matching target (raw space): velocity = noise - x
-                target = noise - x_s_raw
+                # Flow matching target (latent space): velocity = noise - z
+                target = noise - x_s_enc
 
-                # --- Encode noisy raw data → latent via frozen AE ---
-                with torch.no_grad():
-                    noisy_pos_enc = ae.encode(noisy_x_s_raw[..., :3])   # (B, T, N, d_latent)
-                    noisy_vel_enc = ae.encode(noisy_x_s_raw[..., 3:6])  # (B, T, N, d_latent)
-                noisy_enc = torch.cat([noisy_pos_enc, noisy_vel_enc], dim=-1)  # (B, T, N, d_state)
-                T = noisy_enc.shape[1]
-
-                # --- Initial frame conditioning via frozen AE ---
-                with torch.no_grad():
-                    init_pos_enc = ae.encode(x_s_raw[:, :1, :, :3])     # (B, 1, N, d_latent)
-                    init_vel_enc = ae.encode(x_s_raw[:, :1, :, 3:6])    # (B, 1, N, d_latent)
-                init_enc_1 = torch.cat([init_pos_enc, init_vel_enc], dim=-1)  # (B, 1, N, d_state)
+                # --- Initial frame conditioning: first latent frame of x_s_enc ---
+                init_enc_1 = x_s_enc[:, :1]  # (B, 1, N, d_state) — already encoded, no grad
                 init_enc_padded = torch.cat([
                     init_enc_1,
                     torch.zeros(B_sz, T - 1, N_sz, args.d_state,
@@ -528,37 +536,35 @@ def main():
                     c_mat=c_mat,
                     c_mass=c_mass,
                     c_static=c_static,
-                    c_force_raw=c_force_raw,
+                    c_force_enc=c_force_enc,
                     point_obj_idx=point_obj_idx,
                     T=T,
                     point_mask=point_mask,
                 )  # (B, T, N, d_cond)
 
-                # --- Forward pass: DiT in latent space, then decode to raw ---
+                # --- Forward pass: DiT in latent space (LDM-style) ---
+                # AE is fully detached — no decode needed during training.
                 with torch.amp.autocast("cuda", dtype=weight_dtype):
                     pred_enc = sim_transformer(
-                        noisy_enc, init_enc_padded, init_mask, c_sim, timesteps,
+                        noisy_x_s_enc, init_enc_padded, init_mask, c_sim, timesteps,
                         dtype=weight_dtype, valid_seq_mask=valid_seq_mask,
-                    )
-                    # Decode pos/vel separately via frozen AE
-                    with torch.no_grad():
-                        pred_pos_raw = ae.decode(pred_enc[..., :d_latent], T_raw_dim)
-                        pred_vel_raw = ae.decode(pred_enc[..., d_latent:], T_raw_dim)
-                    pred_raw = torch.cat([pred_pos_raw, pred_vel_raw], dim=-1)  # (B, T_raw, N, 6)
+                    )  # (B, T, N, d_state) — predicted latent velocity
 
-                # --- Loss computation (raw space) ---
+                # --- Loss computation (latent space) ---
                 weighting = compute_loss_weighting_for_sd3(
                     weighting_scheme=args.weighting_scheme, sigmas=sigma,
                 )
-                loss_per_elem = F.mse_loss(pred_raw.float(), target.float(), reduction='none')
+                loss_per_elem = F.mse_loss(pred_enc.float(), target.float(), reduction='none')
 
                 if args.padded_batch and point_mask is not None:
-                    # Build raw-space mask: (B, T_raw, N)
-                    t_raw_idx = torch.arange(T_raw_dim, device=accelerator.device).unsqueeze(0)
-                    t_raw_valid = t_raw_idx < T_raw_tensor.unsqueeze(1)
-                    raw_mask = t_raw_valid.unsqueeze(2) & point_mask.unsqueeze(1)
-                    loss_per_elem = loss_per_elem * raw_mask.unsqueeze(-1).float()
-                    n_valid = raw_mask.float().sum() * 6   # 6 raw channels
+                    # Build latent-space mask: (B, T, N). Padded positions are excluded
+                    # from both the numerator and denominator (zero contribution, not counted).
+                    t_latent = (T_raw_tensor - 1) // 4 + 1                 # (B,)
+                    t_idx = torch.arange(T, device=accelerator.device).unsqueeze(0)  # (1, T)
+                    t_valid = t_idx < t_latent.unsqueeze(1)                # (B, T)
+                    latent_mask = t_valid.unsqueeze(2) & point_mask.unsqueeze(1)  # (B, T, N)
+                    loss_per_elem = loss_per_elem * latent_mask.unsqueeze(-1).float()
+                    n_valid = latent_mask.float().sum() * args.d_state
                     loss = (loss_per_elem * weighting.float()).sum() / n_valid.clamp(min=1)
                 else:
                     loss = (loss_per_elem * weighting.float()).mean()

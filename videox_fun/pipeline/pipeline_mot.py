@@ -131,7 +131,6 @@ class MoTPipeline:
             d_joint=d_joint,
             joint_num_heads=joint_num_heads,
             max_objects=max_objects,
-            state_enc_mid=state_enc_mid,
         )
 
         # Load Stage 2 weights
@@ -256,11 +255,13 @@ class MoTPipeline:
         c_init = c_init.to(device, dtype=dtype)
         point_obj_idx = point_obj_idx.to(device)
 
-        c_sim = self.mot.sim_cond_embedder(
-            c_floor=c_floor, c_id=c_id, c_mat=c_mat, c_mass=c_mass,
-            c_static=c_static, c_force_raw=c_force_raw, c_init=c_init,
-            point_obj_idx=point_obj_idx, T=T,
-        )  # (1, T, N, d_cond)
+        # NOTE: c_force_raw must be encoded via the frozen CausalAE upstream.
+        # This pipeline currently does not own the AE — callers must provide
+        # c_force_enc. TODO: wire the frozen AE into this pipeline (Stage 2 inference).
+        raise NotImplementedError(
+            "pipeline_mot Stage 2 inference needs updating for the slim-cond / LDM "
+            "refactor: AE-encoded c_force_enc must be passed to sim_cond_embedder."
+        )
 
         # --- Initialize latents from noise ---
         latent_h = height // (self.vae.config.spatial_compression_ratio or 8)

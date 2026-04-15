@@ -45,8 +45,8 @@ class MoTWrapper(nn.Module):
 
     Args:
         video_transformer: Pre-trained WanTransformer3DModel (frozen or LoRA-wrapped).
-        d_state: Encoded point state dimension (AE pos+vel concat = 64).
-        d_cond: Condition embedding dimension (from SimConditionEmbedder = 368).
+        d_state: Encoded point state dimension (AE pos+vel concat = 32).
+        d_cond: Condition embedding dimension (from SimConditionEmbedder = 60).
         d_sim: Simulation branch hidden dimension.
         sim_ffn_dim: Simulation branch FFN dimension.
         sim_num_heads: Simulation branch attention heads.
@@ -62,10 +62,10 @@ class MoTWrapper(nn.Module):
     def __init__(
         self,
         video_transformer: WanTransformer3DModel,
-        d_state: int = 64,
-        d_cond: int = 368,
-        d_sim: int = 512,
-        sim_ffn_dim: int = 2048,
+        d_state: int = 32,
+        d_cond: int = 60,
+        d_sim: int = 256,
+        sim_ffn_dim: int = 1024,
         sim_num_heads: int = 8,
         sim_num_layers: int = 10,
         d_joint: int = 256,
@@ -73,7 +73,7 @@ class MoTWrapper(nn.Module):
         init_gate: float = -10.0,
         pairing: Optional[Dict[int, int]] = None,
         max_objects: int = 16,
-        force_enc_mid: int = 128,
+        d_force: int = 32,
     ):
         super().__init__()
 
@@ -93,7 +93,7 @@ class MoTWrapper(nn.Module):
         # Condition embedder
         self.sim_cond_embedder = SimConditionEmbedder(
             max_objects=max_objects,
-            force_encoder_mid=force_enc_mid,
+            d_force=d_force,
         )
 
         # Joint attention modules — one per paired block

@@ -81,9 +81,9 @@ def parse_args():
     parser.add_argument("--data_root", type=str, default=None)
 
     # Model architecture (must match Stage 1)
-    parser.add_argument("--d_state", type=int, default=64)
-    parser.add_argument("--d_sim", type=int, default=512)
-    parser.add_argument("--sim_ffn_dim", type=int, default=2048)
+    parser.add_argument("--d_state", type=int, default=32)
+    parser.add_argument("--d_sim", type=int, default=256)
+    parser.add_argument("--sim_ffn_dim", type=int, default=1024)
     parser.add_argument("--sim_num_heads", type=int, default=8)
     parser.add_argument("--sim_num_layers", type=int, default=10)
     parser.add_argument("--max_objects", type=int, default=16)
@@ -217,7 +217,10 @@ def main():
     logger.info(f"Loaded frozen CausalAE from {args.ae_ckpt_dir}")
 
     # --- Build Sim Components ---
-    sim_cond_embedder = SimConditionEmbedder(max_objects=args.max_objects)
+    sim_cond_embedder = SimConditionEmbedder(
+        max_objects=args.max_objects,
+        d_force=2 * ae.d_latent,
+    )
     d_cond = sim_cond_embedder.d_cond
 
     sim_transformer = SimTransformer(
@@ -260,6 +263,7 @@ def main():
         d_joint=args.d_joint,
         joint_num_heads=args.joint_num_heads,
         max_objects=args.max_objects,
+        d_force=2 * ae.d_latent,
     )
     # Copy loaded sim components into mot
     mot.sim.load_state_dict(sim_transformer.state_dict())
@@ -382,17 +386,17 @@ def main():
 
                 unwrapped_mot = accelerator.unwrap_model(mot)
 
-                # --- Encode sim states via frozen AE ---
+                # --- Encode sim states and force via frozen AE ---
                 with torch.no_grad():
-                    pos_enc = ae.encode(x_s_raw[..., :3])    # (1, T, N, d_latent)
-                    vel_enc = ae.encode(x_s_raw[..., 3:6])   # (1, T, N, d_latent)
+                    pos_enc     = ae.encode(x_s_raw[..., :3])        # (1, T, N, d_latent)
+                    vel_enc     = ae.encode(x_s_raw[..., 3:6])       # (1, T, N, d_latent)
+                    force_enc   = ae.encode(c_force_raw[..., :3])
+                    contact_enc = ae.encode(c_force_raw[..., 3:6])
                 x_s_enc = torch.cat([pos_enc, vel_enc], dim=-1)  # (1, T, N, d_state)
+                c_force_enc = torch.cat([force_enc, contact_enc], dim=-1)  # (1, T, N, 2*d_latent)
 
-                # --- Initial frame conditioning via frozen AE ---
-                with torch.no_grad():
-                    init_pos_enc = ae.encode(x_s_raw[:, :1, :, :3])
-                    init_vel_enc = ae.encode(x_s_raw[:, :1, :, 3:6])
-                init_enc_1 = torch.cat([init_pos_enc, init_vel_enc], dim=-1)
+                # --- Initial frame conditioning: reuse the first latent frame ---
+                init_enc_1 = x_s_enc[:, :1]
                 init_enc_padded = torch.cat([
                     init_enc_1,
                     torch.zeros(1, T - 1, N, args.d_state,
@@ -404,7 +408,7 @@ def main():
 
                 c_sim = unwrapped_mot.sim_cond_embedder(
                     c_floor=c_floor, c_id=c_id, c_mat=c_mat, c_mass=c_mass,
-                    c_static=c_static, c_force_raw=c_force_raw,
+                    c_static=c_static, c_force_enc=c_force_enc,
                     point_obj_idx=point_obj_idx, T=T,
                 )  # (1, T, N, d_cond)
 

@@ -120,7 +120,7 @@ assert z.shape == (2, 6, 50, 16)     # T=(21-1)//4+1=6
 
 ## Stage 1 Training (Simulation Branch Only)
 
-Trains `SimTransformer` + `SimConditionEmbedder` using flow matching diffusion with a frozen `CausalAE` for encoding/decoding. Noise is added and loss is computed in **raw state space** `(T_raw, N, 6)`; the frozen AE provides temporal compression around the latent-space DiT.
+Trains `SimTransformer` + `SimConditionEmbedder` using LDM-style flow matching diffusion in the frozen `CausalAE`'s **latent space**. Raw states are encoded once via the AE; noise, target (`noise - x_s_enc`), and loss are all computed in latent space `(B, T, N, d_state=32)`. The AE is fully detached from the DiT gradient path — no decode during training.
 
 ### Single GPU (smoke test)
 
@@ -185,8 +185,8 @@ accelerate launch --num_processes=4 scripts/pv_simulator/train_stage1.py \
 | `--mixed_precision` | `bf16` | `bf16`, `fp16`, or `no` |
 | `--checkpointing_steps` | 5000 | Save a checkpoint every N global steps |
 | `--ae_ckpt_dir` | — | **Required.** Path to Stage 0 CausalAE checkpoint directory |
-| `--d_state` | 64 | Encoded point state dimension (2×d_latent, auto-corrected from AE) |
-| `--d_sim` | 512 | SimTransformer hidden dimension |
+| `--d_state` | 32 | Encoded point state dimension (2×d_latent, auto-corrected from AE) |
+| `--d_sim` | 256 | SimTransformer hidden dimension |
 | `--sim_num_layers` | 10 | Number of transformer blocks |
 | `--padded_batch` | off | Enable padded batch mode (allows `--train_batch_size > 1`) |
 | `--max_T_raw` | 21 | Max raw frames in padded mode (must be 4k+1) |
@@ -398,17 +398,17 @@ visualize_point_cloud_motion(
 | Component | File | Role |
 |-----------|------|------|
 | `CausalAE` | `videox_fun/models/sim_ae.py` | Frozen 4× causal autoencoder: `(T_raw, 3) → (T, 16)` per channel group; trained in Stage 0 |
-| `SimConditionEmbedder` | `videox_fun/models/sim_condition.py` | Encodes floor, object ID, material, mass, static flag, force → `(B, T, N, 368)` |
+| `SimConditionEmbedder` | `videox_fun/models/sim_condition.py` | Encodes floor, object ID, material, mass, static flag, force → `(B, T, N, 60)` (force/contact pre-encoded by frozen CausalAE) |
 | `SimTransformer` | `videox_fun/models/sim_transformer.py` | 10-block DiT; denoises in latent space with init conditioning |
 | `SimulationDataset` | `videox_fun/data/dataset_simulation.py` | Loads custom NPZ format |
 | `MoviSimulationDataset` | `videox_fun/data/dataset_simulation.py` | Loads MOVI-AB directory format |
-| `SimulationPipeline` | `videox_fun/pipeline/pipeline_simulation.py` | Stage 1 inference: frozen AE Encoder→DiT→frozen AE Decoder denoising |
+| `SimulationPipeline` | `videox_fun/pipeline/pipeline_simulation.py` | Stage 1 inference: LDM-style latent-space denoising; AE decodes once at end |
 
-The full denoising network is `frozen AE Encoder → SimTransformer → frozen AE Decoder`. Diffusion noise and scheduler steps operate in **raw state space** `(B, T_raw, N, 6)`. The AE provides 4× temporal compression, applied separately to pos(3) and vel(3) channels → d_state=64 concatenated latents.
+Diffusion operates entirely in **latent space** `(B, T, N, d_state=32)`. The AE encodes `x_s_raw` once before the diffusion loop and decodes once after; scheduler noise/target/steps and DiT predictions are all latent-space quantities. The AE provides 4× temporal compression, applied separately to pos(3) and vel(3) channels → d_state=32 concatenated latents (2 × d_latent=16).
 
 ### Temporal compression
 
-The frozen `CausalAE` (Stage 0) does `T_raw = 4k+1 → T_latent = k+1` (e.g. T_raw=21 → T=6). Applied separately to pos(3) and vel(3) → concatenated d_state=64. This matches the video VAE's 4× temporal compression ratio, keeping the two branches in sync for Stage 2 joint training.
+The frozen `CausalAE` (Stage 0) does `T_raw = 4k+1 → T_latent = k+1` (e.g. T_raw=21 → T=6). Applied separately to pos(3) and vel(3) → concatenated d_state=32 (2×d_latent=16). The same AE also encodes the force(3) and contact(3) channels of `c_force_raw` → 32-d per-point force feature for the condition embedder. This matches the video VAE's 4× temporal compression ratio, keeping the two branches in sync for Stage 2 joint training.
 
 ```
 AE Encoder:  [4k+1] --stride2--> [2k+1] --stride2--> [k+1]   (3 → 16 channels)
@@ -417,7 +417,7 @@ AE Decoder:  [k+1]  --upsample--> [2k+1] --upsample--> [4k+1] --trim--> [T_raw] 
 
 ### Initial state conditioning
 
-The first raw frame `x_s_raw[:, :1]` is encoded with the same frozen AE (pos/vel separately → 64 dims), zero-padded to T latent frames, and concatenated with a binary mask `(B, T, N, 1)` where 0=given (t=0) and 1=unknown. The DiT `input_proj` takes `[x_enc(64), init_enc(64), init_mask(1), c_sim(368)] = 697 → 512`.
+The first raw frame `x_s_raw[:, :1]` is encoded with the same frozen AE (pos/vel separately → 32 dims), zero-padded to T latent frames, and concatenated with a binary mask `(B, T, N, 1)` where 0=given (t=0) and 1=unknown. The DiT `input_proj` takes `[x_enc(32), init_enc(32), init_mask(1), c_sim(60)] = 125 → 256`.
 
 ### Point state representation
 

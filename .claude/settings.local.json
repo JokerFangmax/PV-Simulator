@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3)",
+      "mcp__plugin_telegram_telegram__reply",
+      "Bash(python scripts/pv_simulator/train_stage0.py --output_dir outputs/stage0/diag/_smoke_rw2 --report_to none --max_train_steps 50 --val_every 0 --batch_size 64 --seed 42 --mixed_precision bf16 --loss_type mse --lambda_mmd 0.00001 --lambda_interp 0.00001 --lambda_smooth 0.0 --c_mid 128 --d_latent 16 --n_res_blocks 1 --lr 3e-4 --lr_scheduler cosine --lr_warmup_steps 10 --lr_total_steps 50 --loss_reweight)",
+      "Bash(ps -p 287965 -o pid,etime,cmd)",
+      "Bash(ps -p 282090 -o pid,etime,cmd)"
+    ]
+  }
+}

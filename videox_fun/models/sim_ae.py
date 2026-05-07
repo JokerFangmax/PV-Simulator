@@ -458,7 +458,7 @@ class CausalAE(nn.Module):
                 )
                 out = torch.cat([out, out_], dim=2)
 
-        T = out.shape[2]
+        T = out.shape[2]    # T: (BN, d_latent, T)
         z = out.reshape(B, N, -1, T).permute(0, 3, 1, 2)  # (B, T, N, d_latent)
 
         if squeeze:

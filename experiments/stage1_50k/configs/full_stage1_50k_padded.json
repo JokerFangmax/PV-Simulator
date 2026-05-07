@@ -1,0 +1,19 @@
+{
+  "environment": "videox",
+  "dataset_type": "movi",
+  "data_root": "datasets/movi_ab_50k_shards",
+  "ae_ckpt_dir": "outputs/stage0/sweeps_mae/training/lr1e-3-cosine/final",
+  "output_dir": "outputs/stage1/stage1_50k_padded",
+  "padded_batch": true,
+  "max_objects": 5,
+  "max_T_raw": 21,
+  "max_points_per_object": 200,
+  "num_train_epochs": 1000,
+  "max_train_steps": 100000,
+  "lr_warmup_steps": 200,
+  "train_batch_size": 8,
+  "learning_rate": 0.0001,
+  "mixed_precision": "bf16",
+  "report_to": "tensorboard",
+  "vis_steps": 0
+}

@@ -586,7 +586,15 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
                 current_lr = lr_scheduler.get_last_lr()[0]
-                accelerator.log({"train_loss": train_loss / max(accum_count, 1), "lr": current_lr}, step=global_step)
+                accelerator.log(
+                    {
+                        "train_loss": train_loss / max(accum_count, 1),
+                        "lr": current_lr,
+                        "epoch": epoch,
+                        "global_step": global_step,
+                    },
+                    step=global_step,
+                )
                 train_loss = 0.0
                 accum_count = 0
 

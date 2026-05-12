@@ -174,3 +174,4 @@ mutagen.yml.lock
 /wandb
 /tmp
 /sweep
+/useless

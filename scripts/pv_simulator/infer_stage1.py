@@ -20,13 +20,23 @@ Usage:
         --point_states_npy /path/to/states.npy \
         --point_obj_idx_npy /path/to/obj_idx.npy \
         --output_dir outputs/infer
+
+    # From a sharded MOVI-AB dataset:
+    python scripts/pv_simulator/infer_stage1.py \
+        --ckpt_dir outputs/stage1_test/final \
+        --ae_ckpt_dir outputs/ae/final \
+        --shard_root datasets/movi_ab_50k_shards \
+        --sample_idx 0 \
+        --output_dir outputs/infer
 """
 
 import argparse
+import io
 import json
 import os
 import pickle
 import sys
+import tarfile
 
 import numpy as np
 import torch
@@ -47,16 +57,8 @@ from videox_fun.pipeline.pipeline_simulation import SimulationPipeline
 # Data loading helpers
 # ---------------------------------------------------------------------------
 
-def load_movi_sample(data_dir: str, temporal_compression_ratio: int = 4):
-    """Load a MOVI-AB sample directory → tensors ready for the pipeline."""
-    pkl_path = os.path.join(data_dir, 'point_cloud_states.pkl')
-    meta_path = os.path.join(data_dir, 'metadata.json')
-
-    with open(pkl_path, 'rb') as f:
-        pkl = pickle.load(f)
-    with open(meta_path, 'r') as f:
-        meta = json.load(f)
-
+def _build_movi_sample(pkl, meta, temporal_compression_ratio: int = 4):
+    """Convert MOVI pkl+metadata objects into tensors ready for the pipeline."""
     # Point states — clip to largest valid T_raw = 4k+1
     point_states = pkl['point_states'].astype(np.float32)   # (T_avail, N, 6)
     T_avail = point_states.shape[0]
@@ -107,6 +109,97 @@ def load_movi_sample(data_dir: str, temporal_compression_ratio: int = 4):
     }
 
 
+def load_movi_sample(data_dir: str, temporal_compression_ratio: int = 4):
+    """Load a MOVI-AB sample directory → tensors ready for the pipeline."""
+    pkl_path = os.path.join(data_dir, 'point_cloud_states.pkl')
+    meta_path = os.path.join(data_dir, 'metadata.json')
+
+    with open(pkl_path, 'rb') as f:
+        pkl = pickle.load(f)
+    with open(meta_path, 'r') as f:
+        meta = json.load(f)
+
+    return _build_movi_sample(
+        pkl=pkl,
+        meta=meta,
+        temporal_compression_ratio=temporal_compression_ratio,
+    )
+
+
+def _resolve_shard_webdataset_root(shard_root: str) -> str:
+    """Accept either dataset root or direct webdataset root."""
+    if os.path.exists(os.path.join(shard_root, "manifest.jsonl")):
+        return shard_root
+
+    webdataset_root = os.path.join(shard_root, "webdataset")
+    if os.path.exists(os.path.join(webdataset_root, "manifest.jsonl")):
+        return webdataset_root
+
+    raise FileNotFoundError(
+        f"Could not find manifest.jsonl under {shard_root} or {webdataset_root}"
+    )
+
+
+def load_movi_shard_sample(shard_root: str, sample_idx: int,
+                           temporal_compression_ratio: int = 4):
+    """Load one MOVI-AB sample from the sharded webdataset layout."""
+    webdataset_root = _resolve_shard_webdataset_root(shard_root)
+    manifest_path = os.path.join(webdataset_root, "manifest.jsonl")
+
+    record = None
+    with open(manifest_path, "r") as f:
+        for idx, line in enumerate(f):
+            if idx == sample_idx:
+                record = json.loads(line)
+                break
+
+    if record is None:
+        raise IndexError(f"sample_idx={sample_idx} out of range for {manifest_path}")
+
+    shard_rel_path = record["shard_path"]
+    shard_path = shard_rel_path
+    if not os.path.isabs(shard_path):
+        shard_path = os.path.join(webdataset_root, shard_rel_path)
+    if not os.path.exists(shard_path):
+        shard_path = os.path.join(webdataset_root, "shards", os.path.basename(shard_rel_path))
+
+    sample_id = record["sample_id"]
+    payload_name = f"{sample_id}.payload.tar"
+
+    payload_bytes = None
+    with tarfile.open(shard_path, "r") as outer_tar:
+        try:
+            payload_member = outer_tar.getmember(payload_name)
+        except KeyError as exc:
+            raise FileNotFoundError(
+                f"Could not find {payload_name} inside shard {shard_path}"
+            ) from exc
+        with outer_tar.extractfile(payload_member) as payload_fp:
+            payload_bytes = payload_fp.read()
+
+    pkl = None
+    meta = None
+    with tarfile.open(fileobj=io.BytesIO(payload_bytes), mode="r") as payload_tar:
+        for inner_name in ("metadata.json", "point_cloud_states.pkl"):
+            try:
+                member = payload_tar.getmember(inner_name)
+            except KeyError as exc:
+                raise FileNotFoundError(
+                    f"Could not find {inner_name} inside payload tar for sample {sample_id}"
+                ) from exc
+            with payload_tar.extractfile(member) as inner_fp:
+                if inner_name.endswith(".json"):
+                    meta = json.load(inner_fp)
+                else:
+                    pkl = pickle.load(inner_fp)
+
+    return _build_movi_sample(
+        pkl=pkl,
+        meta=meta,
+        temporal_compression_ratio=temporal_compression_ratio,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -119,8 +212,12 @@ def parse_args():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--data_dir", type=str,
                        help="MOVI-AB sample directory (contains point_cloud_states.pkl + metadata.json)")
+    group.add_argument("--shard_root", type=str,
+                       help="Sharded MOVI-AB dataset root (dataset root or webdataset root)")
     group.add_argument("--point_states_npy", type=str,
                        help="Path to .npy file with ground truth point states (T_raw, N, 6)")
+    parser.add_argument("--sample_idx", type=int, default=0,
+                        help="Sample index inside manifest.jsonl when --shard_root is used.")
     parser.add_argument("--point_obj_idx_npy", type=str, default=None,
                         help="Path to .npy file with point-to-object mapping (N,). "
                              "Required when --point_states_npy is used with multiple objects.")
@@ -159,6 +256,8 @@ def main():
     # --- Load sample ---
     if args.data_dir is not None:
         sample = load_movi_sample(args.data_dir)
+    elif args.shard_root is not None:
+        sample = load_movi_shard_sample(args.shard_root, args.sample_idx)
     else:
         point_states_np = np.load(args.point_states_npy).astype(np.float32)
         if args.point_obj_idx_npy is not None:

@@ -3,7 +3,8 @@
 # No cross-attention (text conditioning is only in the video branch).
 #
 # Input: encoded point states (B, T, N, d_state) + init_enc (B, T, N, d_state)
-#        + init_mask (B, T, N, 1) + conditions (B, T, N, d_cond)
+#        + init_mask (B, T, N, 1) + point anchors (B, T, N, d_anchor)
+#        + conditions (B, T, N, d_cond)
 # Output: predicted value in latent space (B, T, N, d_state)
 
 from typing import Optional
@@ -150,8 +151,9 @@ class SimTransformer(nn.Module):
 
     Input: encoded noisy states x_enc (B, T, N, d_state), initial frame
     encoding init_enc (B, T, N, d_state) zero-padded beyond t=0, inpainting
-    mask init_mask (B, T, N, 1) with 0=given/1=unknown, and conditions
-    c_sim (B, T, N, d_cond). All concatenated and projected to hidden dim.
+    mask init_mask (B, T, N, 1), per-point anchors point_anchor (B, T, N, d_anchor)
+    repeated across time, and conditions c_sim (B, T, N, d_cond). All concatenated
+    and projected to hidden dim.
 
     Output: predicted value in latent space (B, T, N, d_state).
 
@@ -171,6 +173,7 @@ class SimTransformer(nn.Module):
         self,
         d_state: int = 32,
         d_cond: int = 60,
+        d_anchor: int = 3,
         d_sim: int = 256,
         ffn_dim: int = 1024,
         num_heads: int = 8,
@@ -182,13 +185,15 @@ class SimTransformer(nn.Module):
         super().__init__()
         self.d_state = d_state
         self.d_cond = d_cond
+        self.d_anchor = d_anchor
         self.d_sim = d_sim
         self.num_layers = num_layers
         self.freq_dim = freq_dim
 
-        # Input projection: [x_enc | init_enc | init_mask | c_sim] → d_sim
-        # = 2 * d_state + 1 + d_cond
-        self.input_proj = nn.Linear(2 * d_state + 1 + d_cond, d_sim)
+        # Input projection:
+        # [x_enc | init_enc | init_mask | point_anchor | c_sim] → d_sim
+        # = 2 * d_state + 1 + d_anchor + d_cond
+        self.input_proj = nn.Linear(2 * d_state + 1 + d_anchor + d_cond, d_sim)
 
         # Timestep embedding (same pattern as WanTransformer3DModel)
         self.time_embedding = nn.Sequential(
@@ -218,13 +223,14 @@ class SimTransformer(nn.Module):
         nn.init.zeros_(self.head_proj.weight)
         nn.init.zeros_(self.head_proj.bias)
 
-    def forward(self, x_enc, init_enc, init_mask, c_sim, t, dtype=torch.bfloat16,
+    def forward(self, x_enc, init_enc, init_mask, point_anchor, c_sim, t, dtype=torch.bfloat16,
                 valid_seq_mask: Optional[torch.Tensor] = None):
         """
         Args:
             x_enc: (B, T, N, d_state) — AE-encoded noisy point states.
             init_enc: (B, T, N, d_state) — AE-encoded initial frame, zero-padded beyond t=0.
             init_mask: (B, T, N, 1) — 0 at t=0 (given frame), 1 elsewhere.
+            point_anchor: (B, T, N, d_anchor) — per-point anchor features repeated across time.
             c_sim: (B, T, N, d_cond) — condition embeddings.
             t: (B,) — diffusion timestep.
             dtype: Compute dtype for attention.
@@ -237,7 +243,7 @@ class SimTransformer(nn.Module):
         B, T, N, _ = x_enc.shape
 
         # Concatenate state, init conditioning, mask, and conditions → project
-        x = torch.cat([x_enc, init_enc, init_mask, c_sim], dim=-1)  # (B, T, N, 2*d_state+1+d_cond)
+        x = torch.cat([x_enc, init_enc, init_mask, point_anchor, c_sim], dim=-1)
         x = self.input_proj(x)                   # (B, T, N, d_sim)
         x = x.view(B, T * N, self.d_sim)         # (B, T*N, d_sim)
 

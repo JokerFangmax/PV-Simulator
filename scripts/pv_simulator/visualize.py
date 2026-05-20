@@ -1,7 +1,8 @@
 """Visualization of point cloud motion for PV-Simulator.
 
 Provides a reusable function and a CLI script to render point cloud trajectories
-as animated GIF or MP4. Supports multiple views side-by-side in a single animation.
+as animated GIF or MP4. Supports multiple views side-by-side in a single animation,
+with optional keypoint tracking and GT-vs-pred overlay for failure analysis.
 
 Supported views:
   birdseye  — top-down orthographic (X vs Y), square, equal scale
@@ -91,6 +92,100 @@ def _world_bounds(all_pos: np.ndarray, pad: float = 0.3):
     return mid_x, mid_y, mid_z, half_range
 
 
+def _normalize_keypoint_indices(keypoint_indices, n_points: int):
+    if keypoint_indices is None:
+        return []
+    arr = np.asarray(keypoint_indices, dtype=np.int64).reshape(-1)
+    arr = [int(i) for i in arr.tolist() if 0 <= int(i) < n_points]
+    return arr
+
+
+def _sample_keypoints_by_strategy(
+    point_states: np.ndarray,
+    point_obj_idx: np.ndarray,
+    num_keypoints: int,
+):
+    """Pick representative keypoints from frame0 geometry.
+
+    Strategy: for each object choose farthest-from-centroid points first, then
+    round-robin across objects until num_keypoints are filled.
+    """
+    if num_keypoints <= 0:
+        return []
+
+    frame0 = point_states[0, :, :3]
+    chosen = []
+    per_obj_ranked = []
+    for obj_id in np.unique(point_obj_idx):
+        obj_idx = np.where(point_obj_idx == obj_id)[0]
+        if len(obj_idx) == 0:
+            continue
+        obj_pos = frame0[obj_idx]
+        centroid = obj_pos.mean(axis=0, keepdims=True)
+        dist = np.linalg.norm(obj_pos - centroid, axis=-1)
+        ranked = obj_idx[np.argsort(-dist)].tolist()
+        per_obj_ranked.append(ranked)
+
+    cursor = 0
+    while len(chosen) < num_keypoints and any(len(r) > 0 for r in per_obj_ranked):
+        ranked = per_obj_ranked[cursor % max(len(per_obj_ranked), 1)]
+        if ranked:
+            chosen.append(ranked.pop(0))
+        cursor += 1
+
+    return chosen[:num_keypoints]
+
+
+def _draw_keypoints_ortho(
+    ax,
+    pts,
+    keypoint_indices,
+    keypoint_labels,
+    ax0_i,
+    ax1_i,
+    marker,
+    edgecolor,
+    text_color,
+    past_traj=None,
+    linestyle='-',
+):
+    for ki, kp in enumerate(keypoint_indices):
+        x = pts[kp, ax0_i]
+        y = pts[kp, ax1_i]
+        ax.scatter([x], [y], s=64, marker=marker, facecolors='none',
+                   edgecolors=edgecolor, linewidths=1.8, zorder=6)
+        label = keypoint_labels[ki]
+        ax.text(x, y, label, color=text_color, fontsize=7, zorder=7)
+        if past_traj is not None and past_traj.shape[0] > 1:
+            ax.plot(
+                past_traj[:, kp, ax0_i], past_traj[:, kp, ax1_i],
+                color=edgecolor, linewidth=1.0, linestyle=linestyle, alpha=0.9, zorder=5,
+            )
+
+
+def _draw_keypoints_3d(
+    ax,
+    pts,
+    keypoint_indices,
+    keypoint_labels,
+    marker,
+    edgecolor,
+    text_color,
+    past_traj=None,
+    linestyle='-',
+):
+    for ki, kp in enumerate(keypoint_indices):
+        x, y, z = pts[kp, 0], pts[kp, 1], pts[kp, 2]
+        ax.scatter([x], [y], [z], s=72, marker=marker, facecolors='none',
+                   edgecolors=edgecolor, linewidths=1.8, depthshade=False)
+        ax.text(x, y, z, keypoint_labels[ki], color=text_color, fontsize=7)
+        if past_traj is not None and past_traj.shape[0] > 1:
+            ax.plot(
+                past_traj[:, kp, 0], past_traj[:, kp, 1], past_traj[:, kp, 2],
+                color=edgecolor, linewidth=1.0, linestyle=linestyle, alpha=0.9,
+            )
+
+
 def visualize_point_cloud_motion(
     point_states,
     point_obj_idx,
@@ -105,6 +200,11 @@ def visualize_point_cloud_motion(
     iso_azim: int = 45,
     figsize_per_panel: tuple = (5, 5),
     dpi: int = 100,
+    keypoint_indices=None,
+    keypoint_labels=None,
+    reference_point_states=None,
+    keypoint_history: bool = True,
+    auto_select_keypoints: int = 0,
 ):
     """Render point cloud motion as an animated GIF or MP4.
 
@@ -121,6 +221,13 @@ def visualize_point_cloud_motion(
         velocity_scale: Arrow length multiplier.
         figsize_per_panel: Figure size (w, h) in inches per panel.
         dpi: Output resolution.
+        keypoint_indices: Optional iterable of point indices to highlight.
+        keypoint_labels: Optional labels for each highlighted keypoint.
+        reference_point_states: Optional second trajectory (T, N, 6), typically GT,
+            used only for keypoint overlay comparison against point_states.
+        keypoint_history: Draw each keypoint's past trajectory up to frame t.
+        auto_select_keypoints: If >0 and keypoint_indices is empty, choose that many
+            representative keypoints automatically from frame0.
     """
     import matplotlib
     matplotlib.use('Agg')
@@ -141,10 +248,32 @@ def visualize_point_cloud_motion(
         point_obj_idx = point_obj_idx.detach().cpu().numpy()
     point_states = np.asarray(point_states, dtype=np.float32)
     point_obj_idx = np.asarray(point_obj_idx, dtype=np.int64)
+    if reference_point_states is not None:
+        if hasattr(reference_point_states, 'numpy'):
+            reference_point_states = reference_point_states.detach().cpu().numpy()
+        reference_point_states = np.asarray(reference_point_states, dtype=np.float32)
+        assert reference_point_states.shape == point_states.shape, (
+            f"reference_point_states shape {reference_point_states.shape} "
+            f"must match point_states shape {point_states.shape}"
+        )
 
     T, N, _ = point_states.shape
     obj_ids = np.unique(point_obj_idx)
     n_objects = len(obj_ids)
+
+    keypoint_indices = _normalize_keypoint_indices(keypoint_indices, N)
+    if not keypoint_indices and auto_select_keypoints > 0:
+        keypoint_indices = _sample_keypoints_by_strategy(
+            point_states=reference_point_states if reference_point_states is not None else point_states,
+            point_obj_idx=point_obj_idx,
+            num_keypoints=auto_select_keypoints,
+        )
+    if keypoint_labels is None:
+        keypoint_labels = [f"K{i}" for i in range(len(keypoint_indices))]
+    else:
+        keypoint_labels = list(keypoint_labels)
+        if len(keypoint_labels) < len(keypoint_indices):
+            keypoint_labels += [f"K{i}" for i in range(len(keypoint_labels), len(keypoint_indices))]
 
     if colors is None:
         colors = DEFAULT_COLORS
@@ -226,6 +355,21 @@ def visualize_point_cloud_motion(
                                s=4, color=obj_colors[oi], alpha=0.85,
                                linewidths=0, depthshade=True)
 
+                if keypoint_indices:
+                    past = point_states[:t + 1, :, :3] if keypoint_history else None
+                    _draw_keypoints_3d(
+                        ax, point_states[t, :, :3], keypoint_indices, keypoint_labels,
+                        marker='o', edgecolor='#ffffff', text_color='#ffffff',
+                        past_traj=past, linestyle='-',
+                    )
+                    if reference_point_states is not None:
+                        ref_past = reference_point_states[:t + 1, :, :3] if keypoint_history else None
+                        _draw_keypoints_3d(
+                            ax, reference_point_states[t, :, :3], keypoint_indices, keypoint_labels,
+                            marker='x', edgecolor='#ffd166', text_color='#ffd166',
+                            past_traj=ref_past, linestyle='--',
+                        )
+
             else:
                 # ---- Orthographic view ----
                 ax0_i, ax1_i, xlabel, ylabel = _ORTHO_AXES[v]
@@ -253,6 +397,32 @@ def visualize_point_cloud_motion(
                         ax.quiver(x, y, vx * velocity_scale, vy * velocity_scale,
                                   color=c, alpha=0.6, width=0.003,
                                   scale=1, scale_units='xy')
+
+                if keypoint_indices:
+                    past = point_states[:t + 1, :, :3] if keypoint_history else None
+                    _draw_keypoints_ortho(
+                        ax, point_states[t, :, :3], keypoint_indices, keypoint_labels,
+                        ax0_i, ax1_i, marker='o', edgecolor='#ffffff',
+                        text_color='#ffffff', past_traj=past, linestyle='-',
+                    )
+                    if reference_point_states is not None:
+                        ref_past = reference_point_states[:t + 1, :, :3] if keypoint_history else None
+                        _draw_keypoints_ortho(
+                            ax, reference_point_states[t, :, :3], keypoint_indices, keypoint_labels,
+                            ax0_i, ax1_i, marker='x', edgecolor='#ffd166',
+                            text_color='#ffd166', past_traj=ref_past, linestyle='--',
+                        )
+
+                if keypoint_indices and panel_i == 0:
+                    legend_lines = ["white circle/solid = current trajectory",
+                                    "yellow x/dashed = reference trajectory"] if reference_point_states is not None else \
+                                   ["white circle/solid = tracked keypoints"]
+                    ax.text(
+                        0.02, 0.98, "\n".join(legend_lines),
+                        transform=ax.transAxes, va='top', ha='left',
+                        fontsize=7, color='#dddddd',
+                        bbox=dict(facecolor='#111122', edgecolor='#333344', alpha=0.75, pad=4),
+                    )
 
         plt.tight_layout(pad=0.5)
         fig.canvas.draw()
@@ -314,6 +484,9 @@ def parse_args():
                        help="MOVI-AB sample directory containing point_cloud_states.pkl")
     group.add_argument("--point_states_npy", type=str,
                        help="Path to .npy file with point states (T, N, 6)")
+    parser.add_argument("--reference_point_states_npy", type=str, default=None,
+                        help="Optional reference trajectory (T, N, 6), e.g. GT when "
+                             "visualizing a predicted trajectory with keypoint comparison.")
     parser.add_argument("--point_obj_idx_npy", type=str, default=None,
                         help="Path to .npy file with point-to-object mapping (N,). "
                              "If omitted, all points are treated as one object.")
@@ -331,6 +504,13 @@ def parse_args():
     parser.add_argument("--iso_azim", type=int, default=45,
                         help="Azimuth angle (degrees) for the 3D iso view. Default: 45")
     parser.add_argument("--dpi", type=int, default=100)
+    parser.add_argument("--keypoint_indices", type=int, nargs='*', default=None,
+                        help="Specific point indices to highlight and track.")
+    parser.add_argument("--auto_select_keypoints", type=int, default=0,
+                        help="Automatically choose this many representative keypoints if "
+                             "--keypoint_indices is not provided.")
+    parser.add_argument("--no_keypoint_history", action="store_true",
+                        help="Disable drawing each keypoint's past trajectory.")
     return parser.parse_args()
 
 
@@ -345,6 +525,9 @@ def main():
             point_obj_idx = np.load(args.point_obj_idx_npy)
         else:
             point_obj_idx = np.zeros(point_states.shape[1], dtype=np.int64)
+    reference_point_states = None
+    if args.reference_point_states_npy is not None:
+        reference_point_states = np.load(args.reference_point_states_npy)
 
     visualize_point_cloud_motion(
         point_states=point_states,
@@ -358,6 +541,10 @@ def main():
         iso_elev=args.iso_elev,
         iso_azim=args.iso_azim,
         dpi=args.dpi,
+        keypoint_indices=args.keypoint_indices,
+        reference_point_states=reference_point_states,
+        keypoint_history=not args.no_keypoint_history,
+        auto_select_keypoints=args.auto_select_keypoints,
     )
 
 

@@ -106,27 +106,27 @@ class SimConditionEmbedder(nn.Module):
 
         # Object ID: (B, n_objects) → embed → gather per-point → expand over T
         e_id = self.id_embed(c_id)                                      # (B, n_obj, d_id)
-        idx = point_obj_idx.unsqueeze(-1).expand(-1, -1, e_id.size(-1))
+        idx = point_obj_idx.unsqueeze(-1).expand(-1, -1, e_id.size(-1)) # (B, N, d_id)
         e_id = e_id.gather(1, idx)                                      # (B, N, d_id)
-        e_id = e_id.unsqueeze(1).expand(-1, T, -1, -1)
+        e_id = e_id.unsqueeze(1).expand(-1, T, -1, -1)                  # (B, T, N, d_id)
 
         # Material: (B, n_objects, 2) → MLP → gather → expand
-        e_mat = self.mat_mlp(c_mat.to(w_dtype))
-        idx = point_obj_idx.unsqueeze(-1).expand(-1, -1, e_mat.size(-1))
-        e_mat = e_mat.gather(1, idx)
-        e_mat = e_mat.unsqueeze(1).expand(-1, T, -1, -1)
+        e_mat = self.mat_mlp(c_mat.to(w_dtype))                         # (B, n_obj, d_mat)
+        idx = point_obj_idx.unsqueeze(-1).expand(-1, -1, e_mat.size(-1))# (B, N, d_mat)
+        e_mat = e_mat.gather(1, idx)                      # (B, N, d_mat)
+        e_mat = e_mat.unsqueeze(1).expand(-1, T, -1, -1)    # (B, T, N, d_mat)
 
         # Mass: (B, n_objects) → MLP → gather → expand
-        e_mass = self.mass_mlp(c_mass.to(w_dtype).unsqueeze(-1))
-        idx = point_obj_idx.unsqueeze(-1).expand(-1, -1, e_mass.size(-1))
-        e_mass = e_mass.gather(1, idx)
-        e_mass = e_mass.unsqueeze(1).expand(-1, T, -1, -1)
+        e_mass = self.mass_mlp(c_mass.to(w_dtype).unsqueeze(-1))    # (B, n_obj, d_mass)
+        idx = point_obj_idx.unsqueeze(-1).expand(-1, -1, e_mass.size(-1)) # (B, N, d_mass)
+        e_mass = e_mass.gather(1, idx)                # (B, N, d_mass)
+        e_mass = e_mass.unsqueeze(1).expand(-1, T, -1, -1)  # (B, T, N, d_mass)
 
         # Static flag: (B, n_objects) → embed → gather → expand
-        e_static = self.static_embed(c_static)
-        idx = point_obj_idx.unsqueeze(-1).expand(-1, -1, e_static.size(-1))
-        e_static = e_static.gather(1, idx)
-        e_static = e_static.unsqueeze(1).expand(-1, T, -1, -1)
+        e_static = self.static_embed(c_static)                      # (B, n_obj, d_static)
+        idx = point_obj_idx.unsqueeze(-1).expand(-1, -1, e_static.size(-1)) # (B, N, d_static)
+        e_static = e_static.gather(1, idx)              # (B, N, d_static)
+        e_static = e_static.unsqueeze(1).expand(-1, T, -1, -1)          # (B, T, N, d_static)
 
         # Force + contact: already AE-encoded upstream → (B, T, N, d_force)
         e_force = c_force_enc.to(w_dtype)

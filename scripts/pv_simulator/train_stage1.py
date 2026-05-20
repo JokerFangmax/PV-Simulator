@@ -39,6 +39,7 @@ import random
 import shutil
 import sys
 import tempfile
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -51,6 +52,7 @@ from diffusers.optimization import get_scheduler
 from diffusers.training_utils import (compute_density_for_timestep_sampling,
                                       compute_loss_weighting_for_sd3)
 from tqdm.auto import tqdm
+from torch.utils.data import Dataset
 
 # Add project root to path
 current_file_path = os.path.abspath(__file__)
@@ -77,6 +79,21 @@ from videox_fun.utils.discrete_sampler import DiscreteSampling
 logger = get_logger(__name__, log_level="INFO")
 
 
+@dataclass
+class RepeatedSampleDataset(Dataset):
+    """Expose one base-dataset sample many times for overfit diagnostics."""
+
+    base_dataset: Dataset
+    sample_idx: int
+    length: int
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        return self.base_dataset[self.sample_idx]
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Stage 1: Train Simulation Branch")
 
@@ -89,6 +106,12 @@ def parse_args():
                         help="Path to annotation JSON (required for --dataset_type simulation).")
     parser.add_argument("--data_root", type=str, default=None,
                         help="Root directory for data files or MOVI dataset root.")
+    parser.add_argument("--overfit_single_sample_idx", type=int, default=None,
+                        help="If set, train on only this sample index repeated many times. "
+                             "Useful for single-sample overfit diagnostics.")
+    parser.add_argument("--overfit_repeat_length", type=int, default=1024,
+                        help="Logical dataset length when --overfit_single_sample_idx is used. "
+                             "Keeps dataloader/epochs stable under distributed training.")
 
     # Pre-trained AE (from Stage 0)
     parser.add_argument("--ae_ckpt_dir", type=str, required=True,
@@ -143,6 +166,12 @@ def parse_args():
     parser.add_argument("--logit_std", type=float, default=1.0)
     parser.add_argument("--mode_scale", type=float, default=1.29)
 
+    # Shape-preserving inductive bias
+    parser.add_argument("--lambda_local_dist", type=float, default=0.0,
+                        help="Weight for local distance consistency loss in raw position space.")
+    parser.add_argument("--local_dist_k", type=int, default=8,
+                        help="Number of same-object neighbors from frame0 used in local distance loss.")
+
     # Checkpointing & logging
     parser.add_argument("--checkpointing_steps", type=int, default=5000)
     parser.add_argument("--checkpoints_total_limit", type=int, default=5)
@@ -166,6 +195,8 @@ def parse_args():
 
     if args.dataset_type == "simulation" and args.ann_path is None:
         parser.error("--ann_path is required when --dataset_type simulation")
+    if args.overfit_single_sample_idx is not None and args.overfit_repeat_length < 1:
+        parser.error("--overfit_repeat_length must be >= 1")
 
     return args
 
@@ -243,6 +274,86 @@ def _run_vis(vis_samples, sim_transformer, ae, sim_cond_embedder,
             wandb.log(log_dict, step=global_step)
 
     logger.info(f"[Step {global_step}] Logged {len(vis_samples) * 2} vis videos to wandb.")
+
+
+def _compute_point_anchor(x_s_init: torch.Tensor, point_obj_idx: torch.Tensor) -> torch.Tensor:
+    """Build per-point local-position anchors from the initial frame.
+
+    Anchor = point position at t=0 minus its object's centroid at t=0.
+    Returns (B, 1, N, 3).
+    """
+    init_pos = x_s_init[..., :3]
+    anchor = torch.zeros_like(init_pos)
+    B = init_pos.shape[0]
+    for b in range(B):
+        obj_ids = torch.unique(point_obj_idx[b])
+        for obj_id in obj_ids.tolist():
+            obj_mask = point_obj_idx[b] == obj_id
+            if not torch.any(obj_mask):
+                continue
+            obj_pos = init_pos[b, 0, obj_mask]
+            centroid = obj_pos.mean(dim=0, keepdim=True)
+            anchor[b, 0, obj_mask] = obj_pos - centroid
+    return anchor
+
+
+def _compute_local_distance_loss(
+    pos_pred: torch.Tensor,
+    pos_gt: torch.Tensor,
+    point_obj_idx: torch.Tensor,
+    point_mask: torch.Tensor | None,
+    k: int,
+) -> torch.Tensor:
+    """Compare same-object local distances using frame0 KNN from ground truth.
+
+    This is a soft, data-derived structural prior: no explicit rigid graph is
+    provided, only the initial frame's local neighborhood geometry.
+    """
+    device = pos_gt.device
+    total_loss = pos_gt.new_tensor(0.0)
+    total_weight = pos_gt.new_tensor(0.0)
+    B, T_raw, N, _ = pos_gt.shape
+
+    for b in range(B):
+        if point_mask is not None:
+            valid_points = point_mask[b]
+        else:
+            valid_points = torch.ones(N, device=device, dtype=torch.bool)
+
+        obj_ids = torch.unique(point_obj_idx[b][valid_points])
+        for obj_id in obj_ids.tolist():
+            obj_mask = (point_obj_idx[b] == obj_id) & valid_points
+            obj_idx = obj_mask.nonzero(as_tuple=True)[0]
+            n_obj = obj_idx.numel()
+            if n_obj < 2:
+                continue
+
+            obj_gt0 = pos_gt[b, 0, obj_idx]  # (n_obj, 3)
+            obj_gt = pos_gt[b, :, obj_idx]   # (T_raw, n_obj, 3)
+            obj_pred = pos_pred[b, :, obj_idx]
+
+            pairwise = torch.cdist(obj_gt0, obj_gt0)
+            pairwise.fill_diagonal_(torch.finfo(pairwise.dtype).max)
+            k_eff = min(k, n_obj - 1)
+            nbr_local = torch.topk(pairwise, k=k_eff, largest=False).indices  # (n_obj, k_eff)
+
+            gt_ref = obj_gt.unsqueeze(2).expand(-1, -1, k_eff, -1)
+            gt_nbr = obj_gt[:, nbr_local, :]
+            pred_ref = obj_pred.unsqueeze(2).expand(-1, -1, k_eff, -1)
+            pred_nbr = obj_pred[:, nbr_local, :]
+
+            gt_dist = torch.norm(gt_ref - gt_nbr, dim=-1)
+            pred_dist = torch.norm(pred_ref - pred_nbr, dim=-1)
+            obj_scale = gt_dist[:, :].mean().clamp_min(1e-2)
+            rel_err = (pred_dist - gt_dist) / obj_scale
+            obj_loss = rel_err.pow(2).mean()
+
+            total_loss = total_loss + obj_loss * (n_obj * k_eff)
+            total_weight = total_weight + (n_obj * k_eff)
+
+    if total_weight.item() == 0:
+        return pos_gt.new_tensor(0.0)
+    return total_loss / total_weight
 
 
 def main():
@@ -334,7 +445,7 @@ def main():
     trainable_params = (
         list(sim_transformer.parameters()) +
         list(sim_cond_embedder.parameters())
-    )
+    )   # whether all the params are trainable
 
     optimizer = optimizer_cls(
         trainable_params,
@@ -355,6 +466,23 @@ def main():
             ann_path=args.ann_path,
             data_root=args.data_root,
             load_video=False,
+        )
+
+    if args.overfit_single_sample_idx is not None:
+        if not (0 <= args.overfit_single_sample_idx < len(train_dataset)):
+            raise ValueError(
+                f"--overfit_single_sample_idx={args.overfit_single_sample_idx} out of range "
+                f"for dataset of length {len(train_dataset)}"
+            )
+        train_dataset = RepeatedSampleDataset(
+            base_dataset=train_dataset,
+            sample_idx=args.overfit_single_sample_idx,
+            length=args.overfit_repeat_length,
+        )
+        logger.info(
+            "Single-sample overfit mode enabled: sample_idx=%s repeated to logical length %s",
+            args.overfit_single_sample_idx,
+            args.overfit_repeat_length,
         )
 
     if args.padded_batch:
@@ -472,12 +600,12 @@ def main():
                     # c_force_raw: force(3) and contact(3) each → d_latent via frozen AE
                     force_enc   = ae.encode(c_force_raw[..., :3])
                     contact_enc = ae.encode(c_force_raw[..., 3:6])
-                x_s_enc = torch.cat([pos_enc, vel_enc], dim=-1)  # (B, T, N, d_state)
+                x_s_enc = torch.cat([pos_enc, vel_enc], dim=-1)  # (B, T, N, 2*d_latent)
                 c_force_enc = torch.cat([force_enc, contact_enc], dim=-1)  # (B, T, N, 2*d_latent)
                 T = x_s_enc.shape[1]
 
                 # --- Flow matching noise (in latent space) ---
-                noise = torch.randn_like(x_s_enc)   # (B, T, N, d_state)
+                noise = torch.randn_like(x_s_enc)   # (B, T, N, 2*d_latent)
 
                 if not args.uniform_sampling:
                     u = compute_density_for_timestep_sampling(
@@ -502,8 +630,11 @@ def main():
                 while len(sigma.shape) < x_s_enc.ndim:
                     sigma = sigma.unsqueeze(-1)
 
-                # Noisy latents: zt = (1 - sigma) * z + sigma * noise
+                # Noisy latents: zt = (1 - sigma) * z + sigma * noise.
+                # Keep frame 0 fixed so Stage 1 conditions on the true initial state
+                # instead of trying to regenerate it.
                 noisy_x_s_enc = (1.0 - sigma) * x_s_enc + sigma * noise
+                noisy_x_s_enc[:, :1] = x_s_enc[:, :1]
 
                 # Flow matching target (latent space): velocity = noise - z
                 target = noise - x_s_enc
@@ -518,6 +649,10 @@ def main():
                 init_mask = torch.ones(B_sz, T, N_sz, 1,
                                        device=accelerator.device, dtype=weight_dtype)
                 init_mask[:, 0, :, :] = 0.0  # first latent frame is given
+                point_anchor_1 = _compute_point_anchor(x_s_raw[:, :1], point_obj_idx).to(
+                    device=accelerator.device, dtype=weight_dtype
+                )
+                point_anchor = point_anchor_1.expand(-1, T, -1, -1).contiguous()  # (B, T, N, 3)
 
                 # --- Build valid sequence mask for DiT attention (padded batch mode) ---
                 if args.padded_batch:
@@ -546,7 +681,7 @@ def main():
                 # AE is fully detached — no decode needed during training.
                 with torch.amp.autocast("cuda", dtype=weight_dtype):
                     pred_enc = sim_transformer(
-                        noisy_x_s_enc, init_enc_padded, init_mask, c_sim, timesteps,
+                        noisy_x_s_enc, init_enc_padded, init_mask, point_anchor, c_sim, timesteps,
                         dtype=weight_dtype, valid_seq_mask=valid_seq_mask,
                     )  # (B, T, N, d_state) — predicted latent velocity
 
@@ -563,14 +698,39 @@ def main():
                     t_idx = torch.arange(T, device=accelerator.device).unsqueeze(0)  # (1, T)
                     t_valid = t_idx < t_latent.unsqueeze(1)                # (B, T)
                     latent_mask = t_valid.unsqueeze(2) & point_mask.unsqueeze(1)  # (B, T, N)
+                    latent_mask[:, :1] = False
                     loss_per_elem = loss_per_elem * latent_mask.unsqueeze(-1).float()
                     n_valid = latent_mask.float().sum() * args.d_state
-                    loss = (loss_per_elem * weighting.float()).sum() / n_valid.clamp(min=1)
+                    diffusion_loss = (loss_per_elem * weighting.float()).sum() / n_valid.clamp(min=1)
                 else:
-                    loss = (loss_per_elem * weighting.float()).mean()
+                    latent_mask = torch.ones(B_sz, T, N_sz, device=accelerator.device, dtype=torch.bool)
+                    latent_mask[:, :1] = False
+                    loss_per_elem = loss_per_elem * latent_mask.unsqueeze(-1).float()
+                    n_valid = latent_mask.float().sum() * args.d_state
+                    diffusion_loss = (loss_per_elem * weighting.float()).sum() / n_valid.clamp(min=1)
+
+                local_dist_loss = x_s_raw.new_tensor(0.0)
+                if args.lambda_local_dist > 0.0:
+                    pred_x0_enc = noise - pred_enc
+                    pred_x0_enc[:, :1] = x_s_enc[:, :1]
+                    pred_x0_raw = torch.cat([
+                        ae.decode(pred_x0_enc[..., :d_latent], T_raw_dim),
+                        ae.decode(pred_x0_enc[..., d_latent:], T_raw_dim),
+                    ], dim=-1)
+                    local_dist_loss = _compute_local_distance_loss(
+                        pos_pred=pred_x0_raw[..., :3].float(),
+                        pos_gt=x_s_raw[..., :3].float(),
+                        point_obj_idx=point_obj_idx,
+                        point_mask=point_mask,
+                        k=args.local_dist_k,
+                    )
+
+                loss = diffusion_loss + args.lambda_local_dist * local_dist_loss
 
                 # --- Backward ---
                 avg_loss = accelerator.gather(loss.repeat(bsz)).mean()
+                avg_diffusion_loss = accelerator.gather(diffusion_loss.repeat(bsz)).mean()
+                avg_local_dist_loss = accelerator.gather(local_dist_loss.repeat(bsz)).mean()
                 train_loss += avg_loss.item()
                 accum_count += 1
 
@@ -589,6 +749,8 @@ def main():
                 accelerator.log(
                     {
                         "train_loss": train_loss / max(accum_count, 1),
+                        "diffusion_loss": avg_diffusion_loss.item(),
+                        "local_dist_loss": avg_local_dist_loss.item(),
                         "lr": current_lr,
                         "epoch": epoch,
                         "global_step": global_step,
@@ -649,7 +811,12 @@ def main():
                         gc.collect()
                         torch.cuda.empty_cache()
 
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {
+                "step_loss": loss.detach().item(),
+                "diff_loss": diffusion_loss.detach().item(),
+                "local_dist": local_dist_loss.detach().item(),
+                "lr": lr_scheduler.get_last_lr()[0],
+            }
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:

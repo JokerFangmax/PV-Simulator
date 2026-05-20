@@ -131,6 +131,27 @@ class SimulationPipeline:
         vel_raw = self.ae.decode(z[..., d:], t_raw)    # (B, T_raw, N, 3)
         return torch.cat([pos_raw, vel_raw], dim=-1)   # (B, T_raw, N, 6)
 
+    @staticmethod
+    def _compute_point_anchor(x_s_init: torch.Tensor, point_obj_idx: torch.Tensor) -> torch.Tensor:
+        """Build per-point local-position anchors from the initial frame.
+
+        Anchor = point position at t=0 minus its object's centroid at t=0.
+        Shape: (B, 1, N, 3)
+        """
+        init_pos = x_s_init[..., :3]  # (B, 1, N, 3)
+        B, _, N, _ = init_pos.shape
+        anchor = torch.zeros_like(init_pos)
+        for b in range(B):
+            obj_ids = torch.unique(point_obj_idx[b])
+            for obj_id in obj_ids.tolist():
+                obj_mask = point_obj_idx[b] == obj_id
+                if not torch.any(obj_mask):
+                    continue
+                obj_pos = init_pos[b, 0, obj_mask]
+                centroid = obj_pos.mean(dim=0, keepdim=True)
+                anchor[b, 0, obj_mask] = obj_pos - centroid
+        return anchor
+
     @torch.no_grad()
     def __call__(
         self,
@@ -191,6 +212,8 @@ class SimulationPipeline:
         ], dim=1)                                           # (B, T, N, d_state)
         init_mask = torch.ones(B, T, N, 1, device=device, dtype=dtype)
         init_mask[:, 0, :, :] = 0.0  # first latent frame is given
+        point_anchor_1 = self._compute_point_anchor(x_s_init, point_obj_idx).to(dtype)
+        point_anchor = point_anchor_1.expand(-1, T, -1, -1).contiguous()
 
         # --- Encode force+contact via frozen AE (constant across timesteps) ---
         c_force_enc = torch.cat([
@@ -216,6 +239,7 @@ class SimulationPipeline:
             B, T, N, d_state,
             device=device, dtype=dtype, generator=generator,
         )
+        sample[:, :1] = init_enc_1
 
         # --- Denoising loop (diffusion in latent space) ---
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -227,12 +251,13 @@ class SimulationPipeline:
 
             # DiT forward in latent space with init conditioning
             pred_latent = self.sim_transformer(
-                sample, init_enc_padded, init_mask, c_sim, t_batch,
+                sample, init_enc_padded, init_mask, point_anchor, c_sim, t_batch,
                 dtype=dtype, valid_seq_mask=valid_seq_mask,
             )  # (B, T, N, d_state) — predicted latent velocity
 
             # Euler step in latent space
             sample = self.scheduler.step(pred_latent, t, sample).prev_sample
+            sample[:, :1] = init_enc_1
 
         # --- Decode once at the end ---
         x_s_pred = self._decode_state(sample, T_raw)  # (B, T_raw, N, 6)

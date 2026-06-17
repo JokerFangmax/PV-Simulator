@@ -171,6 +171,21 @@ def parse_args():
                         help="Weight for local distance consistency loss in raw position space.")
     parser.add_argument("--local_dist_k", type=int, default=8,
                         help="Number of same-object neighbors from frame0 used in local distance loss.")
+    parser.add_argument("--anchor_mode", type=str, default="local",
+                        choices=["local"],
+                        help="How to encode point anchors from the initial frame. "
+                             "'local' uses centered world coordinates. "
+                             "The earlier 'canonical_pca' variant is disabled because "
+                             "its basis was unstable across samples.")
+    parser.add_argument("--disable_point_anchor", action="store_true",
+                        help="Disable point_anchor input entirely for ablation.")
+    parser.add_argument("--use_temporal_correspondence", action="store_true",
+                        help="Add an explicit same-point temporal attention block before the "
+                             "flat Transformer. This tests whether point collapse is caused by "
+                             "missing correspondence structure rather than by local distance loss.")
+    parser.add_argument("--use_temporal_rope", action="store_true",
+                        help="Apply 1D RoPE inside the same-point temporal attention block. "
+                             "This adds explicit frame-order information on each point track.")
 
     # Checkpointing & logging
     parser.add_argument("--checkpointing_steps", type=int, default=5000)
@@ -202,7 +217,7 @@ def parse_args():
 
 
 def _run_vis(vis_samples, sim_transformer, ae, sim_cond_embedder,
-             global_step, device, weight_dtype, num_inference_steps, fps):
+             global_step, device, weight_dtype, num_inference_steps, fps, anchor_mode):
     """Run inference on fixed samples, render GT+pred videos, and log to wandb.
 
     Must be called on main process only. Imports wandb and pipeline lazily so
@@ -224,6 +239,7 @@ def _run_vis(vis_samples, sim_transformer, ae, sim_cond_embedder,
         ae=ae,
         sim_cond_embedder=sim_cond_embedder,
         scheduler=FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000),
+        anchor_mode=anchor_mode,
     )
 
     log_dict = {}
@@ -276,13 +292,14 @@ def _run_vis(vis_samples, sim_transformer, ae, sim_cond_embedder,
     logger.info(f"[Step {global_step}] Logged {len(vis_samples) * 2} vis videos to wandb.")
 
 
-def _compute_point_anchor(x_s_init: torch.Tensor, point_obj_idx: torch.Tensor) -> torch.Tensor:
-    """Build per-point local-position anchors from the initial frame.
+def _compute_point_anchor(x_s_init: torch.Tensor, point_obj_idx: torch.Tensor, anchor_mode: str) -> torch.Tensor:
+    """Build per-point anchors from the initial frame.
 
-    Anchor = point position at t=0 minus its object's centroid at t=0.
+    Modes:
+      - local: centered world coordinates
     Returns (B, 1, N, 3).
     """
-    init_pos = x_s_init[..., :3]
+    init_pos = x_s_init[..., :3]    # (B, 1, N, 3)
     anchor = torch.zeros_like(init_pos)
     B = init_pos.shape[0]
     for b in range(B):
@@ -293,7 +310,30 @@ def _compute_point_anchor(x_s_init: torch.Tensor, point_obj_idx: torch.Tensor) -
                 continue
             obj_pos = init_pos[b, 0, obj_mask]
             centroid = obj_pos.mean(dim=0, keepdim=True)
-            anchor[b, 0, obj_mask] = obj_pos - centroid
+            centered = obj_pos - centroid
+            # NOTE:
+            # The previous canonical_pca branch is intentionally commented out.
+            # For near-symmetric objects or noisy point samples, the PCA basis can
+            # swap axes or flip signs across samples, which makes cross-sample point
+            # identity less stable instead of more stable.
+            #
+            # if anchor_mode == "canonical_pca" and centered.shape[0] >= 3:
+            #     cov = centered.T @ centered
+            #     eigvals, eigvecs = torch.linalg.eigh(cov)
+            #     order = torch.argsort(eigvals, descending=True)
+            #     basis = eigvecs[:, order]
+            #     proj = centered @ basis
+            #     for ax_i in range(3):
+            #         idx = torch.argmax(proj[:, ax_i].abs())
+            #         sign = torch.sign(proj[idx, ax_i])
+            #         if sign == 0:
+            #             sign = centered.new_tensor(1.0)
+            #         basis[:, ax_i] = basis[:, ax_i] * sign
+            #         proj[:, ax_i] = proj[:, ax_i] * sign
+            #     if torch.det(basis) < 0:
+            #         basis[:, -1] = -basis[:, -1]
+            #     centered = centered @ basis
+            anchor[b, 0, obj_mask] = centered
     return anchor
 
 
@@ -418,10 +458,13 @@ def main():
     sim_transformer = SimTransformer(
         d_state=args.d_state,
         d_cond=d_cond,
+        d_anchor=0 if args.disable_point_anchor else 3,
         d_sim=args.d_sim,
         ffn_dim=args.sim_ffn_dim,
         num_heads=args.sim_num_heads,
         num_layers=args.sim_num_layers,
+        use_temporal_correspondence=args.use_temporal_correspondence,
+        use_temporal_rope=args.use_temporal_rope,
     )
 
     # Move to device
@@ -600,12 +643,12 @@ def main():
                     # c_force_raw: force(3) and contact(3) each → d_latent via frozen AE
                     force_enc   = ae.encode(c_force_raw[..., :3])
                     contact_enc = ae.encode(c_force_raw[..., 3:6])
-                x_s_enc = torch.cat([pos_enc, vel_enc], dim=-1)  # (B, T, N, 2*d_latent)
-                c_force_enc = torch.cat([force_enc, contact_enc], dim=-1)  # (B, T, N, 2*d_latent)
+                x_s_enc = torch.cat([pos_enc, vel_enc], dim=-1)  # (B, T, N, d_state)
+                c_force_enc = torch.cat([force_enc, contact_enc], dim=-1)  # (B, T, N, d_force)
                 T = x_s_enc.shape[1]
 
                 # --- Flow matching noise (in latent space) ---
-                noise = torch.randn_like(x_s_enc)   # (B, T, N, 2*d_latent)
+                noise = torch.randn_like(x_s_enc)   # (B, T, N, d_state)
 
                 if not args.uniform_sampling:
                     u = compute_density_for_timestep_sampling(
@@ -625,7 +668,7 @@ def main():
                 # Get sigmas for flow matching
                 sigmas = noise_scheduler.sigmas.to(device=accelerator.device, dtype=weight_dtype)
                 schedule_timesteps = noise_scheduler.timesteps.to(accelerator.device)
-                step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+                step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]  # timestep到index的反向映射
                 sigma = sigmas[step_indices].flatten()
                 while len(sigma.shape) < x_s_enc.ndim:
                     sigma = sigma.unsqueeze(-1)
@@ -633,26 +676,28 @@ def main():
                 # Noisy latents: zt = (1 - sigma) * z + sigma * noise.
                 # Keep frame 0 fixed so Stage 1 conditions on the true initial state
                 # instead of trying to regenerate it.
-                noisy_x_s_enc = (1.0 - sigma) * x_s_enc + sigma * noise
+                noisy_x_s_enc = (1.0 - sigma) * x_s_enc + sigma * noise # (B, T, N, d_state)
                 noisy_x_s_enc[:, :1] = x_s_enc[:, :1]
 
                 # Flow matching target (latent space): velocity = noise - z
-                target = noise - x_s_enc
+                target = noise - x_s_enc    # sigma(t) = t          (B, T, N, d_state)
 
-                # --- Initial frame conditioning: first latent frame of x_s_enc ---
+                # --- Initial frame conditioning ---
+                # Repeat frame-0 latent on every timestep token. Zero-padding the
+                # future steps removed the strongest per-point identity signal and
+                # forced the model to rely on a weak 3D anchor plus object-level
+                # conditions, which is a direct source of identity ambiguity.
                 init_enc_1 = x_s_enc[:, :1]  # (B, 1, N, d_state) — already encoded, no grad
-                init_enc_padded = torch.cat([
-                    init_enc_1,
-                    torch.zeros(B_sz, T - 1, N_sz, args.d_state,
-                                device=accelerator.device, dtype=weight_dtype),
-                ], dim=1)                                                 # (B, T, N, d_state)
+                init_enc_padded = init_enc_1.expand(-1, T, -1, -1).contiguous()  # (B, T, N, d_state)
                 init_mask = torch.ones(B_sz, T, N_sz, 1,
                                        device=accelerator.device, dtype=weight_dtype)
                 init_mask[:, 0, :, :] = 0.0  # first latent frame is given
-                point_anchor_1 = _compute_point_anchor(x_s_raw[:, :1], point_obj_idx).to(
-                    device=accelerator.device, dtype=weight_dtype
-                )
-                point_anchor = point_anchor_1.expand(-1, T, -1, -1).contiguous()  # (B, T, N, 3)
+                point_anchor_1 = _compute_point_anchor(
+                    x_s_raw[:, :1], point_obj_idx, args.anchor_mode
+                ).to(device=accelerator.device, dtype=weight_dtype)
+                if args.disable_point_anchor:
+                    point_anchor_1 = point_anchor_1[..., :0]
+                point_anchor = point_anchor_1.expand(-1, T, -1, -1).contiguous()  # (B, T, N, d_anchor)
 
                 # --- Build valid sequence mask for DiT attention (padded batch mode) ---
                 if args.padded_batch:
@@ -776,7 +821,7 @@ def main():
                         _run_vis(
                             vis_samples, unwrapped_sim, ae, unwrapped_cond,
                             global_step, accelerator.device, weight_dtype,
-                            args.vis_num_inference_steps, args.vis_fps,
+                            args.vis_num_inference_steps, args.vis_fps, args.anchor_mode,
                         )
                     except Exception as e:
                         logger.warning(f"Visualization failed at step {global_step}: {e}")

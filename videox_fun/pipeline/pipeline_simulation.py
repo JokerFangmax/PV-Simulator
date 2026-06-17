@@ -66,6 +66,7 @@ class SimulationPipeline:
         ae: CausalAE,
         sim_cond_embedder: SimConditionEmbedder,
         scheduler: Optional[FlowMatchEulerDiscreteScheduler] = None,
+        anchor_mode: str = "local",
     ):
         self.sim_transformer = sim_transformer
         self.ae = ae
@@ -73,13 +74,14 @@ class SimulationPipeline:
         self.scheduler = scheduler or FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
         self.device = next(sim_transformer.parameters()).device
         self.dtype = next(sim_transformer.parameters()).dtype
+        self.anchor_mode = anchor_mode
 
     @classmethod
     def from_pretrained(cls, ckpt_dir: str, ae_ckpt_dir: str,
                         device: str = "cuda", dtype=torch.bfloat16,
                         max_objects: int = 16, d_state: int = 32, d_sim: int = 256,
                         sim_ffn_dim: int = 1024, sim_num_heads: int = 8,
-                        sim_num_layers: int = 10):
+                        sim_num_layers: int = 10, anchor_mode: str = "local"):
         """Load a SimulationPipeline from a Stage 1 checkpoint directory."""
         # Load frozen AE
         ae = CausalAE.load(ae_ckpt_dir)
@@ -88,26 +90,62 @@ class SimulationPipeline:
         for p in ae.parameters():
             p.requires_grad_(False)
 
+        sim_cond_state = torch.load(
+            os.path.join(ckpt_dir, "sim_cond_embedder.pt"), map_location="cpu")
+        ckpt_max_objects = int(sim_cond_state["id_embed.weight"].shape[0])
         sim_cond_embedder = SimConditionEmbedder(
-            max_objects=max_objects,
+            max_objects=ckpt_max_objects,
             d_force=2 * ae.d_latent,
         )
         d_cond = sim_cond_embedder.d_cond
 
+        sim_transformer_state = torch.load(
+            os.path.join(ckpt_dir, "sim_transformer.pt"), map_location="cpu")
+
+        ckpt_d_state = int(sim_transformer_state["head_proj.bias"].shape[0])
+        ckpt_d_sim = int(sim_transformer_state["head_proj.weight"].shape[1])
+        ckpt_ffn_dim = int(sim_transformer_state["blocks.0.ffn.0.weight"].shape[0])
+        ckpt_num_layers = 1 + max(
+            int(key.split(".")[1])
+            for key in sim_transformer_state.keys()
+            if key.startswith("blocks.") and key.split(".")[1].isdigit()
+        )
+        ckpt_d_anchor = int(
+            sim_transformer_state["input_proj.weight"].shape[1]
+            - (2 * ckpt_d_state + 1 + d_cond)
+        )
+        ckpt_use_temporal_correspondence = any(
+            key.startswith("temporal_corr_block.") for key in sim_transformer_state.keys()
+        )
+        ckpt_use_temporal_rope = bool(
+            sim_transformer_state.get("temporal_corr_block.temporal_attn.rope_indicator", torch.tensor(0.0)).item()
+        )
+        if ckpt_d_anchor < 0:
+            raise ValueError(
+                f"Invalid inferred d_anchor={ckpt_d_anchor} from checkpoint {ckpt_dir}. "
+                f"input_proj.in_features={sim_transformer_state['input_proj.weight'].shape[1]}, "
+                f"d_state={ckpt_d_state}, d_cond={d_cond}."
+            )
+
         sim_transformer = SimTransformer(
-            d_state=d_state, d_cond=d_cond, d_sim=d_sim,
-            ffn_dim=sim_ffn_dim, num_heads=sim_num_heads, num_layers=sim_num_layers,
+            d_state=ckpt_d_state,
+            d_cond=d_cond,
+            d_anchor=ckpt_d_anchor,
+            d_sim=ckpt_d_sim,
+            ffn_dim=ckpt_ffn_dim,
+            num_heads=sim_num_heads,
+            num_layers=ckpt_num_layers,
+            use_temporal_correspondence=ckpt_use_temporal_correspondence,
+            use_temporal_rope=ckpt_use_temporal_rope,
         )
 
-        sim_transformer.load_state_dict(
-            torch.load(os.path.join(ckpt_dir, "sim_transformer.pt"), map_location="cpu"))
-        sim_cond_embedder.load_state_dict(
-            torch.load(os.path.join(ckpt_dir, "sim_cond_embedder.pt"), map_location="cpu"))
+        sim_transformer.load_state_dict(sim_transformer_state)
+        sim_cond_embedder.load_state_dict(sim_cond_state)
 
         sim_transformer = sim_transformer.to(device, dtype=dtype)
         sim_cond_embedder = sim_cond_embedder.to(device, dtype=dtype)
 
-        return cls(sim_transformer, ae, sim_cond_embedder)
+        return cls(sim_transformer, ae, sim_cond_embedder, anchor_mode=anchor_mode)
 
     def to(self, device=None, dtype=None):
         if device is not None:
@@ -131,11 +169,11 @@ class SimulationPipeline:
         vel_raw = self.ae.decode(z[..., d:], t_raw)    # (B, T_raw, N, 3)
         return torch.cat([pos_raw, vel_raw], dim=-1)   # (B, T_raw, N, 6)
 
-    @staticmethod
-    def _compute_point_anchor(x_s_init: torch.Tensor, point_obj_idx: torch.Tensor) -> torch.Tensor:
-        """Build per-point local-position anchors from the initial frame.
+    def _compute_point_anchor(self, x_s_init: torch.Tensor, point_obj_idx: torch.Tensor) -> torch.Tensor:
+        """Build per-point anchors from the initial frame.
 
-        Anchor = point position at t=0 minus its object's centroid at t=0.
+        Modes:
+          - local: centered world coordinates
         Shape: (B, 1, N, 3)
         """
         init_pos = x_s_init[..., :3]  # (B, 1, N, 3)
@@ -149,7 +187,29 @@ class SimulationPipeline:
                     continue
                 obj_pos = init_pos[b, 0, obj_mask]
                 centroid = obj_pos.mean(dim=0, keepdim=True)
-                anchor[b, 0, obj_mask] = obj_pos - centroid
+                centered = obj_pos - centroid
+                # NOTE:
+                # The previous canonical_pca branch is intentionally commented out.
+                # For near-symmetric objects or noisy point samples, the PCA basis
+                # is not stable enough to serve as a cross-sample point identity.
+                #
+                # if self.anchor_mode == "canonical_pca" and centered.shape[0] >= 3:
+                #     cov = centered.T @ centered
+                #     eigvals, eigvecs = torch.linalg.eigh(cov)
+                #     order = torch.argsort(eigvals, descending=True)
+                #     basis = eigvecs[:, order]
+                #     proj = centered @ basis
+                #     for ax_i in range(3):
+                #         idx = torch.argmax(proj[:, ax_i].abs())
+                #         sign = torch.sign(proj[idx, ax_i])
+                #         if sign == 0:
+                #             sign = centered.new_tensor(1.0)
+                #         basis[:, ax_i] = basis[:, ax_i] * sign
+                #         proj[:, ax_i] = proj[:, ax_i] * sign
+                #     if torch.det(basis) < 0:
+                #         basis[:, -1] = -basis[:, -1]
+                #     centered = centered @ basis
+                anchor[b, 0, obj_mask] = centered
         return anchor
 
     @torch.no_grad()
@@ -205,14 +265,17 @@ class SimulationPipeline:
             valid_seq_mask = valid_seq_mask.to(device)
 
         # --- Encode initial frame conditioning (constant across denoising steps) ---
+        # Repeat frame-0 latent on every timestep token so each future token keeps
+        # direct access to its own initial point identity signal.
         init_enc_1 = self._encode_state(x_s_init)         # (B, 1, N, d_state)
-        init_enc_padded = torch.cat([
-            init_enc_1,
-            torch.zeros(B, T - 1, N, d_state, device=device, dtype=dtype),
-        ], dim=1)                                           # (B, T, N, d_state)
+        init_enc_padded = init_enc_1.expand(-1, T, -1, -1).contiguous()  # (B, T, N, d_state)
         init_mask = torch.ones(B, T, N, 1, device=device, dtype=dtype)
         init_mask[:, 0, :, :] = 0.0  # first latent frame is given
         point_anchor_1 = self._compute_point_anchor(x_s_init, point_obj_idx).to(dtype)
+        if self.sim_transformer.d_anchor == 0:
+            point_anchor_1 = point_anchor_1[..., :0]
+        elif point_anchor_1.shape[-1] != self.sim_transformer.d_anchor:
+            point_anchor_1 = point_anchor_1[..., :self.sim_transformer.d_anchor]
         point_anchor = point_anchor_1.expand(-1, T, -1, -1).contiguous()
 
         # --- Encode force+contact via frozen AE (constant across timesteps) ---

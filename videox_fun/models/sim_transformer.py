@@ -21,6 +21,31 @@ from videox_fun.models.wan_transformer3d import (
 )
 
 
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+
+def _apply_rope_1d(x: torch.Tensor, theta: float = 10000.0) -> torch.Tensor:
+    """Apply standard 1D RoPE to attention tensors shaped (B, S, H, D)."""
+    _, seq_len, _, head_dim = x.shape
+    if head_dim % 2 != 0:
+        raise ValueError(f"RoPE requires even head_dim, got {head_dim}.")
+
+    pos = torch.arange(seq_len, device=x.device, dtype=torch.float32)
+    inv_freq = 1.0 / (
+        theta ** (torch.arange(0, head_dim, 2, device=x.device, dtype=torch.float32) / head_dim)
+    )
+    freqs = torch.outer(pos, inv_freq)
+    cos = torch.repeat_interleave(freqs.cos(), 2, dim=-1).view(1, seq_len, 1, head_dim)
+    sin = torch.repeat_interleave(freqs.sin(), 2, dim=-1).view(1, seq_len, 1, head_dim)
+
+    x_float = x.to(torch.float32)
+    x_rope = x_float * cos + _rotate_half(x_float) * sin
+    return x_rope.to(x.dtype)
+
+
 class SimSelfAttention(nn.Module):
     """Self-attention for simulation tokens.
 
@@ -34,11 +59,22 @@ class SimSelfAttention(nn.Module):
         eps: Epsilon for normalization.
     """
 
-    def __init__(self, dim: int, num_heads: int, qk_norm: bool = True, eps: float = 1e-6):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        qk_norm: bool = True,
+        eps: float = 1e-6,
+        use_rope: bool = False,
+        rope_theta: float = 10000.0,
+    ):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.use_rope = use_rope
+        self.rope_theta = rope_theta
+        self.register_buffer("rope_indicator", torch.tensor(float(use_rope)), persistent=True)
 
         self.q = nn.Linear(dim, dim)
         self.k = nn.Linear(dim, dim)
@@ -66,7 +102,10 @@ class SimSelfAttention(nn.Module):
         k = self.norm_k(self.k(x.to(w_dtype))).view(b, s, n, d)
         v = self.v(x.to(w_dtype)).view(b, s, n, d)
 
-        # No RoPE for simulation tokens.
+        if self.use_rope:
+            q = _apply_rope_1d(q, theta=self.rope_theta)
+            k = _apply_rope_1d(k, theta=self.rope_theta)
+
         # Force SDPA when attn_mask is provided: the shared wrapper would otherwise
         # convert attn_mask → k_lens for Flash Attention and silently drop the mask
         # if FA isn't installed (falling back to SDPA without the mask).
@@ -146,6 +185,69 @@ class SimAttentionBlock(nn.Module):
         return x
 
 
+class SimTemporalCorrespondenceBlock(nn.Module):
+    """Explicit same-point temporal attention across frames.
+
+    Operates on each point track independently: for point p, attention runs over
+    [x_0p, x_1p, ..., x_Tp]. This is a minimal way to inject per-point
+    correspondence without introducing any spatial structural loss.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        ffn_dim: int,
+        num_heads: int,
+        qk_norm: bool = True,
+        eps: float = 1e-6,
+        use_temporal_rope: bool = False,
+        rope_theta: float = 10000.0,
+    ):
+        super().__init__()
+        self.norm1 = WanLayerNorm(dim, eps)
+        self.temporal_attn = SimSelfAttention(
+            dim,
+            num_heads,
+            qk_norm,
+            eps,
+            use_rope=use_temporal_rope,
+            rope_theta=rope_theta,
+        )
+        self.norm2 = WanLayerNorm(dim, eps)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, ffn_dim),
+            nn.GELU(approximate='tanh'),
+            nn.Linear(ffn_dim, dim),
+        )
+
+    def forward(self, x, dtype=torch.bfloat16, valid_token_mask: Optional[torch.Tensor] = None):
+        """
+        Args:
+            x: (B, T, N, C)
+            valid_token_mask: Optional (B, T, N) bool
+        Returns:
+            (B, T, N, C)
+        """
+        B, T, N, C = x.shape
+        x = x.permute(0, 2, 1, 3).reshape(B * N, T, C)  # (B*N, T, C)
+
+        attn_mask = None
+        if valid_token_mask is not None:
+            temporal_mask = valid_token_mask.permute(0, 2, 1).reshape(B * N, T)
+            attn_mask = torch.zeros(B * N, 1, 1, T, device=x.device, dtype=dtype)
+            attn_mask.masked_fill_(
+                ~temporal_mask.unsqueeze(1).unsqueeze(2),
+                torch.finfo(dtype).min,
+            )
+
+        h = self.norm1(x).to(dtype)
+        x = x + self.temporal_attn(h, dtype=dtype, attn_mask=attn_mask)
+        h = self.norm2(x).to(dtype)
+        x = x + self.ffn(h)
+        x = x.view(B, N, T, C).permute(0, 2, 1, 3).contiguous()  # (B, T, N, C)
+        return x
+
+
 class SimTransformer(nn.Module):
     """Simulation DiT: 10-block Transformer for physics trajectory denoising.
 
@@ -178,6 +280,9 @@ class SimTransformer(nn.Module):
         ffn_dim: int = 1024,
         num_heads: int = 8,
         num_layers: int = 10,
+        use_temporal_correspondence: bool = False,
+        use_temporal_rope: bool = False,
+        rope_theta: float = 10000.0,
         freq_dim: int = 256,
         qk_norm: bool = True,
         eps: float = 1e-6,
@@ -188,6 +293,8 @@ class SimTransformer(nn.Module):
         self.d_anchor = d_anchor
         self.d_sim = d_sim
         self.num_layers = num_layers
+        self.use_temporal_correspondence = use_temporal_correspondence
+        self.use_temporal_rope = use_temporal_rope
         self.freq_dim = freq_dim
 
         # Input projection:
@@ -211,6 +318,18 @@ class SimTransformer(nn.Module):
             SimAttentionBlock(d_sim, ffn_dim, num_heads, qk_norm, eps)
             for _ in range(num_layers)
         ])
+        self.temporal_corr_block = (
+            SimTemporalCorrespondenceBlock(
+                d_sim,
+                ffn_dim,
+                num_heads,
+                qk_norm,
+                eps,
+                use_temporal_rope=use_temporal_rope,
+                rope_theta=rope_theta,
+            )
+            if use_temporal_correspondence else None
+        )
 
         # Output head
         self.head_norm = WanLayerNorm(d_sim, eps)
@@ -245,6 +364,13 @@ class SimTransformer(nn.Module):
         # Concatenate state, init conditioning, mask, and conditions → project
         x = torch.cat([x_enc, init_enc, init_mask, point_anchor, c_sim], dim=-1)
         x = self.input_proj(x)                   # (B, T, N, d_sim)
+
+        valid_token_mask = None
+        if valid_seq_mask is not None:
+            valid_token_mask = valid_seq_mask.view(B, T, N)
+        if self.temporal_corr_block is not None:
+            x = self.temporal_corr_block(x, dtype=dtype, valid_token_mask=valid_token_mask)
+
         x = x.view(B, T * N, self.d_sim)         # (B, T*N, d_sim)
 
         # Timestep modulation (computed in fp32 for numerical stability, then cast back)

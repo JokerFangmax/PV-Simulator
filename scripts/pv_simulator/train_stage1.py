@@ -167,10 +167,17 @@ def parse_args():
     parser.add_argument("--mode_scale", type=float, default=1.29)
 
     # Shape-preserving inductive bias
-    parser.add_argument("--lambda_local_dist", type=float, default=0.0,
+    parser.add_argument("--lambda_local_dist", type=float, default=1e-3,
                         help="Weight for local distance consistency loss in raw position space.")
-    parser.add_argument("--local_dist_k", type=int, default=8,
-                        help="Number of same-object neighbors from frame0 used in local distance loss.")
+    parser.add_argument("--lambda_vel", type=float, default=0.1,
+                        help="Weight for frame-to-frame raw-position velocity consistency loss.")
+    parser.add_argument("--lambda_chamfer", type=float, default=0.01,
+                        help="Weight for per-frame raw-position Chamfer distance loss.")
+    parser.add_argument("--knn_k", type=int, default=8,
+                        help="Number of same-object frame-0 KNN edges used in local distance loss.")
+    # Backward-compatible alias for existing launch scripts.
+    parser.add_argument("--local_dist_k", dest="knn_k", type=int, default=argparse.SUPPRESS,
+                        help=argparse.SUPPRESS)
     parser.add_argument("--anchor_mode", type=str, default="local",
                         choices=["local"],
                         help="How to encode point anchors from the initial frame. "
@@ -179,13 +186,17 @@ def parse_args():
                              "its basis was unstable across samples.")
     parser.add_argument("--disable_point_anchor", action="store_true",
                         help="Disable point_anchor input entirely for ablation.")
-    parser.add_argument("--use_temporal_correspondence", action="store_true",
+    parser.add_argument("--use_temporal_correspondence", action=argparse.BooleanOptionalAction,
+                        default=True,
                         help="Add an explicit same-point temporal attention block before the "
-                             "flat Transformer. This tests whether point collapse is caused by "
-                             "missing correspondence structure rather than by local distance loss.")
-    parser.add_argument("--use_temporal_rope", action="store_true",
+                            "flat Transformer. This tests whether point collapse is caused by "
+                            "missing correspondence structure rather than by local distance loss. "
+                            "Enabled by default; disable with --no-use-temporal-correspondence.")
+    parser.add_argument("--use_temporal_rope", action=argparse.BooleanOptionalAction,
+                        default=True,
                         help="Apply 1D RoPE inside the same-point temporal attention block. "
-                             "This adds explicit frame-order information on each point track.")
+                            "This adds explicit frame-order information on each point track. "
+                            "Enabled by default; disable with --no-use-temporal-rope.")
 
     # Checkpointing & logging
     parser.add_argument("--checkpointing_steps", type=int, default=5000)
@@ -212,6 +223,11 @@ def parse_args():
         parser.error("--ann_path is required when --dataset_type simulation")
     if args.overfit_single_sample_idx is not None and args.overfit_repeat_length < 1:
         parser.error("--overfit_repeat_length must be >= 1")
+    if args.knn_k < 1:
+        parser.error("--knn_k must be >= 1")
+    for name in ("lambda_vel", "lambda_local_dist", "lambda_chamfer"):
+        if getattr(args, name) < 0:
+            parser.error(f"--{name} must be >= 0")
 
     return args
 
@@ -342,6 +358,7 @@ def _compute_local_distance_loss(
     pos_gt: torch.Tensor,
     point_obj_idx: torch.Tensor,
     point_mask: torch.Tensor | None,
+    valid_frame_mask: torch.Tensor | None,
     k: int,
 ) -> torch.Tensor:
     """Compare same-object local distances using frame0 KNN from ground truth.
@@ -360,6 +377,13 @@ def _compute_local_distance_loss(
         else:
             valid_points = torch.ones(N, device=device, dtype=torch.bool)
 
+        if valid_frame_mask is not None:
+            valid_frames = valid_frame_mask[b]
+        else:
+            valid_frames = torch.ones(T_raw, device=device, dtype=torch.bool)
+        if valid_frames.sum() < 2:
+            continue
+
         obj_ids = torch.unique(point_obj_idx[b][valid_points])
         for obj_id in obj_ids.tolist():
             obj_mask = (point_obj_idx[b] == obj_id) & valid_points
@@ -368,9 +392,11 @@ def _compute_local_distance_loss(
             if n_obj < 2:
                 continue
 
+            # KNN graph is built independently for each object from frame 0;
+            # points from different objects can never become neighbors here.
             obj_gt0 = pos_gt[b, 0, obj_idx]  # (n_obj, 3)
-            obj_gt = pos_gt[b, :, obj_idx]   # (T_raw, n_obj, 3)
-            obj_pred = pos_pred[b, :, obj_idx]
+            obj_gt = pos_gt[b, valid_frames][:, obj_idx]   # (T_valid, n_obj, 3)
+            obj_pred = pos_pred[b, valid_frames][:, obj_idx]
 
             pairwise = torch.cdist(obj_gt0, obj_gt0)
             pairwise.fill_diagonal_(torch.finfo(pairwise.dtype).max)
@@ -388,8 +414,72 @@ def _compute_local_distance_loss(
             rel_err = (pred_dist - gt_dist) / obj_scale
             obj_loss = rel_err.pow(2).mean()
 
-            total_loss = total_loss + obj_loss * (n_obj * k_eff)
-            total_weight = total_weight + (n_obj * k_eff)
+            total_loss = total_loss + obj_loss * (obj_gt.shape[0] * n_obj * k_eff)
+            total_weight = total_weight + (obj_gt.shape[0] * n_obj * k_eff)
+
+    if total_weight.item() == 0:
+        return pos_gt.new_tensor(0.0)
+    return total_loss / total_weight
+
+
+def _compute_velocity_consistency_loss(
+    pos_pred: torch.Tensor,
+    pos_gt: torch.Tensor,
+    point_mask: torch.Tensor | None,
+    valid_frame_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Match finite-difference position velocities on valid raw frames and points."""
+    pred_vel = pos_pred[:, 1:] - pos_pred[:, :-1]
+    gt_vel = pos_gt[:, 1:] - pos_gt[:, :-1]
+    sq_error = (pred_vel - gt_vel).pow(2)
+
+    B, T_minus_1, N, _ = sq_error.shape
+    if point_mask is None:
+        valid_points = torch.ones(B, N, device=pos_pred.device, dtype=torch.bool)
+    else:
+        valid_points = point_mask
+    if valid_frame_mask is None:
+        valid_pairs = torch.ones(B, T_minus_1, device=pos_pred.device, dtype=torch.bool)
+    else:
+        valid_pairs = valid_frame_mask[:, 1:] & valid_frame_mask[:, :-1]
+
+    mask = valid_pairs.unsqueeze(-1) & valid_points.unsqueeze(1)
+    return (sq_error * mask.unsqueeze(-1)).sum() / (mask.sum() * 3).clamp_min(1)
+
+
+def _compute_chamfer_loss(
+    pos_pred: torch.Tensor,
+    pos_gt: torch.Tensor,
+    point_mask: torch.Tensor | None,
+    valid_frame_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Symmetric squared Chamfer distance for each valid raw point-cloud frame."""
+    B, T_raw, N, _ = pos_gt.shape
+    total_loss = pos_gt.new_tensor(0.0)
+    total_weight = pos_gt.new_tensor(0.0)
+
+    for b in range(B):
+        if point_mask is None:
+            valid_points = torch.ones(N, device=pos_gt.device, dtype=torch.bool)
+        else:
+            valid_points = point_mask[b]
+        if not torch.any(valid_points):
+            continue
+
+        valid_frames = (
+            valid_frame_mask[b]
+            if valid_frame_mask is not None
+            else torch.ones(T_raw, device=pos_gt.device, dtype=torch.bool)
+        )
+        for frame_idx in valid_frames.nonzero(as_tuple=True)[0]:
+            pred_points = pos_pred[b, frame_idx, valid_points]
+            gt_points = pos_gt[b, frame_idx, valid_points]
+            sq_dist = torch.cdist(pred_points, gt_points).square()
+            frame_loss = 0.5 * (
+                sq_dist.min(dim=1).values.mean() + sq_dist.min(dim=0).values.mean()
+            )
+            total_loss = total_loss + frame_loss
+            total_weight = total_weight + 1
 
     if total_weight.item() == 0:
         return pos_gt.new_tensor(0.0)
@@ -465,6 +555,15 @@ def main():
         num_layers=args.sim_num_layers,
         use_temporal_correspondence=args.use_temporal_correspondence,
         use_temporal_rope=args.use_temporal_rope,
+    )
+    logger.info(
+        "Temporal structure: sinusoidal token positions=on, correspondence=%s, RoPE=%s, "
+        "lambda_local_dist=%g, lambda_vel=%g, lambda_chamfer=%g",
+        args.use_temporal_correspondence,
+        args.use_temporal_rope,
+        args.lambda_local_dist,
+        args.lambda_vel,
+        args.lambda_chamfer,
     )
 
     # Move to device
@@ -755,27 +854,67 @@ def main():
                     diffusion_loss = (loss_per_elem * weighting.float()).sum() / n_valid.clamp(min=1)
 
                 local_dist_loss = x_s_raw.new_tensor(0.0)
-                if args.lambda_local_dist > 0.0:
+                velocity_loss = x_s_raw.new_tensor(0.0)
+                chamfer_loss = x_s_raw.new_tensor(0.0)
+                use_raw_auxiliary_loss = any([
+                    args.lambda_local_dist > 0.0,
+                    args.lambda_vel > 0.0,
+                    args.lambda_chamfer > 0.0,
+                ])
+                if use_raw_auxiliary_loss:
                     pred_x0_enc = noise - pred_enc
                     pred_x0_enc[:, :1] = x_s_enc[:, :1]
                     pred_x0_raw = torch.cat([
                         ae.decode(pred_x0_enc[..., :d_latent], T_raw_dim),
                         ae.decode(pred_x0_enc[..., d_latent:], T_raw_dim),
                     ], dim=-1)
-                    local_dist_loss = _compute_local_distance_loss(
-                        pos_pred=pred_x0_raw[..., :3].float(),
-                        pos_gt=x_s_raw[..., :3].float(),
-                        point_obj_idx=point_obj_idx,
-                        point_mask=point_mask,
-                        k=args.local_dist_k,
-                    )
 
-                loss = diffusion_loss + args.lambda_local_dist * local_dist_loss
+                    if args.padded_batch:
+                        raw_t_idx = torch.arange(T_raw_dim, device=accelerator.device).unsqueeze(0)
+                        valid_raw_frame_mask = raw_t_idx < T_raw_tensor.unsqueeze(1)
+                    else:
+                        valid_raw_frame_mask = None
+
+                    pos_pred = pred_x0_raw[..., :3].float()
+                    pos_gt = x_s_raw[..., :3].float()
+
+                    if args.lambda_vel > 0.0:
+                        velocity_loss = _compute_velocity_consistency_loss(
+                            pos_pred=pos_pred,
+                            pos_gt=pos_gt,
+                            point_mask=point_mask,
+                            valid_frame_mask=valid_raw_frame_mask,
+                        )
+                    if args.lambda_local_dist > 0.0:
+                        local_dist_loss = _compute_local_distance_loss(
+                            pos_pred=pos_pred,
+                            pos_gt=pos_gt,
+                            point_obj_idx=point_obj_idx,
+                            point_mask=point_mask,
+                            valid_frame_mask=valid_raw_frame_mask,
+                            k=args.knn_k,
+                        )
+                    if args.lambda_chamfer > 0.0:
+                        chamfer_loss = _compute_chamfer_loss(
+                            pos_pred=pos_pred,
+                            pos_gt=pos_gt,
+                            point_mask=point_mask,
+                            valid_frame_mask=valid_raw_frame_mask,
+                        )
+
+                loss = (
+                    diffusion_loss
+                    + args.lambda_vel * velocity_loss
+                    + args.lambda_local_dist * local_dist_loss
+                    + args.lambda_chamfer * chamfer_loss
+                )
 
                 # --- Backward ---
                 avg_loss = accelerator.gather(loss.repeat(bsz)).mean()
                 avg_diffusion_loss = accelerator.gather(diffusion_loss.repeat(bsz)).mean()
                 avg_local_dist_loss = accelerator.gather(local_dist_loss.repeat(bsz)).mean()
+                avg_velocity_loss = accelerator.gather(velocity_loss.repeat(bsz)).mean()
+                avg_chamfer_loss = accelerator.gather(chamfer_loss.repeat(bsz)).mean()
                 train_loss += avg_loss.item()
                 accum_count += 1
 
@@ -796,6 +935,8 @@ def main():
                         "train_loss": train_loss / max(accum_count, 1),
                         "diffusion_loss": avg_diffusion_loss.item(),
                         "local_dist_loss": avg_local_dist_loss.item(),
+                        "velocity_loss": avg_velocity_loss.item(),
+                        "chamfer_loss": avg_chamfer_loss.item(),
                         "lr": current_lr,
                         "epoch": epoch,
                         "global_step": global_step,
@@ -860,6 +1001,8 @@ def main():
                 "step_loss": loss.detach().item(),
                 "diff_loss": diffusion_loss.detach().item(),
                 "local_dist": local_dist_loss.detach().item(),
+                "velocity": velocity_loss.detach().item(),
+                "chamfer": chamfer_loss.detach().item(),
                 "lr": lr_scheduler.get_last_lr()[0],
             }
             progress_bar.set_postfix(**logs)

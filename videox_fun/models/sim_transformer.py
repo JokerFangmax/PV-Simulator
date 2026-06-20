@@ -365,6 +365,16 @@ class SimTransformer(nn.Module):
         x = torch.cat([x_enc, init_enc, init_mask, point_anchor, c_sim], dim=-1)
         x = self.input_proj(x)                   # (B, T, N, d_sim)
 
+        # Give every token an explicit trajectory-time coordinate before global
+        # (T, N) attention.  The diffusion timestep embedding below is shared by
+        # every token and therefore cannot distinguish frame t from frame t + 1.
+        # This parameter-free encoding remains active when temporal RoPE is off.
+        temporal_pos = sinusoidal_embedding_1d(
+            self.d_sim,
+            torch.arange(T, device=x.device),
+        ).to(dtype=x.dtype)
+        x = x + temporal_pos.view(1, T, 1, self.d_sim)
+
         valid_token_mask = None
         if valid_seq_mask is not None:
             valid_token_mask = valid_seq_mask.view(B, T, N)

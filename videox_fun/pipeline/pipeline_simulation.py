@@ -40,6 +40,13 @@ from tqdm.auto import tqdm
 from videox_fun.models.sim_ae import CausalAE
 from videox_fun.models.sim_condition import SimConditionEmbedder
 from videox_fun.models.sim_transformer import SimTransformer
+from videox_fun.utils.sim_metrics import (
+    ae_reconstruction_chamfer,
+    frame0_error,
+    knn_edge_error,
+    raw_frame_mask_from_valid_seq_mask,
+    velocity_drift,
+)
 
 
 class SimulationPipeline:
@@ -230,6 +237,8 @@ class SimulationPipeline:
         show_progress: bool = True,
         point_mask: Optional[torch.Tensor] = None,    # (B, N) bool
         valid_seq_mask: Optional[torch.Tensor] = None,  # (B, T*N) bool
+        x_s_target: Optional[torch.Tensor] = None,    # (B, T_raw, N, 6|9), optional diagnostics target
+        log_diagnostics: bool = True,
     ):
         """Run LDM-style simulation denoising in latent space.
 
@@ -241,7 +250,8 @@ class SimulationPipeline:
           - After the loop, AE decoder projects the final latent → raw states.
 
         Returns:
-            dict with 'x_s': (B, T_raw, N, 6) — predicted point states
+            dict with 'x_s': (B, T_raw, N, 6) and scalar 'diagnostics'.
+            Without x_s_target, diagnostics include frame-0 preservation only.
         """
         device = self.device
         dtype = self.dtype
@@ -263,6 +273,13 @@ class SimulationPipeline:
             point_mask = point_mask.to(device)
         if valid_seq_mask is not None:
             valid_seq_mask = valid_seq_mask.to(device)
+        if x_s_target is not None:
+            x_s_target = x_s_target.to(device, dtype=dtype)
+            if x_s_target.shape[:3] != (B, T_raw, N):
+                raise ValueError(
+                    "x_s_target must have shape (B, T_raw, N, C), got "
+                    f"{tuple(x_s_target.shape)}; expected ({B}, {T_raw}, {N}, C)."
+                )
 
         # --- Encode initial frame conditioning (constant across denoising steps) ---
         # Repeat frame-0 latent on every timestep token so each future token keeps
@@ -325,6 +342,42 @@ class SimulationPipeline:
         # --- Decode once at the end ---
         x_s_pred = self._decode_state(sample, T_raw)  # (B, T_raw, N, 6)
 
+        diagnostics = {}
+        if log_diagnostics:
+            valid_raw_frame_mask = raw_frame_mask_from_valid_seq_mask(
+                valid_seq_mask, T, N, T_raw,
+            )
+            diagnostics.update(frame0_error(
+                x_s_pred[..., :3].float(),
+                x_s_init[..., :3].float(),
+                point_mask=point_mask,
+            ))
+            if x_s_target is not None:
+                target_positions = x_s_target[..., :3].float()
+                pred_positions = x_s_pred[..., :3].float()
+                diagnostics.update({
+                    "knn_edge_error": knn_edge_error(
+                        pred_positions, target_positions, point_obj_idx,
+                        point_mask=point_mask,
+                        valid_frame_mask=valid_raw_frame_mask,
+                    ),
+                    "velocity_drift": velocity_drift(
+                        pred_positions, target_positions,
+                        point_mask=point_mask,
+                        valid_frame_mask=valid_raw_frame_mask,
+                    ),
+                    "ae_reconstruction_chamfer": ae_reconstruction_chamfer(
+                        self.ae, x_s_target,
+                        point_mask=point_mask,
+                        valid_frame_mask=valid_raw_frame_mask,
+                    ),
+                })
+            print(
+                "[Simulation diagnostics] "
+                + ", ".join(f"{name}={value.item():.6g}" for name, value in diagnostics.items())
+            )
+
         return {
             'x_s': x_s_pred,
+            'diagnostics': {name: value.item() for name, value in diagnostics.items()},
         }

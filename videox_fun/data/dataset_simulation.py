@@ -170,6 +170,13 @@ class MoviSimulationDataset(Dataset):
         self.temporal_compression_ratio = temporal_compression_ratio
         self._shard_tars = {}
         self._shard_members = {}
+        # DataLoader workers are forked lazily.  If the main process has already
+        # loaded a sample (for example, fixed visualization samples), workers
+        # inherit these tar handles.  The inherited descriptors share a file
+        # offset across processes, so concurrent reads can make an inner payload
+        # look like an invalid tar archive.  Track the owning PID and reopen in
+        # every worker instead of reusing inherited handles.
+        self._shard_handle_pid = os.getpid()
 
         webdataset_root = self._resolve_webdataset_root(data_root)
         if webdataset_root is not None:
@@ -285,6 +292,14 @@ class MoviSimulationDataset(Dataset):
         }
 
     def _get_shard_handle(self, shard_path):
+        current_pid = os.getpid()
+        if current_pid != self._shard_handle_pid:
+            for inherited_tf in self._shard_tars.values():
+                inherited_tf.close()
+            self._shard_tars = {}
+            self._shard_members = {}
+            self._shard_handle_pid = current_pid
+
         tf = self._shard_tars.get(shard_path)
         if tf is None:
             tf = tarfile.open(shard_path, "r:")

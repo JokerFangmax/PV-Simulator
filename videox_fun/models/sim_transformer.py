@@ -46,6 +46,49 @@ def _apply_rope_1d(x: torch.Tensor, theta: float = 10000.0) -> torch.Tensor:
     return x_rope.to(x.dtype)
 
 
+def _build_spatial_knn_adjacency(
+    anchor_positions: torch.Tensor,
+    k: int,
+    point_obj_idx: Optional[torch.Tensor] = None,
+    point_valid_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Return symmetric (B, N, N) anchor-frame KNN adjacency including self."""
+    B, N, _ = anchor_positions.shape
+    adjacency = torch.eye(N, device=anchor_positions.device, dtype=torch.bool).expand(B, -1, -1).clone()
+
+    for batch_idx in range(B):
+        valid_points = (
+            point_valid_mask[batch_idx]
+            if point_valid_mask is not None
+            else torch.ones(N, device=anchor_positions.device, dtype=torch.bool)
+        )
+        if point_obj_idx is None:
+            object_point_groups = [valid_points.nonzero(as_tuple=True)[0]]
+        else:
+            object_point_groups = [
+                ((point_obj_idx[batch_idx] == object_id) & valid_points).nonzero(as_tuple=True)[0]
+                for object_id in torch.unique(point_obj_idx[batch_idx][valid_points]).tolist()
+            ]
+
+        for point_idx in object_point_groups:
+            n_points = point_idx.numel()
+            if n_points < 2:
+                continue
+            pairwise = torch.cdist(
+                anchor_positions[batch_idx, point_idx].float(),
+                anchor_positions[batch_idx, point_idx].float(),
+            )
+            pairwise.fill_diagonal_(torch.inf)
+            k_eff = min(k, n_points - 1)
+            neighbors = pairwise.topk(k_eff, largest=False).indices
+            local_adjacency = torch.eye(n_points, device=anchor_positions.device, dtype=torch.bool)
+            local_adjacency.scatter_(1, neighbors, True)
+            local_adjacency = local_adjacency | local_adjacency.transpose(0, 1)
+            adjacency[batch_idx][point_idx[:, None], point_idx[None, :]] = local_adjacency
+
+    return adjacency
+
+
 class SimSelfAttention(nn.Module):
     """Self-attention for simulation tokens.
 
@@ -282,6 +325,9 @@ class SimTransformer(nn.Module):
         num_layers: int = 10,
         use_temporal_correspondence: bool = False,
         use_temporal_rope: bool = False,
+        use_object_local_attention: bool = False,
+        use_spatial_knn_attention: bool = False,
+        spatial_knn_k: int = 8,
         rope_theta: float = 10000.0,
         freq_dim: int = 256,
         qk_norm: bool = True,
@@ -295,6 +341,11 @@ class SimTransformer(nn.Module):
         self.num_layers = num_layers
         self.use_temporal_correspondence = use_temporal_correspondence
         self.use_temporal_rope = use_temporal_rope
+        self.use_object_local_attention = use_object_local_attention
+        self.use_spatial_knn_attention = use_spatial_knn_attention
+        if spatial_knn_k < 1:
+            raise ValueError("spatial_knn_k must be >= 1")
+        self.spatial_knn_k = spatial_knn_k
         self.freq_dim = freq_dim
 
         # Input projection:
@@ -343,7 +394,8 @@ class SimTransformer(nn.Module):
         nn.init.zeros_(self.head_proj.bias)
 
     def forward(self, x_enc, init_enc, init_mask, point_anchor, c_sim, t, dtype=torch.bfloat16,
-                valid_seq_mask: Optional[torch.Tensor] = None):
+                valid_seq_mask: Optional[torch.Tensor] = None,
+                point_obj_idx: Optional[torch.Tensor] = None):
         """
         Args:
             x_enc: (B, T, N, d_state) — AE-encoded noisy point states.
@@ -356,10 +408,20 @@ class SimTransformer(nn.Module):
             valid_seq_mask: Optional (B, T*N) bool — True for valid (non-padded) tokens.
                 If provided, padded tokens are masked out in self-attention via an
                 additive key bias of -inf. Used in padded batch mode.
+            point_obj_idx: Optional (B, N) int — point-to-object mapping. When
+                ``use_object_local_attention`` is enabled, different objects are
+                masked from each other at every temporal position.
         Returns:
             (B, T, N, d_state) — predicted value in latent space.
         """
         B, T, N, _ = x_enc.shape
+        if point_anchor.ndim == 3:
+            if point_anchor.shape[:2] != (B, N):
+                raise ValueError(
+                    "Static point_anchor must have shape (B, N, d_anchor), got "
+                    f"{tuple(point_anchor.shape)} for B={B}, N={N}."
+                )
+            point_anchor = point_anchor.unsqueeze(1).expand(-1, T, -1, -1)
 
         # Concatenate state, init conditioning, mask, and conditions → project
         x = torch.cat([x_enc, init_enc, init_mask, point_anchor, c_sim], dim=-1)
@@ -392,15 +454,62 @@ class SimTransformer(nn.Module):
             # e0: (B, 6, d_sim)
         e0 = e0.to(dtype)   # cast back so modulation arithmetic stays in model dtype
 
-        # Build additive attention bias to mask padding tokens (padded batch mode)
+        # Build additive attention bias for object-local, spatial-KNN, and padded attention.
         attn_mask = None
+        L = T * N
+        allowed_pairs = None
+
+        if self.use_object_local_attention and point_obj_idx is not None:
+            if point_obj_idx.shape != (B, N):
+                raise ValueError(
+                    "point_obj_idx must have shape (B, N), got "
+                    f"{tuple(point_obj_idx.shape)} for B={B}, N={N}."
+                )
+
+            # Token order is (t0,p0..pN), (t1,p0..pN), ... after flattening.
+            # Repeating object IDs over T therefore permits all temporal pairs
+            # within an object while blocking every cross-object query/key pair.
+            token_obj_idx = point_obj_idx.to(device=x.device).unsqueeze(1).expand(-1, T, -1)
+            token_obj_idx = token_obj_idx.reshape(B, L)
+            allowed_pairs = token_obj_idx.unsqueeze(2) == token_obj_idx.unsqueeze(1)
+
+        if self.use_spatial_knn_attention:
+            if point_anchor.shape[-1] < 3:
+                raise ValueError(
+                    "Spatial KNN attention requires point_anchor with at least three coordinate channels."
+                )
+            if point_obj_idx is not None and point_obj_idx.shape != (B, N):
+                raise ValueError(
+                    "point_obj_idx must have shape (B, N), got "
+                    f"{tuple(point_obj_idx.shape)} for B={B}, N={N}."
+                )
+
+            point_valid_mask = None
+            if valid_seq_mask is not None:
+                point_valid_mask = valid_seq_mask.view(B, T, N).any(dim=1)
+            # The anchor is repeated over time; frame 0 is the static KNN graph.
+            spatial_adjacency = _build_spatial_knn_adjacency(
+                point_anchor[:, 0, :, :3],
+                self.spatial_knn_k,
+                point_obj_idx=point_obj_idx,
+                point_valid_mask=point_valid_mask,
+            )
+            spatial_pairs = spatial_adjacency[:, None, :, None, :]
+            spatial_pairs = spatial_pairs.expand(B, T, N, T, N).reshape(B, L, L)
+            allowed_pairs = spatial_pairs if allowed_pairs is None else (allowed_pairs & spatial_pairs)
+
+        if allowed_pairs is not None:
+            attn_mask = torch.zeros(B, 1, L, L, device=x.device, dtype=dtype)
+            attn_mask.masked_fill_(~allowed_pairs.unsqueeze(1), torch.finfo(dtype).min)
+
         if valid_seq_mask is not None:
-            L = T * N
-            # key_bias: (B, 1, 1, L) — 0 for valid tokens, -inf for padding
-            key_bias = torch.zeros(B, 1, 1, L, device=x.device, dtype=dtype)
-            key_bias.masked_fill_(~valid_seq_mask.unsqueeze(1).unsqueeze(2),
-                                  torch.finfo(dtype).min)
-            attn_mask = key_bias
+            if attn_mask is None:
+                attn_mask = torch.zeros(B, 1, 1, L, device=x.device, dtype=dtype)
+            # Mask padded keys without disturbing locality query/key biases.
+            attn_mask.masked_fill_(
+                ~valid_seq_mask.view(B, 1, 1, L),
+                torch.finfo(dtype).min,
+            )
 
         # Transformer blocks
         for block in self.blocks:

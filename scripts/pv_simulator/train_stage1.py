@@ -75,6 +75,12 @@ from videox_fun.models.sim_ae import CausalAE
 from videox_fun.models.sim_condition import SimConditionEmbedder
 from videox_fun.models.sim_transformer import SimTransformer
 from videox_fun.utils.discrete_sampler import DiscreteSampling
+from videox_fun.utils.sim_metrics import (
+    ae_reconstruction_chamfer,
+    frame0_error,
+    knn_edge_error,
+    velocity_drift,
+)
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -168,11 +174,19 @@ def parse_args():
 
     # Shape-preserving inductive bias
     parser.add_argument("--lambda_local_dist", type=float, default=1e-3,
-                        help="Weight for local distance consistency loss in raw position space.")
+                        help="Weight for frame-0-relative local KNN edge deformation loss.")
+    parser.add_argument("--lambda_covariance", type=float, default=0.0,
+                        help="Weight for per-object raw-position covariance consistency loss.")
     parser.add_argument("--lambda_vel", type=float, default=0.1,
                         help="Weight for frame-to-frame raw-position velocity consistency loss.")
     parser.add_argument("--lambda_chamfer", type=float, default=0.01,
                         help="Weight for per-frame raw-position Chamfer distance loss.")
+    parser.add_argument("--lambda_momentum", type=float, default=0.01,
+                        help="Weight for per-object raw linear momentum consistency loss.")
+    parser.add_argument("--lambda_floor", type=float, default=0.1,
+                        help="Weight for non-static point floor-penetration loss.")
+    parser.add_argument("--gravity_axis", type=str, default="z", choices=["x", "y", "z"],
+                        help="Coordinate axis normal to the floor for penetration loss.")
     parser.add_argument("--knn_k", type=int, default=8,
                         help="Number of same-object frame-0 KNN edges used in local distance loss.")
     # Backward-compatible alias for existing launch scripts.
@@ -197,13 +211,25 @@ def parse_args():
                         help="Apply 1D RoPE inside the same-point temporal attention block. "
                             "This adds explicit frame-order information on each point track. "
                             "Enabled by default; disable with --no-use-temporal-rope.")
+    parser.add_argument("--use_object_local_attention", action="store_true",
+                        help="Restrict flat self-attention to tokens from the same object.")
+    parser.add_argument("--use_spatial_knn_attention", action="store_true",
+                        help="Restrict flat self-attention to static anchor-frame KNN neighbors.")
+    parser.add_argument("--spatial_knn_k", type=int, default=8,
+                        help="Number of anchor-frame KNN neighbors for spatial attention.")
 
     # Checkpointing & logging
     parser.add_argument("--checkpointing_steps", type=int, default=5000)
     parser.add_argument("--checkpoints_total_limit", type=int, default=5)
     parser.add_argument("--logging_dir", type=str, default="logs")
     parser.add_argument("--report_to", type=str, default="tensorboard", choices=["tensorboard", "wandb"])
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Resume a full Accelerator checkpoint (model, optimizer, scheduler, and RNG state).")
+    parser.add_argument("--init_from_model_dir", type=str, default=None,
+                        help="Initialize model weights from a directory containing sim_transformer.pt and "
+                             "sim_cond_embedder.pt. Optimizer state is reset.")
+    parser.add_argument("--initial_global_step", type=int, default=0,
+                        help="Optimizer step represented by --init_from_model_dir; keeps epoch and LR schedule aligned.")
     parser.add_argument("--wandb_project", type=str, default="pv_simulator",
                         help="wandb project name (used when --report_to wandb).")
     parser.add_argument("--wandb_run_name", type=str, default=None,
@@ -216,6 +242,8 @@ def parse_args():
                         help="Denoising steps during visualization inference.")
     parser.add_argument("--vis_fps", type=int, default=10,
                         help="FPS for wandb visualization videos.")
+    parser.add_argument("--sim_metrics_steps", type=int, default=100,
+                        help="Log detached raw-space simulation diagnostics every N optimizer steps. 0 = disabled.")
 
     args = parser.parse_args()
 
@@ -225,7 +253,22 @@ def parse_args():
         parser.error("--overfit_repeat_length must be >= 1")
     if args.knn_k < 1:
         parser.error("--knn_k must be >= 1")
-    for name in ("lambda_vel", "lambda_local_dist", "lambda_chamfer"):
+    if args.spatial_knn_k < 1:
+        parser.error("--spatial_knn_k must be >= 1")
+    if args.use_spatial_knn_attention and args.disable_point_anchor:
+        parser.error("--use_spatial_knn_attention requires point anchors; omit --disable_point_anchor")
+    if args.sim_metrics_steps < 0:
+        parser.error("--sim_metrics_steps must be >= 0")
+    if args.initial_global_step < 0:
+        parser.error("--initial_global_step must be >= 0")
+    if args.resume_from_checkpoint and args.init_from_model_dir:
+        parser.error("Use only one of --resume_from_checkpoint and --init_from_model_dir")
+    if args.initial_global_step and not args.init_from_model_dir:
+        parser.error("--initial_global_step requires --init_from_model_dir")
+    for name in (
+        "lambda_vel", "lambda_local_dist", "lambda_covariance", "lambda_chamfer",
+        "lambda_momentum", "lambda_floor",
+    ):
         if getattr(args, name) < 0:
             parser.error(f"--{name} must be >= 0")
 
@@ -361,10 +404,12 @@ def _compute_local_distance_loss(
     valid_frame_mask: torch.Tensor | None,
     k: int,
 ) -> torch.Tensor:
-    """Compare same-object local distances using frame0 KNN from ground truth.
+    """Compare same-object KNN deformation ratios relative to frame 0.
 
-    This is a soft, data-derived structural prior: no explicit rigid graph is
-    provided, only the initial frame's local neighborhood geometry.
+    The graph is built on ground-truth frame 0. For every later frame, this
+    compares ``log(pred_edge / pred_edge_0)`` with
+    ``log(gt_edge / gt_edge_0)``. Thus the loss measures local deformation,
+    rather than absolute world-coordinate edge error.
     """
     device = pos_gt.device
     total_loss = pos_gt.new_tensor(0.0)
@@ -381,7 +426,9 @@ def _compute_local_distance_loss(
             valid_frames = valid_frame_mask[b]
         else:
             valid_frames = torch.ones(T_raw, device=device, dtype=torch.bool)
-        if valid_frames.sum() < 2:
+        frame_idx = valid_frames.nonzero(as_tuple=True)[0]
+        frame_idx = frame_idx[frame_idx > 0]
+        if frame_idx.numel() == 0:
             continue
 
         obj_ids = torch.unique(point_obj_idx[b][valid_points])
@@ -395,24 +442,32 @@ def _compute_local_distance_loss(
             # KNN graph is built independently for each object from frame 0;
             # points from different objects can never become neighbors here.
             obj_gt0 = pos_gt[b, 0, obj_idx]  # (n_obj, 3)
-            obj_gt = pos_gt[b, valid_frames][:, obj_idx]   # (T_valid, n_obj, 3)
-            obj_pred = pos_pred[b, valid_frames][:, obj_idx]
+            obj_gt = pos_gt[b, frame_idx][:, obj_idx]   # (T_valid, n_obj, 3)
+            obj_pred = pos_pred[b, frame_idx][:, obj_idx]
+            obj_pred0 = pos_pred[b, 0, obj_idx]
 
             pairwise = torch.cdist(obj_gt0, obj_gt0)
             pairwise.fill_diagonal_(torch.finfo(pairwise.dtype).max)
             k_eff = min(k, n_obj - 1)
             nbr_local = torch.topk(pairwise, k=k_eff, largest=False).indices  # (n_obj, k_eff)
 
-            gt_ref = obj_gt.unsqueeze(2).expand(-1, -1, k_eff, -1)
-            gt_nbr = obj_gt[:, nbr_local, :]
-            pred_ref = obj_pred.unsqueeze(2).expand(-1, -1, k_eff, -1)
-            pred_nbr = obj_pred[:, nbr_local, :]
+            gt_edge0 = torch.linalg.vector_norm(
+                obj_gt0.unsqueeze(1) - obj_gt0[nbr_local], dim=-1,
+            )
+            pred_edge0 = torch.linalg.vector_norm(
+                obj_pred0.unsqueeze(1) - obj_pred0[nbr_local], dim=-1,
+            )
+            gt_edges = torch.linalg.vector_norm(
+                obj_gt.unsqueeze(2) - obj_gt[:, nbr_local, :], dim=-1,
+            )
+            pred_edges = torch.linalg.vector_norm(
+                obj_pred.unsqueeze(2) - obj_pred[:, nbr_local, :], dim=-1,
+            )
 
-            gt_dist = torch.norm(gt_ref - gt_nbr, dim=-1)
-            pred_dist = torch.norm(pred_ref - pred_nbr, dim=-1)
-            obj_scale = gt_dist[:, :].mean().clamp_min(1e-2)
-            rel_err = (pred_dist - gt_dist) / obj_scale
-            obj_loss = rel_err.pow(2).mean()
+            # Log-ratios penalize expansion and shrinkage symmetrically.
+            gt_log_ratio = torch.log(gt_edges.clamp_min(1e-4) / gt_edge0.clamp_min(1e-4))
+            pred_log_ratio = torch.log(pred_edges.clamp_min(1e-4) / pred_edge0.clamp_min(1e-4))
+            obj_loss = (pred_log_ratio - gt_log_ratio).pow(2).mean()
 
             total_loss = total_loss + obj_loss * (obj_gt.shape[0] * n_obj * k_eff)
             total_weight = total_weight + (obj_gt.shape[0] * n_obj * k_eff)
@@ -420,6 +475,55 @@ def _compute_local_distance_loss(
     if total_weight.item() == 0:
         return pos_gt.new_tensor(0.0)
     return total_loss / total_weight
+
+
+def _compute_covariance_loss(
+    pos_pred: torch.Tensor,
+    pos_gt: torch.Tensor,
+    point_obj_idx: torch.Tensor,
+    point_mask: torch.Tensor | None,
+    valid_frame_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Match per-object 3×3 position covariance matrices after frame 0."""
+    device = pos_gt.device
+    total_loss = pos_gt.new_tensor(0.0)
+    total_weight = pos_gt.new_tensor(0.0)
+    B, T_raw, N, _ = pos_gt.shape
+
+    for b in range(B):
+        valid_points = (
+            point_mask[b]
+            if point_mask is not None
+            else torch.ones(N, device=device, dtype=torch.bool)
+        )
+        valid_frames = (
+            valid_frame_mask[b]
+            if valid_frame_mask is not None
+            else torch.ones(T_raw, device=device, dtype=torch.bool)
+        )
+        frame_idx = valid_frames.nonzero(as_tuple=True)[0]
+        frame_idx = frame_idx[frame_idx > 0]
+        if frame_idx.numel() == 0:
+            continue
+
+        for obj_id in torch.unique(point_obj_idx[b][valid_points]).tolist():
+            obj_idx = ((point_obj_idx[b] == obj_id) & valid_points).nonzero(as_tuple=True)[0]
+            n_obj = obj_idx.numel()
+            if n_obj < 2:
+                continue
+
+            pred_points = pos_pred[b, frame_idx][:, obj_idx]
+            gt_points = pos_gt[b, frame_idx][:, obj_idx]
+            pred_centered = pred_points - pred_points.mean(dim=1, keepdim=True)
+            gt_centered = gt_points - gt_points.mean(dim=1, keepdim=True)
+            pred_cov = pred_centered.transpose(1, 2) @ pred_centered / (n_obj - 1)
+            gt_cov = gt_centered.transpose(1, 2) @ gt_centered / (n_obj - 1)
+            obj_loss = (pred_cov - gt_cov).square().mean()
+
+            total_loss = total_loss + obj_loss * frame_idx.numel()
+            total_weight = total_weight + frame_idx.numel()
+
+    return total_loss / total_weight.clamp_min(1)
 
 
 def _compute_velocity_consistency_loss(
@@ -445,6 +549,80 @@ def _compute_velocity_consistency_loss(
 
     mask = valid_pairs.unsqueeze(-1) & valid_points.unsqueeze(1)
     return (sq_error * mask.unsqueeze(-1)).sum() / (mask.sum() * 3).clamp_min(1)
+
+
+def _compute_momentum_loss(
+    velocity_pred: torch.Tensor,
+    velocity_gt: torch.Tensor,
+    c_mass: torch.Tensor,
+    point_obj_idx: torch.Tensor,
+    point_mask: torch.Tensor | None,
+    valid_frame_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Match total linear momentum per object after uniform per-point mass split."""
+    device = velocity_pred.device
+    total_loss = velocity_pred.new_tensor(0.0)
+    total_weight = velocity_pred.new_tensor(0.0)
+    B, T_raw, N, _ = velocity_pred.shape
+
+    for b in range(B):
+        valid_points = (
+            point_mask[b]
+            if point_mask is not None
+            else torch.ones(N, device=device, dtype=torch.bool)
+        )
+        valid_frames = (
+            valid_frame_mask[b]
+            if valid_frame_mask is not None
+            else torch.ones(T_raw, device=device, dtype=torch.bool)
+        )
+        frame_idx = valid_frames.nonzero(as_tuple=True)[0]
+        if frame_idx.numel() == 0:
+            continue
+
+        for obj_id in torch.unique(point_obj_idx[b][valid_points]).tolist():
+            point_idx = ((point_obj_idx[b] == obj_id) & valid_points).nonzero(as_tuple=True)[0]
+            n_obj_points = point_idx.numel()
+            if n_obj_points == 0:
+                continue
+
+            # Each object's scalar mass is distributed uniformly over its valid points.
+            point_mass = c_mass[b, obj_id].to(dtype=velocity_pred.dtype) / n_obj_points
+            pred_momentum = (velocity_pred[b, frame_idx][:, point_idx] * point_mass).sum(dim=1)
+            gt_momentum = (velocity_gt[b, frame_idx][:, point_idx] * point_mass).sum(dim=1)
+            total_loss = total_loss + (pred_momentum - gt_momentum).square().sum()
+            total_weight = total_weight + frame_idx.numel()
+
+    return total_loss / total_weight.clamp_min(1)
+
+
+def _compute_floor_penetration_loss(
+    pos_pred: torch.Tensor,
+    c_floor: torch.Tensor,
+    c_static: torch.Tensor,
+    point_obj_idx: torch.Tensor,
+    gravity_axis: str,
+    point_mask: torch.Tensor | None,
+    valid_frame_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Penalize non-static valid points below the configured floor plane."""
+    axis_idx = {"x": 0, "y": 1, "z": 2}[gravity_axis]
+    B, T_raw, N, _ = pos_pred.shape
+    if point_mask is None:
+        valid_points = torch.ones(B, N, device=pos_pred.device, dtype=torch.bool)
+    else:
+        valid_points = point_mask
+    if valid_frame_mask is None:
+        valid_frames = torch.ones(B, T_raw, device=pos_pred.device, dtype=torch.bool)
+    else:
+        valid_frames = valid_frame_mask
+
+    point_static = c_static.gather(1, point_obj_idx).bool()
+    active_points = valid_points & ~point_static
+    floor_height = c_floor.to(dtype=pos_pred.dtype).view(B, 1, 1)
+    penetration_sq = (floor_height - pos_pred[..., axis_idx]).relu().square()
+    mask = valid_frames.unsqueeze(-1) & active_points.unsqueeze(1)
+    return (penetration_sq * mask).sum() / mask.sum().clamp_min(1)
 
 
 def _compute_chamfer_loss(
@@ -555,16 +733,45 @@ def main():
         num_layers=args.sim_num_layers,
         use_temporal_correspondence=args.use_temporal_correspondence,
         use_temporal_rope=args.use_temporal_rope,
+        use_object_local_attention=args.use_object_local_attention,
+        use_spatial_knn_attention=args.use_spatial_knn_attention,
+        spatial_knn_k=args.spatial_knn_k,
     )
     logger.info(
         "Temporal structure: sinusoidal token positions=on, correspondence=%s, RoPE=%s, "
-        "lambda_local_dist=%g, lambda_vel=%g, lambda_chamfer=%g",
+        "object_local_attention=%s, spatial_knn_attention=%s(k=%s), "
+        "lambda_local_dist=%g, lambda_covariance=%g, lambda_vel=%g, lambda_chamfer=%g, "
+        "lambda_momentum=%g, lambda_floor=%g(axis=%s)",
         args.use_temporal_correspondence,
         args.use_temporal_rope,
+        args.use_object_local_attention,
+        args.use_spatial_knn_attention,
+        args.spatial_knn_k,
         args.lambda_local_dist,
+        args.lambda_covariance,
         args.lambda_vel,
         args.lambda_chamfer,
+        args.lambda_momentum,
+        args.lambda_floor,
+        args.gravity_axis,
     )
+
+    if args.init_from_model_dir:
+        transformer_path = os.path.join(args.init_from_model_dir, "sim_transformer.pt")
+        cond_embedder_path = os.path.join(args.init_from_model_dir, "sim_cond_embedder.pt")
+        for checkpoint_path in (transformer_path, cond_embedder_path):
+            if not os.path.isfile(checkpoint_path):
+                raise FileNotFoundError(
+                    f"Model-only initialization requires {checkpoint_path}"
+                )
+        sim_transformer.load_state_dict(torch.load(transformer_path, map_location="cpu"))
+        sim_cond_embedder.load_state_dict(torch.load(cond_embedder_path, map_location="cpu"))
+        logger.info(
+            "Initialized Stage 1 model weights from %s at optimizer step %s; "
+            "optimizer state will be reset.",
+            args.init_from_model_dir,
+            args.initial_global_step,
+        )
 
     # Move to device
     sim_cond_embedder.to(accelerator.device, dtype=weight_dtype)
@@ -652,11 +859,18 @@ def main():
     )
 
     # --- Scheduler ---
+    scheduler_last_epoch = -1
+    if args.init_from_model_dir and args.initial_global_step:
+        for param_group in optimizer.param_groups:
+            param_group.setdefault("initial_lr", param_group["lr"])
+        scheduler_last_epoch = args.initial_global_step - 1
+
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
         num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
         num_training_steps=args.max_train_steps * accelerator.num_processes,
+        last_epoch=scheduler_last_epoch,
     )
 
     # --- Noise scheduler ---
@@ -682,12 +896,14 @@ def main():
         logger.info(f"Loaded {len(vis_samples)} fixed vis samples (indices 0..{num_vis - 1}).")
 
     # --- Resume from checkpoint ---
-    global_step = 0
-    first_epoch = 0
+    global_step = args.initial_global_step
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps
+    )
     if args.resume_from_checkpoint:
         accelerator.load_state(args.resume_from_checkpoint)
         global_step = int(os.path.basename(args.resume_from_checkpoint).split("-")[1])
-        first_epoch = global_step // len(train_dataloader)
+    first_epoch = global_step // num_update_steps_per_epoch
 
     # --- Timestep sampling ---
     idx_sampling = DiscreteSampling(args.train_sampling_steps, uniform_sampling=args.uniform_sampling)
@@ -826,7 +1042,13 @@ def main():
                 with torch.amp.autocast("cuda", dtype=weight_dtype):
                     pred_enc = sim_transformer(
                         noisy_x_s_enc, init_enc_padded, init_mask, point_anchor, c_sim, timesteps,
-                        dtype=weight_dtype, valid_seq_mask=valid_seq_mask,
+                        dtype=weight_dtype,
+                        valid_seq_mask=valid_seq_mask,
+                        point_obj_idx=(
+                            point_obj_idx
+                            if args.use_object_local_attention or args.use_spatial_knn_attention
+                            else None
+                        ),
                     )  # (B, T, N, d_state) — predicted latent velocity
 
                 # --- Loss computation (latent space) ---
@@ -854,14 +1076,26 @@ def main():
                     diffusion_loss = (loss_per_elem * weighting.float()).sum() / n_valid.clamp(min=1)
 
                 local_dist_loss = x_s_raw.new_tensor(0.0)
+                covariance_loss = x_s_raw.new_tensor(0.0)
                 velocity_loss = x_s_raw.new_tensor(0.0)
                 chamfer_loss = x_s_raw.new_tensor(0.0)
+                momentum_loss = x_s_raw.new_tensor(0.0)
+                floor_loss = x_s_raw.new_tensor(0.0)
+                should_log_sim_metrics = (
+                    args.sim_metrics_steps > 0
+                    and accelerator.sync_gradients
+                    and (global_step + 1) % args.sim_metrics_steps == 0
+                )
                 use_raw_auxiliary_loss = any([
                     args.lambda_local_dist > 0.0,
+                    args.lambda_covariance > 0.0,
                     args.lambda_vel > 0.0,
                     args.lambda_chamfer > 0.0,
+                    args.lambda_momentum > 0.0,
+                    args.lambda_floor > 0.0,
                 ])
-                if use_raw_auxiliary_loss:
+                sim_metric_values = None
+                if use_raw_auxiliary_loss or should_log_sim_metrics:
                     pred_x0_enc = noise - pred_enc
                     pred_x0_enc[:, :1] = x_s_enc[:, :1]
                     pred_x0_raw = torch.cat([
@@ -877,6 +1111,8 @@ def main():
 
                     pos_pred = pred_x0_raw[..., :3].float()
                     pos_gt = x_s_raw[..., :3].float()
+                    velocity_pred = pred_x0_raw[..., 3:6].float()
+                    velocity_gt = x_s_raw[..., 3:6].float()
 
                     if args.lambda_vel > 0.0:
                         velocity_loss = _compute_velocity_consistency_loss(
@@ -894,6 +1130,14 @@ def main():
                             valid_frame_mask=valid_raw_frame_mask,
                             k=args.knn_k,
                         )
+                    if args.lambda_covariance > 0.0:
+                        covariance_loss = _compute_covariance_loss(
+                            pos_pred=pos_pred,
+                            pos_gt=pos_gt,
+                            point_obj_idx=point_obj_idx,
+                            point_mask=point_mask,
+                            valid_frame_mask=valid_raw_frame_mask,
+                        )
                     if args.lambda_chamfer > 0.0:
                         chamfer_loss = _compute_chamfer_loss(
                             pos_pred=pos_pred,
@@ -901,20 +1145,71 @@ def main():
                             point_mask=point_mask,
                             valid_frame_mask=valid_raw_frame_mask,
                         )
+                    if args.lambda_momentum > 0.0:
+                        momentum_loss = _compute_momentum_loss(
+                            velocity_pred=velocity_pred,
+                            velocity_gt=velocity_gt,
+                            c_mass=c_mass,
+                            point_obj_idx=point_obj_idx,
+                            point_mask=point_mask,
+                            valid_frame_mask=valid_raw_frame_mask,
+                        )
+                    if args.lambda_floor > 0.0:
+                        floor_loss = _compute_floor_penetration_loss(
+                            pos_pred=pos_pred,
+                            c_floor=c_floor,
+                            c_static=c_static,
+                            point_obj_idx=point_obj_idx,
+                            gravity_axis=args.gravity_axis,
+                            point_mask=point_mask,
+                            valid_frame_mask=valid_raw_frame_mask,
+                        )
+
+                    if should_log_sim_metrics:
+                        with torch.no_grad():
+                            sim_metric_values = {
+                                "diag/knn_edge_error": knn_edge_error(
+                                    pos_pred, pos_gt, point_obj_idx,
+                                    k=args.knn_k,
+                                    point_mask=point_mask,
+                                    valid_frame_mask=valid_raw_frame_mask,
+                                ),
+                                "diag/velocity_drift": velocity_drift(
+                                    pos_pred, pos_gt,
+                                    point_mask=point_mask,
+                                    valid_frame_mask=valid_raw_frame_mask,
+                                ),
+                                "diag/ae_reconstruction_chamfer": ae_reconstruction_chamfer(
+                                    ae, x_s_raw,
+                                    point_mask=point_mask,
+                                    valid_frame_mask=valid_raw_frame_mask,
+                                ),
+                            }
+                            sim_metric_values.update(frame0_error(
+                                pred_x0_raw[..., :3].float(),
+                                x_s_raw[:, :1, ..., :3].float(),
+                                point_mask=point_mask,
+                            ))
 
                 loss = (
                     diffusion_loss
                     + args.lambda_vel * velocity_loss
                     + args.lambda_local_dist * local_dist_loss
+                    + args.lambda_covariance * covariance_loss
                     + args.lambda_chamfer * chamfer_loss
+                    + args.lambda_momentum * momentum_loss
+                    + args.lambda_floor * floor_loss
                 )
 
                 # --- Backward ---
                 avg_loss = accelerator.gather(loss.repeat(bsz)).mean()
                 avg_diffusion_loss = accelerator.gather(diffusion_loss.repeat(bsz)).mean()
                 avg_local_dist_loss = accelerator.gather(local_dist_loss.repeat(bsz)).mean()
+                avg_covariance_loss = accelerator.gather(covariance_loss.repeat(bsz)).mean()
                 avg_velocity_loss = accelerator.gather(velocity_loss.repeat(bsz)).mean()
                 avg_chamfer_loss = accelerator.gather(chamfer_loss.repeat(bsz)).mean()
+                avg_momentum_loss = accelerator.gather(momentum_loss.repeat(bsz)).mean()
+                avg_floor_loss = accelerator.gather(floor_loss.repeat(bsz)).mean()
                 train_loss += avg_loss.item()
                 accum_count += 1
 
@@ -930,19 +1225,25 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
                 current_lr = lr_scheduler.get_last_lr()[0]
-                accelerator.log(
-                    {
+                log_values = {
                         "train_loss": train_loss / max(accum_count, 1),
                         "diffusion_loss": avg_diffusion_loss.item(),
                         "local_dist_loss": avg_local_dist_loss.item(),
+                        "covariance_loss": avg_covariance_loss.item(),
                         "velocity_loss": avg_velocity_loss.item(),
                         "chamfer_loss": avg_chamfer_loss.item(),
+                        "momentum_loss": avg_momentum_loss.item(),
+                        "floor_loss": avg_floor_loss.item(),
                         "lr": current_lr,
                         "epoch": epoch,
                         "global_step": global_step,
-                    },
-                    step=global_step,
-                )
+                }
+                if sim_metric_values is not None:
+                    log_values.update({
+                        name: accelerator.gather(value.detach().repeat(bsz)).mean().item()
+                        for name, value in sim_metric_values.items()
+                    })
+                accelerator.log(log_values, step=global_step)
                 train_loss = 0.0
                 accum_count = 0
 
@@ -992,8 +1293,12 @@ def main():
                                    os.path.join(save_dir, "sim_transformer.pt"))
                         torch.save(accelerator.unwrap_model(sim_cond_embedder).state_dict(),
                                    os.path.join(save_dir, "sim_cond_embedder.pt"))
+                    accelerator.wait_for_everyone()
+                    # Includes optimizer, scheduler, RNG, and prepared model state so
+                    # --resume_from_checkpoint can continue exactly at a later time.
+                    accelerator.save_state(save_dir)
+                    if accelerator.is_main_process:
                         logger.info(f"Saved checkpoint to {save_dir}")
-
                         gc.collect()
                         torch.cuda.empty_cache()
 
@@ -1001,8 +1306,11 @@ def main():
                 "step_loss": loss.detach().item(),
                 "diff_loss": diffusion_loss.detach().item(),
                 "local_dist": local_dist_loss.detach().item(),
+                "covariance": covariance_loss.detach().item(),
                 "velocity": velocity_loss.detach().item(),
                 "chamfer": chamfer_loss.detach().item(),
+                "momentum": momentum_loss.detach().item(),
+                "floor": floor_loss.detach().item(),
                 "lr": lr_scheduler.get_last_lr()[0],
             }
             progress_bar.set_postfix(**logs)

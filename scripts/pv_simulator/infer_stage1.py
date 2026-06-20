@@ -325,6 +325,7 @@ def main():
         T=T_latent,
         num_inference_steps=args.num_inference_steps,
         generator=generator,
+        x_s_target=sample['point_states'].unsqueeze(0),
     )
 
     # x_s_pred: (1, T_raw, N, 6) — take first (and only) batch item

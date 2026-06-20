@@ -46,47 +46,20 @@ def _apply_rope_1d(x: torch.Tensor, theta: float = 10000.0) -> torch.Tensor:
     return x_rope.to(x.dtype)
 
 
-def _build_spatial_knn_adjacency(
-    anchor_positions: torch.Tensor,
-    k: int,
-    point_obj_idx: Optional[torch.Tensor] = None,
-    point_valid_mask: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Return symmetric (B, N, N) anchor-frame KNN adjacency including self."""
-    B, N, _ = anchor_positions.shape
-    adjacency = torch.eye(N, device=anchor_positions.device, dtype=torch.bool).expand(B, -1, -1).clone()
-
-    for batch_idx in range(B):
-        valid_points = (
-            point_valid_mask[batch_idx]
-            if point_valid_mask is not None
-            else torch.ones(N, device=anchor_positions.device, dtype=torch.bool)
-        )
-        if point_obj_idx is None:
-            object_point_groups = [valid_points.nonzero(as_tuple=True)[0]]
-        else:
-            object_point_groups = [
-                ((point_obj_idx[batch_idx] == object_id) & valid_points).nonzero(as_tuple=True)[0]
-                for object_id in torch.unique(point_obj_idx[batch_idx][valid_points]).tolist()
-            ]
-
-        for point_idx in object_point_groups:
-            n_points = point_idx.numel()
-            if n_points < 2:
-                continue
-            pairwise = torch.cdist(
-                anchor_positions[batch_idx, point_idx].float(),
-                anchor_positions[batch_idx, point_idx].float(),
-            )
-            pairwise.fill_diagonal_(torch.inf)
-            k_eff = min(k, n_points - 1)
-            neighbors = pairwise.topk(k_eff, largest=False).indices
-            local_adjacency = torch.eye(n_points, device=anchor_positions.device, dtype=torch.bool)
-            local_adjacency.scatter_(1, neighbors, True)
-            local_adjacency = local_adjacency | local_adjacency.transpose(0, 1)
-            adjacency[batch_idx][point_idx[:, None], point_idx[None, :]] = local_adjacency
-
-    return adjacency
+def _spatial_sinusoidal_embedding(anchor_positions: torch.Tensor, dim: int) -> torch.Tensor:
+    """Encode anchor-frame XYZ positions as a ``(B, N, dim)`` sinusoid."""
+    num_frequencies = dim // 6
+    if num_frequencies == 0:
+        return anchor_positions.new_zeros(*anchor_positions.shape[:2], dim)
+    inv_freq = 1.0 / (
+        10000 ** (torch.arange(num_frequencies, device=anchor_positions.device, dtype=torch.float32)
+                   / num_frequencies)
+    )
+    angles = anchor_positions.float().unsqueeze(-1) * inv_freq
+    embedding = torch.cat([angles.sin(), angles.cos()], dim=-1).flatten(-2)
+    if embedding.shape[-1] < dim:
+        embedding = torch.nn.functional.pad(embedding, (0, dim - embedding.shape[-1]))
+    return embedding
 
 
 class SimSelfAttention(nn.Module):
@@ -161,35 +134,33 @@ class SimSelfAttention(nn.Module):
 
 
 class SimAttentionBlock(nn.Module):
-    """Simulation Transformer block: LayerNorm → Self-Attention → LayerNorm → FFN.
-
-    Uses 6-vector timestep modulation matching WanAttentionBlock's pattern:
-    e[0]=shift_sa, e[1]=scale_sa, e[2]=gate_sa_out,
-    e[3]=shift_ffn, e[4]=scale_ffn, e[5]=gate_ffn_out.
-
-    No cross-attention — text conditioning is only in the video branch.
-
-    Args:
-        dim: Hidden dimension.
-        ffn_dim: FFN intermediate dimension.
-        num_heads: Number of attention heads.
-        qk_norm: Whether to apply RMSNorm to Q/K.
-        eps: Epsilon for normalization.
-    """
+    """Global-attention ablation or factorized spatial-then-temporal DiT block."""
 
     def __init__(
         self,
         dim: int,
         ffn_dim: int,
         num_heads: int,
+        d_cond: int,
         qk_norm: bool = True,
         eps: float = 1e-6,
+        use_temporal_rope: bool = False,
+        rope_theta: float = 10000.0,
     ):
         super().__init__()
 
-        # Self-attention
+        # ``self_attn`` is spatial attention in factorized mode and flat global
+        # attention in the backward-compatible ablation.
         self.norm1 = WanLayerNorm(dim, eps)
         self.self_attn = SimSelfAttention(dim, num_heads, qk_norm, eps)
+        self.temporal_norm = WanLayerNorm(dim, eps)
+        self.temporal_attn = SimSelfAttention(
+            dim, num_heads, qk_norm, eps,
+            use_rope=use_temporal_rope,
+            rope_theta=rope_theta,
+        )
+        # Per-token physical conditioning modulates the spatial AdaLN path.
+        self.spatial_condition_modulation = nn.Linear(d_cond, 2 * dim)
 
         # FFN
         self.norm2 = WanLayerNorm(dim, eps)
@@ -202,30 +173,54 @@ class SimAttentionBlock(nn.Module):
         # 6-vector timestep modulation (matching WanAttentionBlock)
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim ** 0.5)
 
-    def forward(self, x, e, dtype=torch.bfloat16, attn_mask: Optional[torch.Tensor] = None):
-        """
-        Args:
-            x: (B, L, C) where L = T*N.
-            e: (B, 6, C) timestep modulation embedding.
-            attn_mask: Optional additive attention bias forwarded to self-attention.
-        Returns:
-            (B, L, C)
-        """
+    def forward_global(self, x, e, dtype=torch.bfloat16, attn_mask: Optional[torch.Tensor] = None):
+        """Original flattened global-attention path for ablations."""
         e = (self.modulation + e).chunk(6, dim=1)
-
-        # Self-attention with modulation
         h = self.norm1(x) * (1 + e[1]) + e[0]
         h = h.to(dtype)
         y = self.self_attn(h, dtype, attn_mask=attn_mask)
         x = x + y * e[2]
-
-        # FFN with modulation
         h = self.norm2(x) * (1 + e[4]) + e[3]
         h = h.to(dtype)
         y = self.ffn(h)
         x = x + y * e[5]
-
         return x
+
+    def forward(self, x, e, dtype=torch.bfloat16, attn_mask: Optional[torch.Tensor] = None):
+        """Compatibility entry point for callers that use flattened attention."""
+        return self.forward_global(x, e, dtype=dtype, attn_mask=attn_mask)
+
+    def forward_factorized(
+        self,
+        x: torch.Tensor,
+        e: torch.Tensor,
+        c_sim: torch.Tensor,
+        dtype: torch.dtype = torch.bfloat16,
+        spatial_attn_mask: Optional[torch.Tensor] = None,
+        temporal_attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Apply spatial attention over points, then temporal attention per point."""
+        B, T, N, C = x.shape
+        e = (self.modulation + e).chunk(6, dim=1)
+        cond_dtype = self.spatial_condition_modulation.weight.dtype
+        cond_shift, cond_scale = self.spatial_condition_modulation(c_sim.to(cond_dtype)).chunk(2, dim=-1)
+
+        # Spatial AdaLN: each frame attends over all of its points.
+        h = self.norm1(x) * (1 + e[1].unsqueeze(1) + cond_scale) + e[0].unsqueeze(1) + cond_shift
+        h = h.to(dtype).reshape(B * T, N, C)
+        y = self.self_attn(h, dtype, attn_mask=spatial_attn_mask)
+        x = x + y.view(B, T, N, C).to(x.dtype) * e[2].unsqueeze(1)
+
+        # Temporal AdaLN: each point attends to its own trajectory only.
+        h = self.temporal_norm(x) * (1 + e[1].unsqueeze(1)) + e[0].unsqueeze(1)
+        h = h.to(dtype).permute(0, 2, 1, 3).reshape(B * N, T, C)
+        y = self.temporal_attn(h, dtype, attn_mask=temporal_attn_mask)
+        y = y.view(B, N, T, C).permute(0, 2, 1, 3)
+        x = x + y.to(x.dtype) * e[2].unsqueeze(1)
+
+        h = self.norm2(x) * (1 + e[4].unsqueeze(1)) + e[3].unsqueeze(1)
+        y = self.ffn(h.to(self.ffn[0].weight.dtype)).to(x.dtype)
+        return x + y * e[5].unsqueeze(1)
 
 
 class SimTemporalCorrespondenceBlock(nn.Module):
@@ -323,11 +318,10 @@ class SimTransformer(nn.Module):
         ffn_dim: int = 1024,
         num_heads: int = 8,
         num_layers: int = 10,
+        use_factorized_attention: bool = True,
         use_temporal_correspondence: bool = False,
         use_temporal_rope: bool = False,
         use_object_local_attention: bool = False,
-        use_spatial_knn_attention: bool = False,
-        spatial_knn_k: int = 8,
         rope_theta: float = 10000.0,
         freq_dim: int = 256,
         qk_norm: bool = True,
@@ -339,13 +333,10 @@ class SimTransformer(nn.Module):
         self.d_anchor = d_anchor
         self.d_sim = d_sim
         self.num_layers = num_layers
+        self.use_factorized_attention = use_factorized_attention
         self.use_temporal_correspondence = use_temporal_correspondence
         self.use_temporal_rope = use_temporal_rope
         self.use_object_local_attention = use_object_local_attention
-        self.use_spatial_knn_attention = use_spatial_knn_attention
-        if spatial_knn_k < 1:
-            raise ValueError("spatial_knn_k must be >= 1")
-        self.spatial_knn_k = spatial_knn_k
         self.freq_dim = freq_dim
 
         # Input projection:
@@ -366,7 +357,11 @@ class SimTransformer(nn.Module):
 
         # Transformer blocks
         self.blocks = nn.ModuleList([
-            SimAttentionBlock(d_sim, ffn_dim, num_heads, qk_norm, eps)
+            SimAttentionBlock(
+                d_sim, ffn_dim, num_heads, d_cond, qk_norm, eps,
+                use_temporal_rope=use_temporal_rope,
+                rope_theta=rope_theta,
+            )
             for _ in range(num_layers)
         ])
         self.temporal_corr_block = (
@@ -379,7 +374,7 @@ class SimTransformer(nn.Module):
                 use_temporal_rope=use_temporal_rope,
                 rope_theta=rope_theta,
             )
-            if use_temporal_correspondence else None
+            if use_temporal_correspondence and not use_factorized_attention else None
         )
 
         # Output head
@@ -427,23 +422,21 @@ class SimTransformer(nn.Module):
         x = torch.cat([x_enc, init_enc, init_mask, point_anchor, c_sim], dim=-1)
         x = self.input_proj(x)                   # (B, T, N, d_sim)
 
-        # Give every token an explicit trajectory-time coordinate before global
-        # (T, N) attention.  The diffusion timestep embedding below is shared by
-        # every token and therefore cannot distinguish frame t from frame t + 1.
-        # This parameter-free encoding remains active when temporal RoPE is off.
+        # Explicit trajectory-time coordinates remain active when temporal RoPE is off.
         temporal_pos = sinusoidal_embedding_1d(
             self.d_sim,
             torch.arange(T, device=x.device),
         ).to(dtype=x.dtype)
         x = x + temporal_pos.view(1, T, 1, self.d_sim)
+        if point_anchor.shape[-1] >= 3:
+            spatial_pos = _spatial_sinusoidal_embedding(point_anchor[:, 0, :, :3], self.d_sim)
+            x = x + spatial_pos.to(dtype=x.dtype).unsqueeze(1)
 
         valid_token_mask = None
         if valid_seq_mask is not None:
             valid_token_mask = valid_seq_mask.view(B, T, N)
         if self.temporal_corr_block is not None:
             x = self.temporal_corr_block(x, dtype=dtype, valid_token_mask=valid_token_mask)
-
-        x = x.view(B, T * N, self.d_sim)         # (B, T*N, d_sim)
 
         # Timestep modulation (computed in fp32 for numerical stability, then cast back)
         with amp.autocast(dtype=torch.float32):
@@ -454,68 +447,60 @@ class SimTransformer(nn.Module):
             # e0: (B, 6, d_sim)
         e0 = e0.to(dtype)   # cast back so modulation arithmetic stays in model dtype
 
-        # Build additive attention bias for object-local, spatial-KNN, and padded attention.
-        attn_mask = None
-        L = T * N
-        allowed_pairs = None
+        if point_obj_idx is not None and point_obj_idx.shape != (B, N):
+            raise ValueError(
+                "point_obj_idx must have shape (B, N), got "
+                f"{tuple(point_obj_idx.shape)} for B={B}, N={N}."
+            )
 
-        if self.use_object_local_attention and point_obj_idx is not None:
-            if point_obj_idx.shape != (B, N):
-                raise ValueError(
-                    "point_obj_idx must have shape (B, N), got "
-                    f"{tuple(point_obj_idx.shape)} for B={B}, N={N}."
+        if self.use_factorized_attention:
+            # Spatial masks are applied independently to each frame.
+            spatial_attn_mask = None
+            if self.use_object_local_attention and point_obj_idx is not None:
+                same_object = point_obj_idx.to(x.device).unsqueeze(2) == point_obj_idx.to(x.device).unsqueeze(1)
+                spatial_attn_mask = torch.zeros(B * T, 1, N, N, device=x.device, dtype=dtype)
+                spatial_attn_mask.masked_fill_(
+                    ~same_object.unsqueeze(1).expand(-1, T, -1, -1).reshape(B * T, 1, N, N),
+                    torch.finfo(dtype).min,
                 )
+            if valid_token_mask is not None:
+                spatial_key_mask = valid_token_mask.reshape(B * T, 1, 1, N)
+                if spatial_attn_mask is None:
+                    spatial_attn_mask = torch.zeros(B * T, 1, 1, N, device=x.device, dtype=dtype)
+                spatial_attn_mask.masked_fill_(~spatial_key_mask, torch.finfo(dtype).min)
 
-            # Token order is (t0,p0..pN), (t1,p0..pN), ... after flattening.
-            # Repeating object IDs over T therefore permits all temporal pairs
-            # within an object while blocking every cross-object query/key pair.
-            token_obj_idx = point_obj_idx.to(device=x.device).unsqueeze(1).expand(-1, T, -1)
-            token_obj_idx = token_obj_idx.reshape(B, L)
-            allowed_pairs = token_obj_idx.unsqueeze(2) == token_obj_idx.unsqueeze(1)
+            # Temporal attention has one sequence per point identity.
+            temporal_attn_mask = None
+            if valid_token_mask is not None:
+                temporal_key_mask = valid_token_mask.permute(0, 2, 1).reshape(B * N, 1, 1, T)
+                temporal_attn_mask = torch.zeros(B * N, 1, 1, T, device=x.device, dtype=dtype)
+                temporal_attn_mask.masked_fill_(~temporal_key_mask, torch.finfo(dtype).min)
 
-        if self.use_spatial_knn_attention:
-            if point_anchor.shape[-1] < 3:
-                raise ValueError(
-                    "Spatial KNN attention requires point_anchor with at least three coordinate channels."
+            for block in self.blocks:
+                x = block.forward_factorized(
+                    x, e0, c_sim, dtype,
+                    spatial_attn_mask=spatial_attn_mask,
+                    temporal_attn_mask=temporal_attn_mask,
                 )
-            if point_obj_idx is not None and point_obj_idx.shape != (B, N):
-                raise ValueError(
-                    "point_obj_idx must have shape (B, N), got "
-                    f"{tuple(point_obj_idx.shape)} for B={B}, N={N}."
-                )
-
-            point_valid_mask = None
+        else:
+            # Original flattened global-attention ablation.
+            x = x.view(B, T * N, self.d_sim)
+            attn_mask = None
+            if self.use_object_local_attention and point_obj_idx is not None:
+                L = T * N
+                token_obj_idx = point_obj_idx.to(x.device).unsqueeze(1).expand(-1, T, -1).reshape(B, L)
+                same_object = token_obj_idx.unsqueeze(2) == token_obj_idx.unsqueeze(1)
+                attn_mask = torch.zeros(B, 1, L, L, device=x.device, dtype=dtype)
+                attn_mask.masked_fill_(~same_object.unsqueeze(1), torch.finfo(dtype).min)
             if valid_seq_mask is not None:
-                point_valid_mask = valid_seq_mask.view(B, T, N).any(dim=1)
-            # The anchor is repeated over time; frame 0 is the static KNN graph.
-            spatial_adjacency = _build_spatial_knn_adjacency(
-                point_anchor[:, 0, :, :3],
-                self.spatial_knn_k,
-                point_obj_idx=point_obj_idx,
-                point_valid_mask=point_valid_mask,
-            )
-            spatial_pairs = spatial_adjacency[:, None, :, None, :]
-            spatial_pairs = spatial_pairs.expand(B, T, N, T, N).reshape(B, L, L)
-            allowed_pairs = spatial_pairs if allowed_pairs is None else (allowed_pairs & spatial_pairs)
-
-        if allowed_pairs is not None:
-            attn_mask = torch.zeros(B, 1, L, L, device=x.device, dtype=dtype)
-            attn_mask.masked_fill_(~allowed_pairs.unsqueeze(1), torch.finfo(dtype).min)
-
-        if valid_seq_mask is not None:
-            if attn_mask is None:
-                attn_mask = torch.zeros(B, 1, 1, L, device=x.device, dtype=dtype)
-            # Mask padded keys without disturbing locality query/key biases.
-            attn_mask.masked_fill_(
-                ~valid_seq_mask.view(B, 1, 1, L),
-                torch.finfo(dtype).min,
-            )
-
-        # Transformer blocks
-        for block in self.blocks:
-            x = block(x, e0, dtype, attn_mask=attn_mask)
+                L = T * N
+                if attn_mask is None:
+                    attn_mask = torch.zeros(B, 1, 1, L, device=x.device, dtype=dtype)
+                attn_mask.masked_fill_(~valid_seq_mask.view(B, 1, 1, L), torch.finfo(dtype).min)
+            for block in self.blocks:
+                x = block.forward_global(x, e0, dtype, attn_mask=attn_mask)
+            x = x.view(B, T, N, self.d_sim)
 
         # Output head
-        x = x.view(B, T, N, self.d_sim)
         x = self.head_proj(self.head_norm(x.to(self.head_proj.weight.dtype)))  # (B, T, N, d_state)
         return x

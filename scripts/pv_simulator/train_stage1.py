@@ -173,6 +173,8 @@ def parse_args():
     parser.add_argument("--mode_scale", type=float, default=1.29)
 
     # Shape-preserving inductive bias
+    parser.add_argument("--lambda_diffusion", type=float, default=1.0,
+                        help="Weight for latent-space flow-matching diffusion loss.")
     parser.add_argument("--lambda_local_dist", type=float, default=1e-3,
                         help="Weight for frame-0-relative local KNN edge deformation loss.")
     parser.add_argument("--lambda_covariance", type=float, default=0.0,
@@ -185,6 +187,9 @@ def parse_args():
                         help="Weight for per-object raw linear momentum consistency loss.")
     parser.add_argument("--lambda_floor", type=float, default=0.1,
                         help="Weight for non-static point floor-penetration loss.")
+    parser.add_argument("--debug_raw_loss_gradients", action="store_true",
+                        help="Assert that local-distance raw-loss gradients reach SimTransformer. "
+                             "Use only for short gradient-path checks.")
     parser.add_argument("--gravity_axis", type=str, default="z", choices=["x", "y", "z"],
                         help="Coordinate axis normal to the floor for penetration loss.")
     parser.add_argument("--knn_k", type=int, default=8,
@@ -213,10 +218,10 @@ def parse_args():
                             "Enabled by default; disable with --no-use-temporal-rope.")
     parser.add_argument("--use_object_local_attention", action="store_true",
                         help="Restrict flat self-attention to tokens from the same object.")
-    parser.add_argument("--use_spatial_knn_attention", action="store_true",
-                        help="Restrict flat self-attention to static anchor-frame KNN neighbors.")
-    parser.add_argument("--spatial_knn_k", type=int, default=8,
-                        help="Number of anchor-frame KNN neighbors for spatial attention.")
+    parser.add_argument("--use_factorized_attention", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Use spatial-then-temporal attention in every SimTransformer block. "
+                             "Disable with --no-use-factorized-attention for global-attention ablations.")
 
     # Checkpointing & logging
     parser.add_argument("--checkpointing_steps", type=int, default=5000)
@@ -253,10 +258,6 @@ def parse_args():
         parser.error("--overfit_repeat_length must be >= 1")
     if args.knn_k < 1:
         parser.error("--knn_k must be >= 1")
-    if args.spatial_knn_k < 1:
-        parser.error("--spatial_knn_k must be >= 1")
-    if args.use_spatial_knn_attention and args.disable_point_anchor:
-        parser.error("--use_spatial_knn_attention requires point anchors; omit --disable_point_anchor")
     if args.sim_metrics_steps < 0:
         parser.error("--sim_metrics_steps must be >= 0")
     if args.initial_global_step < 0:
@@ -266,7 +267,7 @@ def parse_args():
     if args.initial_global_step and not args.init_from_model_dir:
         parser.error("--initial_global_step requires --init_from_model_dir")
     for name in (
-        "lambda_vel", "lambda_local_dist", "lambda_covariance", "lambda_chamfer",
+        "lambda_diffusion", "lambda_vel", "lambda_local_dist", "lambda_covariance", "lambda_chamfer",
         "lambda_momentum", "lambda_floor",
     ):
         if getattr(args, name) < 0:
@@ -731,22 +732,21 @@ def main():
         ffn_dim=args.sim_ffn_dim,
         num_heads=args.sim_num_heads,
         num_layers=args.sim_num_layers,
+        use_factorized_attention=args.use_factorized_attention,
         use_temporal_correspondence=args.use_temporal_correspondence,
         use_temporal_rope=args.use_temporal_rope,
         use_object_local_attention=args.use_object_local_attention,
-        use_spatial_knn_attention=args.use_spatial_knn_attention,
-        spatial_knn_k=args.spatial_knn_k,
     )
     logger.info(
         "Temporal structure: sinusoidal token positions=on, correspondence=%s, RoPE=%s, "
-        "object_local_attention=%s, spatial_knn_attention=%s(k=%s), "
-        "lambda_local_dist=%g, lambda_covariance=%g, lambda_vel=%g, lambda_chamfer=%g, "
+        "factorized_attention=%s, object_local_attention=%s, "
+        "lambda_diffusion=%g, lambda_local_dist=%g, lambda_covariance=%g, lambda_vel=%g, lambda_chamfer=%g, "
         "lambda_momentum=%g, lambda_floor=%g(axis=%s)",
         args.use_temporal_correspondence,
         args.use_temporal_rope,
+        args.use_factorized_attention,
         args.use_object_local_attention,
-        args.use_spatial_knn_attention,
-        args.spatial_knn_k,
+        args.lambda_diffusion,
         args.lambda_local_dist,
         args.lambda_covariance,
         args.lambda_vel,
@@ -1046,7 +1046,7 @@ def main():
                         valid_seq_mask=valid_seq_mask,
                         point_obj_idx=(
                             point_obj_idx
-                            if args.use_object_local_attention or args.use_spatial_knn_attention
+                            if args.use_object_local_attention
                             else None
                         ),
                     )  # (B, T, N, d_state) — predicted latent velocity
@@ -1098,6 +1098,10 @@ def main():
                 if use_raw_auxiliary_loss or should_log_sim_metrics:
                     pred_x0_enc = noise - pred_enc
                     pred_x0_enc[:, :1] = x_s_enc[:, :1]
+                    if args.debug_raw_loss_gradients and args.lambda_local_dist > 0.0:
+                        assert pred_x0_enc.requires_grad and pred_x0_enc.grad_fn is not None, (
+                            "pred_x0_enc is detached before the raw-space auxiliary losses"
+                        )
                     pred_x0_raw = torch.cat([
                         ae.decode(pred_x0_enc[..., :d_latent], T_raw_dim),
                         ae.decode(pred_x0_enc[..., d_latent:], T_raw_dim),
@@ -1130,6 +1134,10 @@ def main():
                             valid_frame_mask=valid_raw_frame_mask,
                             k=args.knn_k,
                         )
+                        if args.debug_raw_loss_gradients:
+                            assert local_dist_loss.requires_grad and local_dist_loss.grad_fn is not None, (
+                                "local_dist_loss is detached from the decoded prediction"
+                            )
                     if args.lambda_covariance > 0.0:
                         covariance_loss = _compute_covariance_loss(
                             pos_pred=pos_pred,
@@ -1192,7 +1200,7 @@ def main():
                             ))
 
                 loss = (
-                    diffusion_loss
+                    args.lambda_diffusion * diffusion_loss
                     + args.lambda_vel * velocity_loss
                     + args.lambda_local_dist * local_dist_loss
                     + args.lambda_covariance * covariance_loss
@@ -1214,6 +1222,15 @@ def main():
                 accum_count += 1
 
                 accelerator.backward(loss)
+                if args.debug_raw_loss_gradients and args.lambda_local_dist > 0.0:
+                    local_grad_reaches_transformer = any(
+                        parameter.grad is not None and torch.any(parameter.grad != 0).item()
+                        for parameter in sim_transformer.parameters()
+                        if parameter.requires_grad
+                    )
+                    assert local_grad_reaches_transformer, (
+                        "No nonzero SimTransformer gradient after backward; raw local loss is disconnected"
+                    )
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(trainable_params, args.max_grad_norm)
                 optimizer.step()
@@ -1228,12 +1245,19 @@ def main():
                 log_values = {
                         "train_loss": train_loss / max(accum_count, 1),
                         "diffusion_loss": avg_diffusion_loss.item(),
+                        "weighted_diffusion_loss": args.lambda_diffusion * avg_diffusion_loss.item(),
                         "local_dist_loss": avg_local_dist_loss.item(),
                         "covariance_loss": avg_covariance_loss.item(),
                         "velocity_loss": avg_velocity_loss.item(),
                         "chamfer_loss": avg_chamfer_loss.item(),
                         "momentum_loss": avg_momentum_loss.item(),
                         "floor_loss": avg_floor_loss.item(),
+                        "weighted_local_dist_loss": args.lambda_local_dist * avg_local_dist_loss.item(),
+                        "weighted_covariance_loss": args.lambda_covariance * avg_covariance_loss.item(),
+                        "weighted_velocity_loss": args.lambda_vel * avg_velocity_loss.item(),
+                        "weighted_chamfer_loss": args.lambda_chamfer * avg_chamfer_loss.item(),
+                        "weighted_momentum_loss": args.lambda_momentum * avg_momentum_loss.item(),
+                        "weighted_floor_loss": args.lambda_floor * avg_floor_loss.item(),
                         "lr": current_lr,
                         "epoch": epoch,
                         "global_step": global_step,

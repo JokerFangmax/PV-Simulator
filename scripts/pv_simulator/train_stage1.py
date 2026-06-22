@@ -3,9 +3,10 @@
 Trains the SimTransformer + SimConditionEmbedder on physics trajectory data
 using LDM-style flow matching diffusion in the frozen CausalAE's latent
 space (pre-trained in Stage 0). Raw states are encoded once to x_s_enc;
-noise, target (noise - x_s_enc), DiT prediction, and loss are all in
-latent space. The AE decoder is not used during training — gradients are
-completely independent of the AE.
+noise and the flow target (noise - x_s_enc) remain latent. By default the
+loss is latent MSE; --use_raw_point_mse_target instead decodes the predicted
+and target x0 point clouds through the frozen AE and uses correspondence-aware
+raw-space per-point L2 loss.
 
 No video branch is loaded. No Joint Attention is used.
 
@@ -175,6 +176,9 @@ def parse_args():
     # Shape-preserving inductive bias
     parser.add_argument("--lambda_diffusion", type=float, default=1.0,
                         help="Weight for latent-space flow-matching diffusion loss.")
+    parser.add_argument("--use_raw_point_mse_target", action="store_true",
+                        help="Replace latent flow-matching MSE with correspondence-aware per-point "
+                             "L2 loss between AE-decoded predicted and target x0 positions.")
     parser.add_argument("--lambda_local_dist", type=float, default=1e-3,
                         help="Weight for frame-0-relative local KNN edge deformation loss.")
     parser.add_argument("--lambda_covariance", type=float, default=0.0,
@@ -632,12 +636,25 @@ def _compute_chamfer_loss(
     point_mask: torch.Tensor | None,
     valid_frame_mask: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Symmetric squared Chamfer distance for each valid raw point-cloud frame."""
+    """Mean symmetric squared Chamfer distance over valid raw point-cloud frames."""
+    return _compute_chamfer_loss_per_sample(
+        pos_pred, pos_gt, point_mask, valid_frame_mask,
+    ).mean()
+
+
+def _compute_chamfer_loss_per_sample(
+    pos_pred: torch.Tensor,
+    pos_gt: torch.Tensor,
+    point_mask: torch.Tensor | None,
+    valid_frame_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Symmetric squared Chamfer distance per sample, averaged over valid frames."""
     B, T_raw, N, _ = pos_gt.shape
-    total_loss = pos_gt.new_tensor(0.0)
-    total_weight = pos_gt.new_tensor(0.0)
+    per_sample_losses = []
 
     for b in range(B):
+        total_loss = pos_gt.new_tensor(0.0)
+        total_weight = pos_gt.new_tensor(0.0)
         if point_mask is None:
             valid_points = torch.ones(N, device=pos_gt.device, dtype=torch.bool)
         else:
@@ -660,9 +677,13 @@ def _compute_chamfer_loss(
             total_loss = total_loss + frame_loss
             total_weight = total_weight + 1
 
-    if total_weight.item() == 0:
-        return pos_gt.new_tensor(0.0)
-    return total_loss / total_weight
+        if total_weight.item() == 0:
+            # Preserve a valid zero-gradient path for empty padded samples.
+            per_sample_losses.append(pos_pred[b].sum() * 0.0)
+        else:
+            per_sample_losses.append(total_loss / total_weight)
+
+    return torch.stack(per_sample_losses)
 
 
 def main():
@@ -740,12 +761,13 @@ def main():
     logger.info(
         "Temporal structure: sinusoidal token positions=on, correspondence=%s, RoPE=%s, "
         "factorized_attention=%s, object_local_attention=%s, "
-        "lambda_diffusion=%g, lambda_local_dist=%g, lambda_covariance=%g, lambda_vel=%g, lambda_chamfer=%g, "
+        "raw_point_mse_target=%s, lambda_diffusion=%g, lambda_local_dist=%g, lambda_covariance=%g, lambda_vel=%g, lambda_chamfer=%g, "
         "lambda_momentum=%g, lambda_floor=%g(axis=%s)",
         args.use_temporal_correspondence,
         args.use_temporal_rope,
         args.use_factorized_attention,
         args.use_object_local_attention,
+        args.use_raw_point_mse_target,
         args.lambda_diffusion,
         args.lambda_local_dist,
         args.lambda_covariance,
@@ -1038,7 +1060,6 @@ def main():
                 )  # (B, T, N, d_cond)
 
                 # --- Forward pass: DiT in latent space (LDM-style) ---
-                # AE is fully detached — no decode needed during training.
                 with torch.amp.autocast("cuda", dtype=weight_dtype):
                     pred_enc = sim_transformer(
                         noisy_x_s_enc, init_enc_padded, init_mask, point_anchor, c_sim, timesteps,
@@ -1051,7 +1072,7 @@ def main():
                         ),
                     )  # (B, T, N, d_state) — predicted latent velocity
 
-                # --- Loss computation (latent space) ---
+                # --- Default flow-matching loss (latent space) ---
                 weighting = compute_loss_weighting_for_sd3(
                     weighting_scheme=args.weighting_scheme, sigmas=sigma,
                 )
@@ -1067,13 +1088,17 @@ def main():
                     latent_mask[:, :1] = False
                     loss_per_elem = loss_per_elem * latent_mask.unsqueeze(-1).float()
                     n_valid = latent_mask.float().sum() * args.d_state
-                    diffusion_loss = (loss_per_elem * weighting.float()).sum() / n_valid.clamp(min=1)
+                    latent_diffusion_loss = (loss_per_elem * weighting.float()).sum() / n_valid.clamp(min=1)
                 else:
                     latent_mask = torch.ones(B_sz, T, N_sz, device=accelerator.device, dtype=torch.bool)
                     latent_mask[:, :1] = False
                     loss_per_elem = loss_per_elem * latent_mask.unsqueeze(-1).float()
                     n_valid = latent_mask.float().sum() * args.d_state
-                    diffusion_loss = (loss_per_elem * weighting.float()).sum() / n_valid.clamp(min=1)
+                    latent_diffusion_loss = (loss_per_elem * weighting.float()).sum() / n_valid.clamp(min=1)
+
+                # Selected below when --use_raw_point_mse_target is enabled.
+                diffusion_loss = latent_diffusion_loss
+                raw_point_mse_target_loss = x_s_raw.new_tensor(0.0)
 
                 local_dist_loss = x_s_raw.new_tensor(0.0)
                 covariance_loss = x_s_raw.new_tensor(0.0)
@@ -1087,6 +1112,7 @@ def main():
                     and (global_step + 1) % args.sim_metrics_steps == 0
                 )
                 use_raw_auxiliary_loss = any([
+                    args.use_raw_point_mse_target,
                     args.lambda_local_dist > 0.0,
                     args.lambda_covariance > 0.0,
                     args.lambda_vel > 0.0,
@@ -1102,21 +1128,57 @@ def main():
                         assert pred_x0_enc.requires_grad and pred_x0_enc.grad_fn is not None, (
                             "pred_x0_enc is detached before the raw-space auxiliary losses"
                         )
-                    pred_x0_raw = torch.cat([
-                        ae.decode(pred_x0_enc[..., :d_latent], T_raw_dim),
-                        ae.decode(pred_x0_enc[..., d_latent:], T_raw_dim),
-                    ], dim=-1)
-
                     if args.padded_batch:
                         raw_t_idx = torch.arange(T_raw_dim, device=accelerator.device).unsqueeze(0)
                         valid_raw_frame_mask = raw_t_idx < T_raw_tensor.unsqueeze(1)
                     else:
                         valid_raw_frame_mask = None
 
-                    pos_pred = pred_x0_raw[..., :3].float()
+                    # The raw point-MSE target preserves the simulator's exact point
+                    # correspondence. Both sides are decoded x0 representations:
+                    # pred_x0_enc is obtained from the predicted velocity, while
+                    # x_s_enc == noise - target.
+                    pred_x0_pos_raw = None
+                    if args.use_raw_point_mse_target:
+                        pred_x0_pos_raw = ae.decode(pred_x0_enc[..., :d_latent], T_raw_dim)
+                        target_x0_pos_raw = ae.decode(x_s_enc[..., :d_latent], T_raw_dim)
+                        point_mse = (pred_x0_pos_raw.float() - target_x0_pos_raw.float()).square().sum(dim=-1)
+                        if point_mask is None:
+                            raw_point_mask = torch.ones(
+                                B_sz, T_raw_dim, N_sz,
+                                device=accelerator.device, dtype=torch.bool,
+                            )
+                        else:
+                            raw_point_mask = point_mask.unsqueeze(1).expand(
+                                -1, T_raw_dim, -1
+                            ).clone()
+                        if valid_raw_frame_mask is not None:
+                            raw_point_mask = raw_point_mask & valid_raw_frame_mask.unsqueeze(-1)
+                        # Frame 0 is explicitly conditioned and has no trainable prediction.
+                        raw_point_mask[:, :1] = False
+                        raw_point_mse_per_sample = (
+                            (point_mse * raw_point_mask).sum(dim=(1, 2))
+                            / raw_point_mask.sum(dim=(1, 2)).clamp_min(1)
+                        )
+                        sample_weighting = weighting.float().reshape(B_sz, -1)[:, 0]
+                        raw_point_mse_target_loss = (
+                            raw_point_mse_per_sample * sample_weighting
+                        ).mean()
+                        diffusion_loss = raw_point_mse_target_loss
+
+                    # Reuse the position decode above when the raw point-MSE target
+                    # already produced it. Decode velocities only for momentum.
+                    if pred_x0_pos_raw is None:
+                        pred_x0_pos_raw = ae.decode(pred_x0_enc[..., :d_latent], T_raw_dim)
+                    pos_pred = pred_x0_pos_raw.float()
                     pos_gt = x_s_raw[..., :3].float()
-                    velocity_pred = pred_x0_raw[..., 3:6].float()
-                    velocity_gt = x_s_raw[..., 3:6].float()
+                    velocity_pred = None
+                    velocity_gt = None
+                    if args.lambda_momentum > 0.0:
+                        velocity_pred = ae.decode(
+                            pred_x0_enc[..., d_latent:], T_raw_dim,
+                        ).float()
+                        velocity_gt = x_s_raw[..., 3:6].float()
 
                     if args.lambda_vel > 0.0:
                         velocity_loss = _compute_velocity_consistency_loss(
@@ -1194,7 +1256,7 @@ def main():
                                 ),
                             }
                             sim_metric_values.update(frame0_error(
-                                pred_x0_raw[..., :3].float(),
+                                pos_pred,
                                 x_s_raw[:, :1, ..., :3].float(),
                                 point_mask=point_mask,
                             ))
@@ -1212,6 +1274,12 @@ def main():
                 # --- Backward ---
                 avg_loss = accelerator.gather(loss.repeat(bsz)).mean()
                 avg_diffusion_loss = accelerator.gather(diffusion_loss.repeat(bsz)).mean()
+                avg_latent_diffusion_loss = accelerator.gather(
+                    latent_diffusion_loss.repeat(bsz)
+                ).mean()
+                avg_raw_point_mse_target_loss = accelerator.gather(
+                    raw_point_mse_target_loss.repeat(bsz)
+                ).mean()
                 avg_local_dist_loss = accelerator.gather(local_dist_loss.repeat(bsz)).mean()
                 avg_covariance_loss = accelerator.gather(covariance_loss.repeat(bsz)).mean()
                 avg_velocity_loss = accelerator.gather(velocity_loss.repeat(bsz)).mean()
@@ -1245,6 +1313,8 @@ def main():
                 log_values = {
                         "train_loss": train_loss / max(accum_count, 1),
                         "diffusion_loss": avg_diffusion_loss.item(),
+                        "latent_diffusion_loss": avg_latent_diffusion_loss.item(),
+                        "raw_point_mse_target_loss": avg_raw_point_mse_target_loss.item(),
                         "weighted_diffusion_loss": args.lambda_diffusion * avg_diffusion_loss.item(),
                         "local_dist_loss": avg_local_dist_loss.item(),
                         "covariance_loss": avg_covariance_loss.item(),

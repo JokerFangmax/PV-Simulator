@@ -233,8 +233,12 @@ class MoviSimulationDataset(Dataset):
                 return candidate
         return None
 
-    def _build_sample_from_movi_parts(self, point_states, instances, meta_instances, sample_name):
+    def _build_sample_from_movi_parts(
+        self, point_states, instances, meta_instances, sample_name, physics=None,
+    ):
         """Convert MOVI point-cloud + metadata parts into the Stage 1 sample dict."""
+        physics = {} if physics is None else physics
+        point_states = physics.get('x_s_raw', point_states)
         point_states = point_states.astype(np.float32)  # (T_avail, N, 6)
         T_avail = point_states.shape[0]
 
@@ -250,11 +254,20 @@ class MoviSimulationDataset(Dataset):
         if n_objects > self.max_objects:
             raise ValueError(f"Too many objects ({n_objects}) in {sample_name}")
 
-        # point_obj_idx: (N,) — assign each point to its object index
-        point_obj_idx = np.zeros(N, dtype=np.int64)
-        for obj_i, inst in enumerate(instances):
-            start, end = inst['point_range']
-            point_obj_idx[start:end] = obj_i
+        # point_obj_idx: (N,) — use generator-side mapping when available.
+        point_obj_idx = physics.get('point_obj_idx')
+        if point_obj_idx is None:
+            point_obj_idx = np.zeros(N, dtype=np.int64)
+            for obj_i, inst in enumerate(instances):
+                start, end = inst['point_range']
+                point_obj_idx[start:end] = obj_i
+        else:
+            point_obj_idx = np.asarray(point_obj_idx, dtype=np.int64)
+            if point_obj_idx.shape != (N,):
+                raise ValueError(
+                    f"Invalid point_obj_idx shape {point_obj_idx.shape} in {sample_name}; "
+                    f"expected {(N,)}"
+                )
 
         assert len(meta_instances) == n_objects, \
             f"Instance count mismatch: pkl={n_objects}, meta={len(meta_instances)}"
@@ -276,14 +289,42 @@ class MoviSimulationDataset(Dataset):
         c_init_mask = np.ones((n_objects, 1), dtype=np.float32)
         c_init = np.concatenate([c_init_state, c_init_mask], axis=-1)
 
+        c_force_raw = physics.get('c_force_raw')
+        if c_force_raw is None:
+            c_force_raw = np.zeros((T_raw, N, 6), dtype=np.float32)
+        else:
+            c_force_raw = np.asarray(c_force_raw, dtype=np.float32)[:T_raw]
+            if c_force_raw.shape != (T_raw, N, 6):
+                raise ValueError(
+                    f"Invalid c_force_raw shape {c_force_raw.shape} in {sample_name}; "
+                    f"expected {(T_raw, N, 6)}"
+                )
+
+        if 'c_mat' in physics:
+            c_mat = np.asarray(physics['c_mat'], dtype=np.float32)
+        if 'c_mass' in physics:
+            c_mass = np.asarray(physics['c_mass'], dtype=np.float32)
+        if 'c_static' in physics:
+            c_static = np.asarray(physics['c_static'], dtype=np.int64)
+        else:
+            c_static = np.zeros(n_objects, dtype=np.int64)
+        if 'c_init' in physics:
+            c_init = np.asarray(physics['c_init'], dtype=np.float32)
+
+        if c_mat.shape != (n_objects, 2) or c_mass.shape != (n_objects,):
+            raise ValueError(f"Invalid object physics shapes in {sample_name}")
+        if c_static.shape != (n_objects,) or c_init.shape != (n_objects, 7):
+            raise ValueError(f"Invalid static/init physics shapes in {sample_name}")
+        c_floor = float(np.asarray(physics.get('c_floor', 0.0)))
+
         return {
             'x_s_raw': torch.from_numpy(point_states),             # (T_raw, N, 6)
-            'c_force_raw': torch.zeros(T_raw, N, 6),               # (T_raw, N, 6)
-            'c_floor': torch.tensor(0.0),                           # scalar
+            'c_force_raw': torch.from_numpy(c_force_raw),           # (T_raw, N, 6)
+            'c_floor': torch.tensor(c_floor),                       # scalar
             'c_id': torch.arange(n_objects, dtype=torch.long),     # (n_objects,)
             'c_mat': torch.from_numpy(c_mat),                       # (n_objects, 2)
             'c_mass': torch.from_numpy(c_mass),                     # (n_objects,)
-            'c_static': torch.zeros(n_objects, dtype=torch.long),  # (n_objects,)
+            'c_static': torch.from_numpy(c_static),                 # (n_objects,)
             'c_init': torch.from_numpy(c_init),                     # (n_objects, 7)
             'point_obj_idx': torch.from_numpy(point_obj_idx),       # (N,)
             'T_raw': T_raw,                                          # int
@@ -323,12 +364,22 @@ class MoviSimulationDataset(Dataset):
                 pkl = pickle.load(f)
             with inner_tf.extractfile("metadata.json") as f:
                 meta = json.load(f)
+            physics = None
+            try:
+                physics_member = inner_tf.getmember("physics.npz")
+            except KeyError:
+                physics_member = None
+            if physics_member is not None:
+                with inner_tf.extractfile(physics_member) as f:
+                    with np.load(io.BytesIO(f.read())) as physics_npz:
+                        physics = {key: physics_npz[key] for key in physics_npz.files}
 
         return self._build_sample_from_movi_parts(
             point_states=pkl["point_states"],
             instances=pkl["instances"],
             meta_instances=meta["instances"],
             sample_name=f"{os.path.basename(shard_path)}:{sample_id}",
+            physics=physics,
         )
 
     def __getitem__(self, idx):
@@ -345,12 +396,18 @@ class MoviSimulationDataset(Dataset):
                     pkl = pickle.load(f)
                 with open(meta_path, 'r') as f:
                     meta = json.load(f)
+                physics_path = os.path.join(sample_dir, 'physics.npz')
+                physics = None
+                if os.path.exists(physics_path):
+                    with np.load(physics_path) as physics_npz:
+                        physics = {key: physics_npz[key] for key in physics_npz.files}
 
                 return self._build_sample_from_movi_parts(
                     point_states=pkl["point_states"],
                     instances=pkl["instances"],
                     meta_instances=meta["instances"],
                     sample_name=sample_dir,
+                    physics=physics,
                 )
 
             except Exception as e:

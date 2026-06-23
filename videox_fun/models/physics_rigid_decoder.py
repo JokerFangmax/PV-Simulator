@@ -69,7 +69,7 @@ class PhysicsConditionedRigidResidualDecoder(nn.Module):
         target: torch.Tensor,
         point_obj_idx: torch.Tensor,
         point_mask: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """Fit per-object masked SE(3) transforms from source to target.
 
         R uses a column-vector convention: target = R @ source + t.
@@ -81,6 +81,11 @@ class PhysicsConditionedRigidResidualDecoder(nn.Module):
             B, T, self.num_objects, -1, -1,
         ).clone()
         t = target.new_zeros(B, T, self.num_objects, 3)
+        svd_condition_number = target.new_full(
+            (B, T, self.num_objects), float("nan"),
+        )
+        fallback_count = target.new_zeros(B, T, self.num_objects)
+        centroid_error = target.new_zeros(B, T, self.num_objects)
 
         for b in range(B):
             valid_points = (
@@ -100,10 +105,15 @@ class PhysicsConditionedRigidResidualDecoder(nn.Module):
 
                 source_mean = source_obj.mean(dim=0)        # (3,)
                 target_mean = target_obj.mean(dim=1)        # (T, 3)
+                centroid_error[b, :, object_id] = torch.linalg.vector_norm(
+                    target_mean - source_mean,
+                    dim=-1,
+                )
 
                 # Default and degenerate fallback: identity rotation plus
                 # centroid translation.
                 t[b, :, object_id] = target_mean - source_mean
+                fallback_count[b, :, object_id] = 1.0
                 if num_points < 3:
                     continue
 
@@ -118,6 +128,10 @@ class PhysicsConditionedRigidResidualDecoder(nn.Module):
                 U, singular_values, Vh = torch.linalg.svd(
                     covariance,
                     full_matrices=False,
+                )
+                svd_condition_number[b, :, object_id] = (
+                    singular_values[:, 0]
+                    / singular_values[:, -1].clamp_min(1e-12)
                 )
                 non_degenerate = singular_values[:, -1] >= 1e-6
                 if not torch.any(non_degenerate):
@@ -139,6 +153,7 @@ class PhysicsConditionedRigidResidualDecoder(nn.Module):
                 fitted_R = V_valid @ correction @ U_valid.transpose(-1, -2)
 
                 R[b, non_degenerate, object_id] = fitted_R
+                fallback_count[b, non_degenerate, object_id] = 0.0
 
                 rotated_source_mean = torch.matmul(
                     source_mean.expand(fitted_R.shape[0], -1).unsqueeze(1),
@@ -148,7 +163,26 @@ class PhysicsConditionedRigidResidualDecoder(nn.Module):
                     target_mean[non_degenerate] - rotated_source_mean
                 )
 
-        return R, t
+        relative_rotation_angle = target.new_zeros(B, T, self.num_objects)
+        if T > 1:
+            relative_rotation = R[:, 1:] @ R[:, :-1].transpose(-1, -2)
+            trace = relative_rotation.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+            cosine = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+            angles = torch.rad2deg(torch.acos(cosine))
+            # Avoid reporting numerical trace noise as a physical rotation.
+            relative_rotation_angle[:, 1:] = torch.where(
+                cosine > 1.0 - 1e-6,
+                torch.zeros_like(angles),
+                angles,
+            )
+
+        diagnostics = {
+            "svd_condition_number": svd_condition_number,
+            "fallback_count": fallback_count,
+            "centroid_error": centroid_error,
+            "relative_rotation_angle": relative_rotation_angle,
+        }
+        return R, t, diagnostics
 
     def forward(
         self,
@@ -185,7 +219,7 @@ class PhysicsConditionedRigidResidualDecoder(nn.Module):
             point_mask,
             self.num_objects,
         )
-        R, t = self.kabsch_alignment(
+        R, t, kabsch_diagnostics = self.kabsch_alignment(
             canonical_points,
             latent,
             point_obj_idx,
@@ -238,4 +272,5 @@ class PhysicsConditionedRigidResidualDecoder(nn.Module):
             "residual": residual,
             "deformability": deformability,
             "object_mask": object_mask,
+            "diagnostics": kabsch_diagnostics,
         }

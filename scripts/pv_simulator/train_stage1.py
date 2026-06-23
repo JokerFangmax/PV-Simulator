@@ -196,6 +196,18 @@ def parse_args():
                         help="Weight for per-object raw-position covariance consistency loss.")
     parser.add_argument("--lambda_vel", type=float, default=0.1,
                         help="Weight for frame-to-frame raw-position velocity consistency loss.")
+    parser.add_argument("--lambda_ang_vel", type=float, default=0.0,
+                        help="Weight for per-object angular-velocity field consistency loss.")
+    parser.add_argument("--lambda_velocity_vector", type=float, default=0.0,
+                        help="Weight for direct per-point 3D velocity-vector supervision.")
+    parser.add_argument("--lambda_velocity_accel", type=float, default=0.0,
+                        help="Weight for temporal velocity-change consistency supervision.")
+    parser.add_argument("--lambda_centroid", type=float, default=0.0,
+                        help="Weight for per-object predicted/GT centroid consistency.")
+    parser.add_argument("--lambda_rotation", type=float, default=0.0,
+                        help="Weight for direct Kabsch rotation-matrix supervision.")
+    parser.add_argument("--lambda_rotation_temporal", type=float, default=0.0,
+                        help="Weight for relative Kabsch rotation consistency across frames.")
     parser.add_argument("--lambda_chamfer", type=float, default=0.01,
                         help="Weight for per-frame raw-position Chamfer distance loss.")
     parser.add_argument("--lambda_momentum", type=float, default=0.01,
@@ -282,7 +294,9 @@ def parse_args():
     if args.initial_global_step and not args.init_from_model_dir:
         parser.error("--initial_global_step requires --init_from_model_dir")
     for name in (
-        "lambda_diffusion", "lambda_vel", "lambda_local_dist", "lambda_covariance", "lambda_chamfer",
+        "lambda_diffusion", "lambda_vel", "lambda_ang_vel", "lambda_velocity_vector",
+        "lambda_velocity_accel", "lambda_centroid", "lambda_rotation", "lambda_rotation_temporal",
+        "lambda_local_dist", "lambda_covariance", "lambda_chamfer",
         "lambda_momentum", "lambda_floor", "lambda_chamfer_coarse", "lambda_residual_reg",
         "lambda_residual_mag", "lambda_physics_point",
     ):
@@ -567,6 +581,258 @@ def _compute_velocity_consistency_loss(
 
     mask = valid_pairs.unsqueeze(-1) & valid_points.unsqueeze(1)
     return (sq_error * mask.unsqueeze(-1)).sum() / (mask.sum() * 3).clamp_min(1)
+
+
+def _compute_angular_velocity_loss(
+    pos_pred: torch.Tensor,
+    velocity_pred: torch.Tensor,
+    pos_gt: torch.Tensor,
+    velocity_gt: torch.Tensor,
+    point_obj_idx: torch.Tensor,
+    point_mask: torch.Tensor | None,
+    valid_frame_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Match angular velocity fitted from each object's 3D velocity field.
+
+    For centred points ``r`` and centred velocities ``v``, fit
+    ``v = omega x r`` by least squares.  Centring removes the translational
+    component, so a uniform velocity field has angular velocity near zero.
+    """
+    device = pos_pred.device
+    B, T_raw, N, _ = pos_pred.shape
+    total_loss = pos_pred.new_tensor(0.0)
+    total_weight = pos_pred.new_tensor(0.0)
+    identity = torch.eye(3, device=device, dtype=pos_pred.dtype)
+
+    def _fit_omega(positions: torch.Tensor, velocities: torch.Tensor) -> torch.Tensor:
+        # positions/velocities: (F, P, 3), with P >= 3
+        centred_positions = positions - positions.mean(dim=1, keepdim=True)
+        centred_velocities = velocities - velocities.mean(dim=1, keepdim=True)
+        rx, ry, rz = centred_positions.unbind(dim=-1)
+        zeros = torch.zeros_like(rx)
+        skew = torch.stack([
+            zeros, -rz, ry,
+            rz, zeros, -rx,
+            -ry, rx, zeros,
+        ], dim=-1).view(*centred_positions.shape[:-1], 3, 3)
+        # omega x r == -[r]_x omega
+        design = -skew
+        normal = (design.transpose(-1, -2) @ design).sum(dim=1)
+        rhs = (design.transpose(-1, -2) @ centred_velocities.unsqueeze(-1)).sum(dim=1)
+        return torch.linalg.solve(normal + 1e-6 * identity, rhs).squeeze(-1)
+
+    for b in range(B):
+        valid_points = (
+            point_mask[b]
+            if point_mask is not None
+            else torch.ones(N, device=device, dtype=torch.bool)
+        )
+        valid_frames = (
+            valid_frame_mask[b]
+            if valid_frame_mask is not None
+            else torch.ones(T_raw, device=device, dtype=torch.bool)
+        )
+        frame_idx = valid_frames.nonzero(as_tuple=True)[0]
+        frame_idx = frame_idx[frame_idx > 0]
+        if frame_idx.numel() == 0:
+            continue
+
+        for object_id in torch.unique(point_obj_idx[b][valid_points]).tolist():
+            object_idx = ((point_obj_idx[b] == object_id) & valid_points).nonzero(
+                as_tuple=True,
+            )[0]
+            if object_idx.numel() < 3:
+                continue
+
+            omega_pred = _fit_omega(
+                pos_pred[b, frame_idx][:, object_idx],
+                velocity_pred[b, frame_idx][:, object_idx],
+            )
+            omega_gt = _fit_omega(
+                pos_gt[b, frame_idx][:, object_idx],
+                velocity_gt[b, frame_idx][:, object_idx],
+            )
+            frame_loss = F.mse_loss(omega_pred, omega_gt)
+            total_loss = total_loss + frame_loss * frame_idx.numel()
+            total_weight = total_weight + frame_idx.numel()
+
+    return total_loss / total_weight.clamp_min(1)
+
+
+def _compute_velocity_vector_loss(
+    velocity_pred: torch.Tensor,
+    velocity_gt: torch.Tensor,
+    point_mask: torch.Tensor | None,
+    valid_frame_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Direct masked 3D velocity-vector supervision after the given frame."""
+    B, T_raw, N, _ = velocity_pred.shape
+    if point_mask is None:
+        valid_points = torch.ones(B, N, device=velocity_pred.device, dtype=torch.bool)
+    else:
+        valid_points = point_mask
+    if valid_frame_mask is None:
+        valid_frames = torch.ones(B, T_raw, device=velocity_pred.device, dtype=torch.bool)
+    else:
+        valid_frames = valid_frame_mask
+    valid_frames = valid_frames.clone()
+    valid_frames[:, :1] = False
+    mask = valid_frames.unsqueeze(-1) & valid_points.unsqueeze(1)
+    sq_error = (velocity_pred - velocity_gt).square()
+    return (sq_error * mask.unsqueeze(-1)).sum() / (mask.sum() * 3).clamp_min(1)
+
+
+def _compute_velocity_acceleration_loss(
+    velocity_pred: torch.Tensor,
+    velocity_gt: torch.Tensor,
+    point_mask: torch.Tensor | None,
+    valid_frame_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Match changes in per-point velocity without smoothing away GT dynamics."""
+    B, T_raw, N, _ = velocity_pred.shape
+    if T_raw < 3:
+        return velocity_pred.sum() * 0.0
+    if point_mask is None:
+        valid_points = torch.ones(B, N, device=velocity_pred.device, dtype=torch.bool)
+    else:
+        valid_points = point_mask
+    if valid_frame_mask is None:
+        valid_triplets = torch.ones(
+            B, T_raw - 1, device=velocity_pred.device, dtype=torch.bool,
+        )
+    else:
+        valid_triplets = valid_frame_mask[:, 1:] & valid_frame_mask[:, :-1]
+    valid_triplets = valid_triplets.clone()
+    valid_triplets[:, :1] = False
+    mask = valid_triplets.unsqueeze(-1) & valid_points.unsqueeze(1)
+    pred_delta = velocity_pred[:, 1:] - velocity_pred[:, :-1]
+    gt_delta = velocity_gt[:, 1:] - velocity_gt[:, :-1]
+    sq_error = (pred_delta - gt_delta).square()
+    return (sq_error * mask.unsqueeze(-1)).sum() / (mask.sum() * 3).clamp_min(1)
+
+
+def _compute_centroid_consistency_loss(
+    pos_pred: torch.Tensor,
+    pos_gt: torch.Tensor,
+    point_obj_idx: torch.Tensor,
+    point_mask: torch.Tensor | None,
+    valid_frame_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Match object centroids, distinct from canonical-frame displacement."""
+    B, T_raw, N, _ = pos_pred.shape
+    total_loss = pos_pred.new_tensor(0.0)
+    total_weight = pos_pred.new_tensor(0.0)
+    for b in range(B):
+        valid_points = (
+            point_mask[b]
+            if point_mask is not None
+            else torch.ones(N, device=pos_pred.device, dtype=torch.bool)
+        )
+        valid_frames = (
+            valid_frame_mask[b]
+            if valid_frame_mask is not None
+            else torch.ones(T_raw, device=pos_pred.device, dtype=torch.bool)
+        )
+        frame_idx = valid_frames.nonzero(as_tuple=True)[0]
+        frame_idx = frame_idx[frame_idx > 0]
+        for object_id in torch.unique(point_obj_idx[b][valid_points]).tolist():
+            object_idx = ((point_obj_idx[b] == object_id) & valid_points).nonzero(
+                as_tuple=True,
+            )[0]
+            if object_idx.numel() == 0 or frame_idx.numel() == 0:
+                continue
+            pred_centroid = pos_pred[b, frame_idx][:, object_idx].mean(dim=1)
+            gt_centroid = pos_gt[b, frame_idx][:, object_idx].mean(dim=1)
+            total_loss = total_loss + (pred_centroid - gt_centroid).square().mean() * frame_idx.numel()
+            total_weight = total_weight + frame_idx.numel()
+    return total_loss / total_weight.clamp_min(1)
+
+
+def _fit_kabsch_rotations(
+    canonical_points: torch.Tensor,
+    positions: torch.Tensor,
+    point_obj_idx: torch.Tensor,
+    point_mask: torch.Tensor | None,
+    num_objects: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return per-frame Kabsch rotations and a mask of non-degenerate fits."""
+    B, T_raw, N, _ = positions.shape
+    identity = torch.eye(3, device=positions.device, dtype=positions.dtype)
+    rotations = identity.view(1, 1, 1, 3, 3).expand(
+        B, T_raw, num_objects, -1, -1,
+    ).clone()
+    valid_rotation = torch.zeros(
+        B, T_raw, num_objects, device=positions.device, dtype=torch.bool,
+    )
+    for b in range(B):
+        valid_points = (
+            point_mask[b]
+            if point_mask is not None
+            else torch.ones(N, device=positions.device, dtype=torch.bool)
+        )
+        for object_id in range(num_objects):
+            object_points = (point_obj_idx[b] == object_id) & valid_points
+            if int(object_points.sum().item()) < 3:
+                continue
+            source = canonical_points[b, object_points]
+            source_centered = source - source.mean(dim=0)
+            target = positions[b, :, object_points]
+            target_centered = target - target.mean(dim=1, keepdim=True)
+            covariance = torch.einsum("pi,tpj->tij", source_centered, target_centered)
+            U, singular_values, Vh = torch.linalg.svd(covariance, full_matrices=False)
+            non_degenerate = singular_values[:, -1] >= 1e-6
+            if not torch.any(non_degenerate):
+                continue
+            U_valid = U[non_degenerate]
+            V_valid = Vh[non_degenerate].transpose(-1, -2)
+            correction = identity.expand(U_valid.shape[0], -1, -1).clone()
+            correction[:, 2, 2] = torch.where(
+                torch.det(V_valid @ U_valid.transpose(-1, -2)) < 0,
+                correction.new_tensor(-1.0),
+                correction.new_tensor(1.0),
+            )
+            rotations[b, non_degenerate, object_id] = (
+                V_valid @ correction @ U_valid.transpose(-1, -2)
+            )
+            valid_rotation[b, non_degenerate, object_id] = True
+    return rotations, valid_rotation
+
+
+def _compute_rotation_consistency_losses(
+    pos_pred: torch.Tensor,
+    pos_gt: torch.Tensor,
+    canonical_points: torch.Tensor,
+    point_obj_idx: torch.Tensor,
+    point_mask: torch.Tensor | None,
+    valid_frame_mask: torch.Tensor | None,
+    num_objects: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match absolute and frame-to-frame Kabsch rotations to GT."""
+    rotations_pred, valid_pred = _fit_kabsch_rotations(
+        canonical_points, pos_pred, point_obj_idx, point_mask, num_objects,
+    )
+    rotations_gt, valid_gt = _fit_kabsch_rotations(
+        canonical_points, pos_gt, point_obj_idx, point_mask, num_objects,
+    )
+    valid = valid_pred & valid_gt
+    if valid_frame_mask is not None:
+        valid = valid & valid_frame_mask[:, :, None]
+    valid = valid.clone()
+    valid[:, :1] = False
+    absolute_error = (rotations_pred - rotations_gt).square().mean(dim=(-1, -2))
+    absolute_loss = (absolute_error * valid.float()).sum() / valid.float().sum().clamp_min(1)
+
+    if rotations_pred.shape[1] < 2:
+        return absolute_loss, absolute_loss * 0.0
+    relative_pred = rotations_pred[:, 1:] @ rotations_pred[:, :-1].transpose(-1, -2)
+    relative_gt = rotations_gt[:, 1:] @ rotations_gt[:, :-1].transpose(-1, -2)
+    valid_pairs = valid[:, 1:] & valid[:, :-1]
+    temporal_error = (relative_pred - relative_gt).square().mean(dim=(-1, -2))
+    temporal_loss = (
+        (temporal_error * valid_pairs.float()).sum()
+        / valid_pairs.float().sum().clamp_min(1)
+    )
+    return absolute_loss, temporal_loss
 
 
 def _compute_momentum_loss(
@@ -1189,10 +1455,20 @@ def main():
                 loss_residual_reg = x_s_raw.new_tensor(0.0)
                 loss_residual_mag = x_s_raw.new_tensor(0.0)
                 deformability_mean = x_s_raw.new_tensor(0.0)
+                svd_condition = x_s_raw.new_tensor(0.0)
+                fallback_rate = x_s_raw.new_tensor(0.0)
+                centroid_error = x_s_raw.new_tensor(0.0)
+                relative_rotation_angle = x_s_raw.new_tensor(0.0)
 
                 local_dist_loss = x_s_raw.new_tensor(0.0)
                 covariance_loss = x_s_raw.new_tensor(0.0)
                 velocity_loss = x_s_raw.new_tensor(0.0)
+                angular_velocity_loss = x_s_raw.new_tensor(0.0)
+                velocity_vector_loss = x_s_raw.new_tensor(0.0)
+                velocity_acceleration_loss = x_s_raw.new_tensor(0.0)
+                centroid_loss = x_s_raw.new_tensor(0.0)
+                rotation_loss = x_s_raw.new_tensor(0.0)
+                rotation_temporal_loss = x_s_raw.new_tensor(0.0)
                 chamfer_loss = x_s_raw.new_tensor(0.0)
                 momentum_loss = x_s_raw.new_tensor(0.0)
                 floor_loss = x_s_raw.new_tensor(0.0)
@@ -1207,6 +1483,12 @@ def main():
                     args.lambda_local_dist > 0.0,
                     args.lambda_covariance > 0.0,
                     args.lambda_vel > 0.0,
+                    args.lambda_ang_vel > 0.0,
+                    args.lambda_velocity_vector > 0.0,
+                    args.lambda_velocity_accel > 0.0,
+                    args.lambda_centroid > 0.0,
+                    args.lambda_rotation > 0.0,
+                    args.lambda_rotation_temporal > 0.0,
                     args.lambda_chamfer > 0.0,
                     args.lambda_momentum > 0.0,
                     args.lambda_floor > 0.0,
@@ -1278,6 +1560,46 @@ def main():
                             point_obj_idx=point_obj_idx,
                             point_mask=point_mask,
                         )
+
+                        kabsch_diagnostics = {
+                            name: value.detach()
+                            for name, value in decoder_out["diagnostics"].items()
+                        }
+                        valid_object_frames = decoder_out["object_mask"][:, None, :].expand_as(
+                            kabsch_diagnostics["fallback_count"]
+                        )
+                        if valid_raw_frame_mask is not None:
+                            valid_object_frames = (
+                                valid_object_frames
+                                & valid_raw_frame_mask[:, :, None]
+                            )
+                        valid_object_frames_float = valid_object_frames.float()
+                        valid_object_frame_count = valid_object_frames_float.sum().clamp_min(1)
+
+                        fallback_rate = (
+                            kabsch_diagnostics["fallback_count"]
+                            * valid_object_frames_float
+                        ).sum() / valid_object_frame_count
+                        centroid_error = (
+                            kabsch_diagnostics["centroid_error"]
+                            * valid_object_frames_float
+                        ).sum() / valid_object_frame_count
+
+                        finite_svd = (
+                            valid_object_frames
+                            & torch.isfinite(kabsch_diagnostics["svd_condition_number"])
+                        )
+                        svd_condition = (
+                            kabsch_diagnostics["svd_condition_number"]
+                            * finite_svd.float()
+                        ).sum() / finite_svd.float().sum().clamp_min(1)
+
+                        valid_rotation_frames = valid_object_frames.clone()
+                        valid_rotation_frames[:, :1] = False
+                        relative_rotation_angle = (
+                            kabsch_diagnostics["relative_rotation_angle"]
+                            * valid_rotation_frames.float()
+                        ).sum() / valid_rotation_frames.float().sum().clamp_min(1)
 
                         pred_points = torch.cat(
                             [
@@ -1384,7 +1706,12 @@ def main():
                     )
                     velocity_pred = None
                     velocity_gt = None
-                    if args.lambda_momentum > 0.0:
+                    if any([
+                        args.lambda_momentum > 0.0,
+                        args.lambda_ang_vel > 0.0,
+                        args.lambda_velocity_vector > 0.0,
+                        args.lambda_velocity_accel > 0.0,
+                    ]):
                         velocity_pred = ae.decode(
                             pred_x0_enc[..., d_latent:], T_raw_dim,
                         ).float()
@@ -1396,6 +1723,48 @@ def main():
                             pos_gt=pos_gt,
                             point_mask=point_mask,
                             valid_frame_mask=valid_raw_frame_mask,
+                        )
+                    if args.lambda_ang_vel > 0.0:
+                        angular_velocity_loss = _compute_angular_velocity_loss(
+                            pos_pred=pred_x0_pos_raw.float(),
+                            velocity_pred=velocity_pred,
+                            pos_gt=x_s_raw[..., :3].float(),
+                            velocity_gt=velocity_gt,
+                            point_obj_idx=point_obj_idx,
+                            point_mask=point_mask,
+                            valid_frame_mask=valid_raw_frame_mask,
+                        )
+                    if args.lambda_velocity_vector > 0.0:
+                        velocity_vector_loss = _compute_velocity_vector_loss(
+                            velocity_pred=velocity_pred,
+                            velocity_gt=velocity_gt,
+                            point_mask=point_mask,
+                            valid_frame_mask=valid_raw_frame_mask,
+                        )
+                    if args.lambda_velocity_accel > 0.0:
+                        velocity_acceleration_loss = _compute_velocity_acceleration_loss(
+                            velocity_pred=velocity_pred,
+                            velocity_gt=velocity_gt,
+                            point_mask=point_mask,
+                            valid_frame_mask=valid_raw_frame_mask,
+                        )
+                    if args.lambda_centroid > 0.0:
+                        centroid_loss = _compute_centroid_consistency_loss(
+                            pos_pred=pred_x0_pos_raw.float(),
+                            pos_gt=x_s_raw[..., :3].float(),
+                            point_obj_idx=point_obj_idx,
+                            point_mask=point_mask,
+                            valid_frame_mask=valid_raw_frame_mask,
+                        )
+                    if args.lambda_rotation > 0.0 or args.lambda_rotation_temporal > 0.0:
+                        rotation_loss, rotation_temporal_loss = _compute_rotation_consistency_losses(
+                            pos_pred=pred_x0_pos_raw.float(),
+                            pos_gt=x_s_raw[..., :3].float(),
+                            canonical_points=x_s_raw[:, 0, :, :3].float(),
+                            point_obj_idx=point_obj_idx,
+                            point_mask=point_mask,
+                            valid_frame_mask=valid_raw_frame_mask,
+                            num_objects=args.max_objects,
                         )
                     if args.lambda_local_dist > 0.0:
                         local_dist_loss = _compute_local_distance_loss(
@@ -1474,6 +1843,12 @@ def main():
                 loss = (
                     args.lambda_diffusion * diffusion_loss
                     + args.lambda_vel * velocity_loss
+                    + args.lambda_ang_vel * angular_velocity_loss
+                    + args.lambda_velocity_vector * velocity_vector_loss
+                    + args.lambda_velocity_accel * velocity_acceleration_loss
+                    + args.lambda_centroid * centroid_loss
+                    + args.lambda_rotation * rotation_loss
+                    + args.lambda_rotation_temporal * rotation_temporal_loss
                     + args.lambda_local_dist * local_dist_loss
                     + args.lambda_covariance * covariance_loss
                     + args.lambda_chamfer * chamfer_loss
@@ -1508,9 +1883,29 @@ def main():
                 avg_deformability_mean = accelerator.gather(
                     deformability_mean.detach().repeat(bsz)
                 ).mean()
+                avg_svd_condition = accelerator.gather(svd_condition.repeat(bsz)).mean()
+                avg_fallback_rate = accelerator.gather(fallback_rate.repeat(bsz)).mean()
+                avg_centroid_error = accelerator.gather(centroid_error.repeat(bsz)).mean()
+                avg_relative_rotation_angle = accelerator.gather(
+                    relative_rotation_angle.repeat(bsz)
+                ).mean()
                 avg_local_dist_loss = accelerator.gather(local_dist_loss.repeat(bsz)).mean()
                 avg_covariance_loss = accelerator.gather(covariance_loss.repeat(bsz)).mean()
                 avg_velocity_loss = accelerator.gather(velocity_loss.repeat(bsz)).mean()
+                avg_angular_velocity_loss = accelerator.gather(
+                    angular_velocity_loss.repeat(bsz)
+                ).mean()
+                avg_velocity_vector_loss = accelerator.gather(
+                    velocity_vector_loss.repeat(bsz)
+                ).mean()
+                avg_velocity_acceleration_loss = accelerator.gather(
+                    velocity_acceleration_loss.repeat(bsz)
+                ).mean()
+                avg_centroid_loss = accelerator.gather(centroid_loss.repeat(bsz)).mean()
+                avg_rotation_loss = accelerator.gather(rotation_loss.repeat(bsz)).mean()
+                avg_rotation_temporal_loss = accelerator.gather(
+                    rotation_temporal_loss.repeat(bsz)
+                ).mean()
                 avg_chamfer_loss = accelerator.gather(chamfer_loss.repeat(bsz)).mean()
                 avg_momentum_loss = accelerator.gather(momentum_loss.repeat(bsz)).mean()
                 avg_floor_loss = accelerator.gather(floor_loss.repeat(bsz)).mean()
@@ -1547,12 +1942,32 @@ def main():
                         "local_dist_loss": avg_local_dist_loss.item(),
                         "covariance_loss": avg_covariance_loss.item(),
                         "velocity_loss": avg_velocity_loss.item(),
+                        "angular_velocity_loss": avg_angular_velocity_loss.item(),
+                        "velocity_vector_loss": avg_velocity_vector_loss.item(),
+                        "velocity_acceleration_loss": avg_velocity_acceleration_loss.item(),
+                        "centroid_loss": avg_centroid_loss.item(),
+                        "rotation_loss": avg_rotation_loss.item(),
+                        "rotation_temporal_loss": avg_rotation_temporal_loss.item(),
                         "chamfer_loss": avg_chamfer_loss.item(),
                         "momentum_loss": avg_momentum_loss.item(),
                         "floor_loss": avg_floor_loss.item(),
                         "weighted_local_dist_loss": args.lambda_local_dist * avg_local_dist_loss.item(),
                         "weighted_covariance_loss": args.lambda_covariance * avg_covariance_loss.item(),
                         "weighted_velocity_loss": args.lambda_vel * avg_velocity_loss.item(),
+                        "weighted_angular_velocity_loss": (
+                            args.lambda_ang_vel * avg_angular_velocity_loss.item()
+                        ),
+                        "weighted_velocity_vector_loss": (
+                            args.lambda_velocity_vector * avg_velocity_vector_loss.item()
+                        ),
+                        "weighted_velocity_acceleration_loss": (
+                            args.lambda_velocity_accel * avg_velocity_acceleration_loss.item()
+                        ),
+                        "weighted_centroid_loss": args.lambda_centroid * avg_centroid_loss.item(),
+                        "weighted_rotation_loss": args.lambda_rotation * avg_rotation_loss.item(),
+                        "weighted_rotation_temporal_loss": (
+                            args.lambda_rotation_temporal * avg_rotation_temporal_loss.item()
+                        ),
                         "weighted_chamfer_loss": args.lambda_chamfer * avg_chamfer_loss.item(),
                         "weighted_momentum_loss": args.lambda_momentum * avg_momentum_loss.item(),
                         "weighted_floor_loss": args.lambda_floor * avg_floor_loss.item(),
@@ -1568,6 +1983,10 @@ def main():
                         "loss_residual_reg": avg_loss_residual_reg.item(),
                         "loss_residual_mag": avg_loss_residual_mag.item(),
                         "deformability_mean": avg_deformability_mean.item(),
+                        "avg_svd_condition": avg_svd_condition.item(),
+                        "avg_fallback_rate": avg_fallback_rate.item(),
+                        "avg_centroid_error": avg_centroid_error.item(),
+                        "avg_relative_rotation_angle": avg_relative_rotation_angle.item(),
                     })
                 if sim_metric_values is not None:
                     log_values.update({
@@ -1659,6 +2078,12 @@ def main():
                 "local_dist": local_dist_loss.detach().item(),
                 "covariance": covariance_loss.detach().item(),
                 "velocity": velocity_loss.detach().item(),
+                "angular_velocity": angular_velocity_loss.detach().item(),
+                "velocity_vector": velocity_vector_loss.detach().item(),
+                "velocity_accel": velocity_acceleration_loss.detach().item(),
+                "centroid": centroid_loss.detach().item(),
+                "rotation": rotation_loss.detach().item(),
+                "rotation_temporal": rotation_temporal_loss.detach().item(),
                 "chamfer": chamfer_loss.detach().item(),
                 "momentum": momentum_loss.detach().item(),
                 "floor": floor_loss.detach().item(),

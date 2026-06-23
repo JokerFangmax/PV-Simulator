@@ -75,6 +75,7 @@ from videox_fun.data.dataset_simulation import (MoviSimulationDataset,
 from videox_fun.models.sim_ae import CausalAE
 from videox_fun.models.sim_condition import SimConditionEmbedder
 from videox_fun.models.sim_transformer import SimTransformer
+from videox_fun.models.physics_rigid_decoder import PhysicsConditionedRigidResidualDecoder
 from videox_fun.utils.discrete_sampler import DiscreteSampling
 from videox_fun.utils.sim_metrics import (
     ae_reconstruction_chamfer,
@@ -179,6 +180,16 @@ def parse_args():
     parser.add_argument("--use_raw_point_mse_target", action="store_true",
                         help="Replace latent flow-matching MSE with correspondence-aware per-point "
                              "L2 loss between AE-decoded predicted and target x0 positions.")
+    parser.add_argument("--use_physics_conditioned_decoder", action="store_true",
+                        help="Use the rigid SE(3) plus physics-gated residual coordinate decoder.")
+    parser.add_argument("--lambda_physics_point", type=float, default=1.0,
+                        help="Weight for the physics-decoder raw coordinate-space objective.")
+    parser.add_argument("--lambda_chamfer_coarse", type=float, default=0.5,
+                        help="Weight for coarse rigid-motion Chamfer supervision.")
+    parser.add_argument("--lambda_residual_reg", type=float, default=0.1,
+                        help="Weight for physics-conditioned deformability supervision.")
+    parser.add_argument("--lambda_residual_mag", type=float, default=0.1,
+                        help="Weight for softness-weighted residual magnitude regularization.")
     parser.add_argument("--lambda_local_dist", type=float, default=1e-3,
                         help="Weight for frame-0-relative local KNN edge deformation loss.")
     parser.add_argument("--lambda_covariance", type=float, default=0.0,
@@ -272,7 +283,8 @@ def parse_args():
         parser.error("--initial_global_step requires --init_from_model_dir")
     for name in (
         "lambda_diffusion", "lambda_vel", "lambda_local_dist", "lambda_covariance", "lambda_chamfer",
-        "lambda_momentum", "lambda_floor",
+        "lambda_momentum", "lambda_floor", "lambda_chamfer_coarse", "lambda_residual_reg",
+        "lambda_residual_mag", "lambda_physics_point",
     ):
         if getattr(args, name) < 0:
             parser.error(f"--{name} must be >= 0")
@@ -281,7 +293,7 @@ def parse_args():
 
 
 def _run_vis(vis_samples, sim_transformer, ae, sim_cond_embedder,
-             global_step, device, weight_dtype, num_inference_steps, fps, anchor_mode):
+             global_step, device, weight_dtype, num_inference_steps, fps, anchor_mode, physics_decoder=None):
     """Run inference on fixed samples, render GT+pred videos, and log to wandb.
 
     Must be called on main process only. Imports wandb and pipeline lazily so
@@ -302,6 +314,7 @@ def _run_vis(vis_samples, sim_transformer, ae, sim_cond_embedder,
         sim_transformer=sim_transformer,
         ae=ae,
         sim_cond_embedder=sim_cond_embedder,
+        physics_decoder=physics_decoder,
         scheduler=FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000),
         anchor_mode=anchor_mode,
     )
@@ -758,6 +771,19 @@ def main():
         use_temporal_rope=args.use_temporal_rope,
         use_object_local_attention=args.use_object_local_attention,
     )
+
+    physics_decoder = None
+    if args.use_physics_conditioned_decoder:
+        physics_decoder = PhysicsConditionedRigidResidualDecoder(
+            num_objects=args.max_objects,
+        )
+        logger.info(
+            "Physics-conditioned rigid residual decoder enabled: "
+            "lambda_chamfer_coarse=%g, lambda_residual_reg=%g, lambda_residual_mag=%g",
+            args.lambda_chamfer_coarse,
+            args.lambda_residual_reg,
+            args.lambda_residual_mag,
+        )
     logger.info(
         "Temporal structure: sinusoidal token positions=on, correspondence=%s, RoPE=%s, "
         "factorized_attention=%s, object_local_attention=%s, "
@@ -781,13 +807,27 @@ def main():
     if args.init_from_model_dir:
         transformer_path = os.path.join(args.init_from_model_dir, "sim_transformer.pt")
         cond_embedder_path = os.path.join(args.init_from_model_dir, "sim_cond_embedder.pt")
-        for checkpoint_path in (transformer_path, cond_embedder_path):
+        checkpoint_paths = [transformer_path, cond_embedder_path]
+
+        if args.use_physics_conditioned_decoder:
+            physics_decoder_path = os.path.join(
+                args.init_from_model_dir, "physics_decoder.pt"
+            )
+            checkpoint_paths.append(physics_decoder_path)
+
+        for checkpoint_path in checkpoint_paths:
             if not os.path.isfile(checkpoint_path):
                 raise FileNotFoundError(
                     f"Model-only initialization requires {checkpoint_path}"
                 )
+
         sim_transformer.load_state_dict(torch.load(transformer_path, map_location="cpu"))
         sim_cond_embedder.load_state_dict(torch.load(cond_embedder_path, map_location="cpu"))
+        if args.use_physics_conditioned_decoder:
+            physics_decoder.load_state_dict(
+                torch.load(physics_decoder_path, map_location="cpu")
+            )
+
         logger.info(
             "Initialized Stage 1 model weights from %s at optimizer step %s; "
             "optimizer state will be reset.",
@@ -798,11 +838,19 @@ def main():
     # Move to device
     sim_cond_embedder.to(accelerator.device, dtype=weight_dtype)
     sim_transformer.to(accelerator.device, dtype=weight_dtype)
+    if physics_decoder is not None:
+        # Keep this module FP32 because its specified physics attributes are FP32.
+        physics_decoder.to(accelerator.device)
 
     # Count parameters
     total_params = (
         sum(p.numel() for p in sim_transformer.parameters()) +
-        sum(p.numel() for p in sim_cond_embedder.parameters())
+        sum(p.numel() for p in sim_cond_embedder.parameters()) +
+        (
+            sum(p.numel() for p in physics_decoder.parameters())
+            if physics_decoder is not None
+            else 0
+        )
     )
     logger.info(f"Total trainable parameters: {total_params:,}")
 
@@ -816,7 +864,10 @@ def main():
     trainable_params = (
         list(sim_transformer.parameters()) +
         list(sim_cond_embedder.parameters())
-    )   # whether all the params are trainable
+    )
+    if physics_decoder is not None:
+        trainable_params += list(physics_decoder.parameters())
+
 
     optimizer = optimizer_cls(
         trainable_params,
@@ -903,11 +954,43 @@ def main():
     # --- Accelerate prepare ---
     # All trainable modules are wrapped so DDP syncs their gradients across GPUs.
     # AE is frozen and not wrapped (no gradient sync needed).
-    (sim_transformer, sim_cond_embedder,
-     optimizer, train_dataloader, lr_scheduler) = accelerator.prepare(
-        sim_transformer, sim_cond_embedder,
-        optimizer, train_dataloader, lr_scheduler,
-    )
+    if physics_decoder is not None:
+        (
+            sim_transformer,
+            sim_cond_embedder,
+            physics_decoder,
+            optimizer,
+            train_dataloader,
+            lr_scheduler,
+        ) = accelerator.prepare(
+            sim_transformer,
+            sim_cond_embedder,
+            physics_decoder,
+            optimizer,
+            train_dataloader,
+            lr_scheduler,
+        )
+        accumulation_models = (
+            sim_transformer,
+            sim_cond_embedder,
+            physics_decoder,
+        )
+    else:
+        (
+            sim_transformer,
+            sim_cond_embedder,
+            optimizer,
+            train_dataloader,
+            lr_scheduler,
+        ) = accelerator.prepare(
+            sim_transformer,
+            sim_cond_embedder,
+            optimizer,
+            train_dataloader,
+            lr_scheduler,
+        )
+        accumulation_models = (sim_transformer, sim_cond_embedder)
+
 
     # --- Fixed visualization samples (loaded once, main process only) ---
     vis_samples = []
@@ -949,10 +1032,10 @@ def main():
         accum_count = 0
 
         for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(sim_transformer, sim_cond_embedder):
+            with accelerator.accumulate(*accumulation_models):
                 # --- Unpack batch ---
                 # Tensors have shape (B, ...) after collation
-                x_s_raw = batch['x_s_raw'].to(accelerator.device, dtype=weight_dtype)    # (B, T_raw, N, 6)
+                x_s_raw = batch['x_s_raw'].to(accelerator.device, dtype=weight_dtype)   # (B, T_raw, N, 6)
                 c_force_raw = batch['c_force_raw'].to(accelerator.device, dtype=weight_dtype)  # (B, T_raw, N, 6)
                 c_floor = batch['c_floor'].to(accelerator.device)                          # (B,)
                 c_id = batch['c_id'].to(accelerator.device)                                # (B, n_objects)
@@ -1096,9 +1179,16 @@ def main():
                     n_valid = latent_mask.float().sum() * args.d_state
                     latent_diffusion_loss = (loss_per_elem * weighting.float()).sum() / n_valid.clamp(min=1)
 
-                # Selected below when --use_raw_point_mse_target is enabled.
+                # Selected below when a raw-space objective is enabled.
                 diffusion_loss = latent_diffusion_loss
                 raw_point_mse_target_loss = x_s_raw.new_tensor(0.0)
+
+                loss_mse_raw = x_s_raw.new_tensor(0.0)
+                loss_mse_total = x_s_raw.new_tensor(0.0)
+                loss_chamfer_coarse = x_s_raw.new_tensor(0.0)
+                loss_residual_reg = x_s_raw.new_tensor(0.0)
+                loss_residual_mag = x_s_raw.new_tensor(0.0)
+                deformability_mean = x_s_raw.new_tensor(0.0)
 
                 local_dist_loss = x_s_raw.new_tensor(0.0)
                 covariance_loss = x_s_raw.new_tensor(0.0)
@@ -1113,6 +1203,7 @@ def main():
                 )
                 use_raw_auxiliary_loss = any([
                     args.use_raw_point_mse_target,
+                    args.use_physics_conditioned_decoder,
                     args.lambda_local_dist > 0.0,
                     args.lambda_covariance > 0.0,
                     args.lambda_vel > 0.0,
@@ -1138,27 +1229,135 @@ def main():
                     # correspondence. Both sides are decoded x0 representations:
                     # pred_x0_enc is obtained from the predicted velocity, while
                     # x_s_enc == noise - target.
+                    # Decode the coordinate prediction once. The physics decoder,
+                    # when enabled, replaces only the raw point-MSE objective.
                     pred_x0_pos_raw = None
-                    if args.use_raw_point_mse_target:
-                        pred_x0_pos_raw = ae.decode(pred_x0_enc[..., :d_latent], T_raw_dim)
-                        target_x0_pos_raw = ae.decode(x_s_enc[..., :d_latent], T_raw_dim)
-                        point_mse = (pred_x0_pos_raw.float() - target_x0_pos_raw.float()).square().sum(dim=-1)
-                        if point_mask is None:
-                            raw_point_mask = torch.ones(
-                                B_sz, T_raw_dim, N_sz,
-                                device=accelerator.device, dtype=torch.bool,
-                            )
-                        else:
-                            raw_point_mask = point_mask.unsqueeze(1).expand(
-                                -1, T_raw_dim, -1
-                            ).clone()
-                        if valid_raw_frame_mask is not None:
-                            raw_point_mask = raw_point_mask & valid_raw_frame_mask.unsqueeze(-1)
-                        # Frame 0 is explicitly conditioned and has no trainable prediction.
-                        raw_point_mask[:, :1] = False
+                    target_points = None
+                    decoder_out = None
+
+                    if point_mask is None:
+                        raw_point_mask = torch.ones(
+                            B_sz,
+                            T_raw_dim,
+                            N_sz,
+                            device=accelerator.device,
+                            dtype=torch.bool,
+                        )
+                    else:
+                        raw_point_mask = point_mask.unsqueeze(1).expand(
+                            -1, T_raw_dim, -1
+                        ).clone()
+                    if valid_raw_frame_mask is not None:
+                        raw_point_mask = raw_point_mask & valid_raw_frame_mask.unsqueeze(-1)
+
+                    # Frame 0 is hard-conditioned and therefore excluded from
+                    # trainable point losses, matching the existing raw-MSE behavior.
+                    raw_point_mask[:, :1] = False
+
+                    if args.use_physics_conditioned_decoder:
+                        pred_x0_pos_raw = ae.decode(
+                            pred_x0_enc[..., :d_latent],
+                            T_raw_dim,
+                        )
+                        target_points = x_s_raw[..., :3].float()
+                        canonical_points = x_s_raw[:, 0, :, :3].float()
+
+                        physics_attrs = torch.ones(
+                            B_sz,
+                            args.max_objects,
+                            4,
+                            device=accelerator.device,
+                            dtype=torch.float32,
+                        )
+                        physics_attrs[:, :, 0] = 1.0
+
+                        decoder_out = physics_decoder(
+                            latent=pred_x0_pos_raw.float(),
+                            canonical_points=canonical_points,
+                            physics_attrs=physics_attrs,
+                            point_obj_idx=point_obj_idx,
+                            point_mask=point_mask,
+                        )
+
+                        pred_points = torch.cat(
+                            [
+                                pred_x0_pos_raw[:, :1].float(),
+                                decoder_out["positions"][:, 1:],
+                            ],
+                            dim=1,
+                        )
+
+                        # Direct pre-decoder supervision: every raw predicted
+                        # coordinate receives a gradient from SimTransformer.
+                        point_mse_raw = (
+                            pred_x0_pos_raw.float() - target_points
+                        ).square().sum(dim=-1)
+                        loss_mse_raw = (
+                            (point_mse_raw * raw_point_mask.float()).sum()
+                            / raw_point_mask.float().sum().clamp_min(1)
+                        )
+
+                        # Kabsch-projected final-coordinate supervision.
+                        point_mse_total = (
+                            pred_points - target_points
+                        ).square().sum(dim=-1)
+                        loss_mse_total = (
+                            (point_mse_total * raw_point_mask.float()).sum()
+                            / raw_point_mask.float().sum().clamp_min(1)
+                        )
+
+                        loss_chamfer_coarse = _compute_chamfer_loss(
+                            pos_pred=decoder_out["coarse_positions"],
+                            pos_gt=target_points,
+                            point_mask=point_mask,
+                            valid_frame_mask=valid_raw_frame_mask,
+                        )
+
+                        stiffness = physics_attrs[:, :, 0]
+                        expected_deformability = (
+                            (1.0 - stiffness)
+                            .unsqueeze(1)
+                            .unsqueeze(-1)
+                            .expand_as(decoder_out["deformability"])
+                        )
+                        loss_residual_reg = F.mse_loss(
+                            decoder_out["deformability"],
+                            expected_deformability,
+                        )
+
+                        residual_norm = decoder_out["residual"].norm(dim=-1)
+                        residual_norm_per_sample = (
+                            (residual_norm * raw_point_mask.float()).sum(dim=(1, 2))
+                            / raw_point_mask.float().sum(dim=(1, 2)).clamp_min(1)
+                        )
+                        softness = (1.0 - stiffness).mean(dim=1)
+                        loss_residual_mag = (
+                            residual_norm_per_sample * softness
+                        ).mean()
+
+                        loss_point = (
+                            loss_mse_raw
+                            + loss_mse_total
+                            + args.lambda_chamfer_coarse * loss_chamfer_coarse
+                            + args.lambda_residual_reg * loss_residual_reg
+                            + args.lambda_residual_mag * loss_residual_mag
+                        )
+                        diffusion_loss = loss_point
+                        deformability_mean = decoder_out["deformability"].mean()
+
+                    elif args.use_raw_point_mse_target:
+                        pred_x0_pos_raw = ae.decode(
+                            pred_x0_enc[..., :d_latent], T_raw_dim
+                        )
+                        target_x0_pos_raw = ae.decode(
+                            x_s_enc[..., :d_latent], T_raw_dim
+                        )
+                        point_mse = (
+                            pred_x0_pos_raw.float() - target_x0_pos_raw.float()
+                        ).square().sum(dim=-1)
                         raw_point_mse_per_sample = (
-                            (point_mse * raw_point_mask).sum(dim=(1, 2))
-                            / raw_point_mask.sum(dim=(1, 2)).clamp_min(1)
+                            (point_mse * raw_point_mask.float()).sum(dim=(1, 2))
+                            / raw_point_mask.float().sum(dim=(1, 2)).clamp_min(1)
                         )
                         sample_weighting = weighting.float().reshape(B_sz, -1)[:, 0]
                         raw_point_mse_target_loss = (
@@ -1166,12 +1365,23 @@ def main():
                         ).mean()
                         diffusion_loss = raw_point_mse_target_loss
 
-                    # Reuse the position decode above when the raw point-MSE target
-                    # already produced it. Decode velocities only for momentum.
+                    # Reuse the position decode above when available. Existing
+                    # velocity, local-distance, momentum, floor, and diffusion
+                    # losses remain unchanged below.
                     if pred_x0_pos_raw is None:
-                        pred_x0_pos_raw = ae.decode(pred_x0_enc[..., :d_latent], T_raw_dim)
-                    pos_pred = pred_x0_pos_raw.float()
-                    pos_gt = x_s_raw[..., :3].float()
+                        pred_x0_pos_raw = ae.decode(
+                            pred_x0_enc[..., :d_latent], T_raw_dim
+                        )
+                    pos_pred = (
+                        pred_points
+                        if args.use_physics_conditioned_decoder
+                        else pred_x0_pos_raw.float()
+                    )
+                    pos_gt = (
+                        target_points
+                        if target_points is not None
+                        else x_s_raw[..., :3].float()
+                    )
                     velocity_pred = None
                     velocity_gt = None
                     if args.lambda_momentum > 0.0:
@@ -1280,6 +1490,24 @@ def main():
                 avg_raw_point_mse_target_loss = accelerator.gather(
                     raw_point_mse_target_loss.repeat(bsz)
                 ).mean()
+                avg_loss_mse_raw = accelerator.gather(
+                    loss_mse_raw.repeat(bsz)
+                ).mean()
+                avg_loss_mse_total = accelerator.gather(
+                    loss_mse_total.repeat(bsz)
+                ).mean()
+                avg_loss_chamfer_coarse = accelerator.gather(
+                    loss_chamfer_coarse.repeat(bsz)
+                ).mean()
+                avg_loss_residual_reg = accelerator.gather(
+                    loss_residual_reg.repeat(bsz)
+                ).mean()
+                avg_loss_residual_mag = accelerator.gather(
+                    loss_residual_mag.repeat(bsz)
+                ).mean()
+                avg_deformability_mean = accelerator.gather(
+                    deformability_mean.detach().repeat(bsz)
+                ).mean()
                 avg_local_dist_loss = accelerator.gather(local_dist_loss.repeat(bsz)).mean()
                 avg_covariance_loss = accelerator.gather(covariance_loss.repeat(bsz)).mean()
                 avg_velocity_loss = accelerator.gather(velocity_loss.repeat(bsz)).mean()
@@ -1332,6 +1560,15 @@ def main():
                         "epoch": epoch,
                         "global_step": global_step,
                 }
+                if args.use_physics_conditioned_decoder:
+                    log_values.update({
+                        "loss_mse_raw": avg_loss_mse_raw.item(),
+                        "loss_mse_total": avg_loss_mse_total.item(),
+                        "loss_chamfer_coarse": avg_loss_chamfer_coarse.item(),
+                        "loss_residual_reg": avg_loss_residual_reg.item(),
+                        "loss_residual_mag": avg_loss_residual_mag.item(),
+                        "deformability_mean": avg_deformability_mean.item(),
+                    })
                 if sim_metric_values is not None:
                     log_values.update({
                         name: accelerator.gather(value.detach().repeat(bsz)).mean().item()
@@ -1351,19 +1588,34 @@ def main():
                 ):
                     unwrapped_sim = accelerator.unwrap_model(sim_transformer)
                     unwrapped_cond = accelerator.unwrap_model(sim_cond_embedder)
+                    unwrapped_physics = (
+                        accelerator.unwrap_model(physics_decoder)
+                        if physics_decoder is not None
+                        else None
+                    )
                     unwrapped_sim.eval()
                     unwrapped_cond.eval()
+                    if unwrapped_physics is not None:
+                        unwrapped_physics.eval()
                     try:
                         _run_vis(
-                            vis_samples, unwrapped_sim, ae, unwrapped_cond,
-                            global_step, accelerator.device, weight_dtype,
-                            args.vis_num_inference_steps, args.vis_fps, args.anchor_mode,
+                            vis_samples,
+                            unwrapped_sim,
+                            ae,
+                            unwrapped_cond,
+                            global_step,
+                            accelerator.device,
+                            weight_dtype,
+                            args.vis_num_inference_steps,
+                            args.vis_fps,
+                            args.anchor_mode,
+                            physics_decoder=unwrapped_physics,
                         )
-                    except Exception as e:
-                        logger.warning(f"Visualization failed at step {global_step}: {e}")
                     finally:
                         unwrapped_sim.train()
                         unwrapped_cond.train()
+                        if unwrapped_physics is not None:
+                            unwrapped_physics.train()
 
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
@@ -1387,9 +1639,14 @@ def main():
                                    os.path.join(save_dir, "sim_transformer.pt"))
                         torch.save(accelerator.unwrap_model(sim_cond_embedder).state_dict(),
                                    os.path.join(save_dir, "sim_cond_embedder.pt"))
+                        if physics_decoder is not None:
+                            torch.save(
+                                accelerator.unwrap_model(physics_decoder).state_dict(),
+                                os.path.join(save_dir, "physics_decoder.pt"),
+                            )
                     accelerator.wait_for_everyone()
-                    # Includes optimizer, scheduler, RNG, and prepared model state so
-                    # --resume_from_checkpoint can continue exactly at a later time.
+                    # Includes optimizer, scheduler, RNG, and every prepared model,
+                    # including physics_decoder when enabled.
                     accelerator.save_state(save_dir)
                     if accelerator.is_main_process:
                         logger.info(f"Saved checkpoint to {save_dir}")
@@ -1424,6 +1681,11 @@ def main():
                    os.path.join(save_dir, "sim_transformer.pt"))
         torch.save(accelerator.unwrap_model(sim_cond_embedder).state_dict(),
                    os.path.join(save_dir, "sim_cond_embedder.pt"))
+        if physics_decoder is not None:
+            torch.save(
+                accelerator.unwrap_model(physics_decoder).state_dict(),
+                os.path.join(save_dir, "physics_decoder.pt"),
+            )
         logger.info(f"Saved final model to {save_dir}")
 
     accelerator.end_training()

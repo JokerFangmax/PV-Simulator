@@ -34,6 +34,7 @@ import os
 from typing import Optional
 
 import torch
+import torch.nn as nn
 from diffusers import FlowMatchEulerDiscreteScheduler
 from tqdm.auto import tqdm
 
@@ -47,6 +48,9 @@ from videox_fun.utils.sim_metrics import (
     raw_frame_mask_from_valid_seq_mask,
     velocity_drift,
 )
+
+from videox_fun.models.physics_rigid_decoder import PhysicsConditionedRigidResidualDecoder
+from videox_fun.models.sim_ae import CausalAE
 
 
 class SimulationPipeline:
@@ -72,16 +76,22 @@ class SimulationPipeline:
         sim_transformer: SimTransformer,
         ae: CausalAE,
         sim_cond_embedder: SimConditionEmbedder,
+        physics_decoder: Optional[nn.Module] = None,
         scheduler: Optional[FlowMatchEulerDiscreteScheduler] = None,
         anchor_mode: str = "local",
     ):
         self.sim_transformer = sim_transformer
         self.ae = ae
         self.sim_cond_embedder = sim_cond_embedder
+        self.physics_decoder = physics_decoder
         self.scheduler = scheduler or FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
         self.device = next(sim_transformer.parameters()).device
         self.dtype = next(sim_transformer.parameters()).dtype
         self.anchor_mode = anchor_mode
+
+        if self.physics_decoder is not None:
+            self.physics_decoder.to(self.device)
+            self.physics_decoder.eval()
 
     @classmethod
     def from_pretrained(cls, ckpt_dir: str, ae_ckpt_dir: str,
@@ -149,18 +159,47 @@ class SimulationPipeline:
         sim_transformer.load_state_dict(sim_transformer_state)
         sim_cond_embedder.load_state_dict(sim_cond_state)
 
+        physics_decoder = None
+        physics_decoder_path = os.path.join(ckpt_dir, "physics_decoder.pt")
+        if os.path.isfile(physics_decoder_path):
+            physics_decoder_state = torch.load(
+                physics_decoder_path,
+                map_location="cpu",
+            )
+            physics_dim = int(
+                physics_decoder_state["physics_encoder.net.0.weight"].shape[0]
+            )
+            physics_decoder = PhysicsConditionedRigidResidualDecoder(
+                physics_dim=physics_dim,
+                num_objects=ckpt_max_objects,
+            )
+            physics_decoder.load_state_dict(physics_decoder_state)
+            physics_decoder = physics_decoder.to(device)
+            physics_decoder.eval()
+
         sim_transformer = sim_transformer.to(device, dtype=dtype)
         sim_cond_embedder = sim_cond_embedder.to(device, dtype=dtype)
 
-        return cls(sim_transformer, ae, sim_cond_embedder, anchor_mode=anchor_mode)
+        return cls(
+            sim_transformer,
+            ae,
+            sim_cond_embedder,
+            physics_decoder=physics_decoder,
+            anchor_mode=anchor_mode,
+        )
 
     def to(self, device=None, dtype=None):
         if device is not None:
             self.device = device
         if dtype is not None:
             self.dtype = dtype
-        for m in [self.sim_transformer, self.ae, self.sim_cond_embedder]:
-            m.to(device=device, dtype=dtype)
+
+        for module in [self.sim_transformer, self.ae, self.sim_cond_embedder]:
+            module.to(device=device, dtype=dtype)
+
+        # The Kabsch decoder deliberately remains FP32.
+        if self.physics_decoder is not None and device is not None:
+            self.physics_decoder.to(device=device)
         return self
 
     def _encode_state(self, x_raw):
@@ -239,6 +278,7 @@ class SimulationPipeline:
         valid_seq_mask: Optional[torch.Tensor] = None,  # (B, T*N) bool
         x_s_target: Optional[torch.Tensor] = None,    # (B, T_raw, N, 6|9), optional diagnostics target
         log_diagnostics: bool = True,
+        physics_attrs: Optional[torch.Tensor] = None,
     ):
         """Run LDM-style simulation denoising in latent space.
 
@@ -342,6 +382,57 @@ class SimulationPipeline:
         # --- Decode once at the end ---
         x_s_pred = self._decode_state(sample, T_raw)  # (B, T_raw, N, 6)
 
+        decoder_out = None
+        if self.physics_decoder is not None:
+            decoded_positions = x_s_pred[..., :3].float()
+            canonical_points = x_s_init[:, 0, :, :3].float()
+
+            if physics_attrs is None:
+                physics_attrs = torch.ones(
+                    B,
+                    self.physics_decoder.num_objects,
+                    4,
+                    device=device,
+                    dtype=torch.float32,
+                )
+                physics_attrs[:, :, 0] = 1.0
+            else:
+                physics_attrs = physics_attrs.to(
+                    device=device,
+                    dtype=torch.float32,
+                )
+                expected_shape = (
+                    B,
+                    self.physics_decoder.num_objects,
+                    4,
+                )
+                if physics_attrs.shape != expected_shape:
+                    raise ValueError(
+                        f"physics_attrs must be {expected_shape}, got "
+                        f"{tuple(physics_attrs.shape)}"
+                    )
+
+            decoder_out = self.physics_decoder(
+                latent=decoded_positions,
+                canonical_points=canonical_points,
+                physics_attrs=physics_attrs,
+                point_obj_idx=point_obj_idx,
+                point_mask=point_mask,
+            )
+
+            # Match training's hard frame-0 bypass exactly.
+            final_positions = torch.cat(
+                [
+                    decoded_positions[:, :1],
+                    decoder_out["positions"][:, 1:],
+                ],
+                dim=1,
+            )
+            x_s_pred = torch.cat(
+                [final_positions, x_s_pred[..., 3:].float()],
+                dim=-1,
+            )
+
         diagnostics = {}
         if log_diagnostics:
             valid_raw_frame_mask = raw_frame_mask_from_valid_seq_mask(
@@ -377,7 +468,13 @@ class SimulationPipeline:
                 + ", ".join(f"{name}={value.item():.6g}" for name, value in diagnostics.items())
             )
 
-        return {
-            'x_s': x_s_pred,
-            'diagnostics': {name: value.item() for name, value in diagnostics.items()},
+        result = {
+            "x_s": x_s_pred,
+            "diagnostics": {
+                name: value.item()
+                for name, value in diagnostics.items()
+            },
         }
+        if decoder_out is not None:
+            result["decoder_out"] = decoder_out
+        return result

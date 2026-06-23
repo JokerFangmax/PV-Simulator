@@ -1,4 +1,4 @@
-"""Physics-conditioned rigid-motion plus residual point-cloud decoder."""
+"""Physics-conditioned rigid alignment plus residual point-cloud decoder."""
 
 from __future__ import annotations
 
@@ -9,12 +9,12 @@ import torch.nn as nn
 class PhysicsEncoder(nn.Module):
     """Embed [stiffness, friction, restitution, mass] per object."""
 
-    def __init__(self, attr_dim: int = 4, physics_dim: int = 64):
+    def __init__(self, attr_dim: int = 4, out_dim: int = 64):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(attr_dim, physics_dim),
+            nn.Linear(attr_dim, out_dim),
             nn.SiLU(),
-            nn.Linear(physics_dim, physics_dim),
+            nn.Linear(out_dim, out_dim),
             nn.SiLU(),
         )
 
@@ -22,57 +22,133 @@ class PhysicsEncoder(nn.Module):
         return self.net(physics_attrs)
 
 
-def _rodrigues(axis_angle: torch.Tensor) -> torch.Tensor:
-    """Convert axis-angle rotations (..., 3) to matrices (..., 3, 3)."""
-    theta = torch.linalg.vector_norm(axis_angle, dim=-1, keepdim=True)
-    axis = axis_angle / theta.clamp_min(1e-8)
-    x, y, z = axis.unbind(dim=-1)
-    zeros = torch.zeros_like(x)
-    skew = torch.stack([
-        zeros, -z, y,
-        z, zeros, -x,
-        -y, x, zeros,
-    ], dim=-1).view(*axis.shape[:-1], 3, 3)
-    identity = torch.eye(3, device=axis.device, dtype=axis.dtype).expand_as(skew)
-    theta = theta.unsqueeze(-1)
-    return identity + torch.sin(theta) * skew + (1.0 - torch.cos(theta)) * (skew @ skew)
-
-
 class PhysicsConditionedRigidResidualDecoder(nn.Module):
-    """Decode backbone point features as SE(3) coarse motion plus deformation.
+    """Project predicted coordinates onto per-object rigid motion via Kabsch."""
 
-    ``stiffness`` is physics attribute 0.  It exactly suppresses residuals and
-    permits full rotation for rigid objects; soft objects receive the converse.
-    """
-
-    def __init__(self, latent_dim: int = 3, physics_dim: int = 64, hidden_dim: int = 256):
+    def __init__(self, physics_dim: int = 64, num_objects: int = 1):
         super().__init__()
-        self.physics_encoder = PhysicsEncoder(4, physics_dim)
-        self.object_trunk = nn.Sequential(
-            nn.Linear(latent_dim + physics_dim, hidden_dim), nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
+        self.physics_encoder = PhysicsEncoder(attr_dim=4, out_dim=physics_dim)
+        self.num_objects = num_objects
+
+        self.residual_mlp = nn.Sequential(
+            nn.Linear(3 + 3 + physics_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 3),
         )
-        self.pose_head = nn.Linear(hidden_dim, 6)
-        self.deformability_head = nn.Linear(hidden_dim, 1)
-        self.residual_head = nn.Sequential(
-            nn.Linear(latent_dim + physics_dim + 3, hidden_dim), nn.SiLU(),
-            nn.Linear(hidden_dim, 3),
+        self.deformability_gate = nn.Sequential(
+            nn.Linear(physics_dim, 1),
+            nn.Sigmoid(),
         )
-        nn.init.zeros_(self.pose_head.weight)
-        nn.init.zeros_(self.pose_head.bias)
-        nn.init.zeros_(self.residual_head[-1].weight)
-        nn.init.zeros_(self.residual_head[-1].bias)
+        nn.init.zeros_(self.residual_mlp[-1].weight)
+        nn.init.zeros_(self.residual_mlp[-1].bias)
 
     @staticmethod
-    def _object_mask(point_obj_idx, point_mask, num_objects):
+    def _object_mask(
+        point_obj_idx: torch.Tensor,
+        point_mask: torch.Tensor | None,
+        num_objects: int,
+    ) -> torch.Tensor:
         B, N = point_obj_idx.shape
-        mask = torch.zeros(B, num_objects, device=point_obj_idx.device, dtype=torch.bool)
+        object_mask = torch.zeros(
+            B, num_objects, device=point_obj_idx.device, dtype=torch.bool,
+        )
         for b in range(B):
-            valid = point_mask[b] if point_mask is not None else torch.ones(N, device=mask.device, dtype=torch.bool)
-            for obj_id in torch.unique(point_obj_idx[b][valid]).tolist():
-                if 0 <= obj_id < num_objects:
-                    mask[b, obj_id] = True
-        return mask
+            valid = (
+                point_mask[b]
+                if point_mask is not None
+                else torch.ones(N, device=point_obj_idx.device, dtype=torch.bool)
+            )
+            for object_id in torch.unique(point_obj_idx[b, valid]).tolist():
+                if 0 <= object_id < num_objects:
+                    object_mask[b, object_id] = True
+        return object_mask
+
+    def kabsch_alignment(
+        self,
+        source: torch.Tensor,
+        target: torch.Tensor,
+        point_obj_idx: torch.Tensor,
+        point_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fit per-object masked SE(3) transforms from source to target.
+
+        R uses a column-vector convention: target = R @ source + t.
+        Therefore row-vector points use source @ R.transpose(-1, -2) + t.
+        """
+        B, T, N, _ = target.shape
+        identity = torch.eye(3, device=target.device, dtype=target.dtype)
+        R = identity.view(1, 1, 1, 3, 3).expand(
+            B, T, self.num_objects, -1, -1,
+        ).clone()
+        t = target.new_zeros(B, T, self.num_objects, 3)
+
+        for b in range(B):
+            valid_points = (
+                point_mask[b]
+                if point_mask is not None
+                else torch.ones(N, device=target.device, dtype=torch.bool)
+            )
+
+            for object_id in range(self.num_objects):
+                object_points = (point_obj_idx[b] == object_id) & valid_points
+                num_points = int(object_points.sum().item())
+                if num_points == 0:
+                    continue
+
+                source_obj = source[b, object_points]       # (P, 3)
+                target_obj = target[b, :, object_points]    # (T, P, 3)
+
+                source_mean = source_obj.mean(dim=0)        # (3,)
+                target_mean = target_obj.mean(dim=1)        # (T, 3)
+
+                # Default and degenerate fallback: identity rotation plus
+                # centroid translation.
+                t[b, :, object_id] = target_mean - source_mean
+                if num_points < 3:
+                    continue
+
+                source_centered = source_obj - source_mean
+                target_centered = target_obj - target_mean.unsqueeze(1)
+                covariance = torch.einsum(
+                    "pi,tpj->tij",
+                    source_centered,
+                    target_centered,
+                )
+
+                U, singular_values, Vh = torch.linalg.svd(
+                    covariance,
+                    full_matrices=False,
+                )
+                non_degenerate = singular_values[:, -1] >= 1e-6
+                if not torch.any(non_degenerate):
+                    continue
+
+                U_valid = U[non_degenerate]
+                V_valid = Vh[non_degenerate].transpose(-1, -2)
+
+                # Kabsch reflection correction: R = V D U^T.
+                uncorrected_R = V_valid @ U_valid.transpose(-1, -2)
+                correction = identity.expand(
+                    uncorrected_R.shape[0], -1, -1,
+                ).clone()
+                correction[:, 2, 2] = torch.where(
+                    torch.det(uncorrected_R) < 0,
+                    correction.new_tensor(-1.0),
+                    correction.new_tensor(1.0),
+                )
+                fitted_R = V_valid @ correction @ U_valid.transpose(-1, -2)
+
+                R[b, non_degenerate, object_id] = fitted_R
+
+                rotated_source_mean = torch.matmul(
+                    source_mean.expand(fitted_R.shape[0], -1).unsqueeze(1),
+                    fitted_R.transpose(-1, -2),
+                ).squeeze(1)
+                t[b, non_degenerate, object_id] = (
+                    target_mean[non_degenerate] - rotated_source_mean
+                )
+
+        return R, t
 
     def forward(
         self,
@@ -82,65 +158,82 @@ class PhysicsConditionedRigidResidualDecoder(nn.Module):
         point_obj_idx: torch.Tensor,
         point_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Return final positions, SE(3) coarse positions, residual, and gates."""
+        """Return Kabsch-aligned positions and gated pointwise residuals."""
         B, T, N, C = latent.shape
-        num_objects = physics_attrs.shape[1]
+        if C != 3:
+            raise ValueError(f"latent must have 3 channels, got {C}")
         if canonical_points.shape != (B, N, 3):
-            raise ValueError(f"canonical_points must be {(B, N, 3)}, got {tuple(canonical_points.shape)}")
+            raise ValueError(
+                f"canonical_points must be {(B, N, 3)}, got "
+                f"{tuple(canonical_points.shape)}"
+            )
+        if physics_attrs.shape[:2] != (B, self.num_objects):
+            raise ValueError(
+                f"physics_attrs must be ({B}, {self.num_objects}, 4), got "
+                f"{tuple(physics_attrs.shape)}"
+            )
 
-        physics = self.physics_encoder(physics_attrs)
-        object_mask = self._object_mask(point_obj_idx, point_mask, num_objects)
-        pooled = latent.new_zeros(B, T, num_objects, C)
-        for b in range(B):
-            for obj_id in range(num_objects):
-                points = (point_obj_idx[b] == obj_id)
-                if point_mask is not None:
-                    points = points & point_mask[b]
-                if torch.any(points):
-                    pooled[b, :, obj_id] = latent[b, :, points].mean(dim=1)
+        physics_cond = self.physics_encoder(physics_attrs)
+        stiffness = physics_attrs[..., 0].clamp(0.0, 1.0)
+        deformability = (
+            (1.0 - stiffness).unsqueeze(-1)
+            * self.deformability_gate(physics_cond)
+        ).unsqueeze(1).expand(-1, T, -1, -1)
 
-        object_feature = self.object_trunk(torch.cat([
-            pooled, physics.unsqueeze(1).expand(-1, T, -1, -1),
-        ], dim=-1))
-        pose = self.pose_head(object_feature)
-        stiffness = physics_attrs[..., 0].clamp(0.0, 1.0).unsqueeze(1).unsqueeze(-1)
-        axis_angle = pose[..., :3] * stiffness
-        translation = pose[..., 3:]
-        learned_deformability = torch.sigmoid(self.deformability_head(object_feature))
-        deformability = (1.0 - stiffness) * learned_deformability
+        object_mask = self._object_mask(
+            point_obj_idx,
+            point_mask,
+            self.num_objects,
+        )
+        R, t = self.kabsch_alignment(
+            canonical_points,
+            latent,
+            point_obj_idx,
+            point_mask,
+        )
 
         coarse = latent.new_zeros(B, T, N, 3)
         for b in range(B):
-            for obj_id in range(num_objects):
-                points = (point_obj_idx[b] == obj_id)
+            for object_id in range(self.num_objects):
+                object_points = point_obj_idx[b] == object_id
                 if point_mask is not None:
-                    points = points & point_mask[b]
-                if not torch.any(points):
+                    object_points = object_points & point_mask[b]
+                if not torch.any(object_points):
                     continue
-                rotation = _rodrigues(axis_angle[b, :, obj_id])
-                template = canonical_points[b, points]
-                coarse[b, :, points] = (
-                    template.unsqueeze(0) @ rotation.transpose(-1, -2)
-                    + translation[b, :, obj_id].unsqueeze(1)
+
+                source_obj = canonical_points[b, object_points]
+                coarse[b, :, object_points] = (
+                    torch.matmul(
+                        source_obj.unsqueeze(0),
+                        R[b, :, object_id].transpose(-1, -2),
+                    )
+                    + t[b, :, object_id].unsqueeze(1)
                 )
 
-        point_object_idx = point_obj_idx.clamp(0, num_objects - 1)
-        physics_per_point = physics[:, None].expand(-1, T, -1, -1).gather(
-            2, point_object_idx[:, None, :, None].expand(-1, T, -1, physics.shape[-1]),
+        point_object_idx = point_obj_idx.clamp(0, self.num_objects - 1)
+        physics_per_point = physics_cond[:, None].expand(-1, T, -1, -1).gather(
+            2,
+            point_object_idx[:, None, :, None].expand(
+                -1, T, -1, physics_cond.shape[-1],
+            ),
         )
         deformability_per_point = deformability.gather(
-            2, point_object_idx[:, None, :, None].expand(-1, T, -1, 1),
+            2,
+            point_object_idx[:, None, :, None].expand(-1, T, -1, 1),
         )
-        residual = self.residual_head(torch.cat([
-            latent, physics_per_point, canonical_points[:, None].expand(-1, T, -1, -1),
+
+        residual = self.residual_mlp(torch.cat([
+            latent,
+            canonical_points[:, None].expand(-1, T, -1, -1),
+            physics_per_point,
         ], dim=-1)) * deformability_per_point
-        final = coarse + residual
-        # Frame 0 is a hard condition, not a prediction target.
-        coarse[:, 0] = canonical_points
-        residual[:, 0] = 0
-        final[:, 0] = canonical_points
+
+        if point_mask is not None:
+            residual = residual * point_mask[:, None, :, None].to(residual.dtype)
+
+        positions = coarse + residual
         return {
-            "positions": final,
+            "positions": positions,
             "coarse_positions": coarse,
             "residual": residual,
             "deformability": deformability,

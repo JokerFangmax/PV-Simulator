@@ -801,3 +801,188 @@ exp rerun new_physics_50
 exp new_physics_50_mse
 
 /data/fhr/projects/PV-Simulator/scripts/pv_simulator/train_stage1.py --dataset_type movi --data_root /data/fhr/kubric/new_output/movi_physics_50 --ae_ckpt_dir outputs/stage0/diag/stage_mlp/causal-mae-long-fp32-50k/final --output_dir outputs/stage1/new-physics-50-point-mse --padded_batch --max_objects 1 --max_T_raw 21 --max_points_per_object 200 --num_train_epochs 800 --max_train_steps 5000 --lr_warmup_steps 300 --train_batch_size 4 --gradient_accumulation_steps 2 --mixed_precision no --dataloader_num_workers 4 --d_sim 512 --sim_ffn_dim 2048 --use_factorized_attention --use_temporal_correspondence --use_temporal_rope --use_raw_point_mse_target --lambda_diffusion 1.0 --lambda_vel 0.2 --lambda_local_dist 0.2 --lambda_covariance 0.0 --lambda_chamfer 0.0 --lambda_momentum 0.1 --lambda_floor 0.1 --gravity_axis z --report_to wandb --wandb_project pv-simulator-stage1 --wandb_run_name new-physics-50-point-mse --vis_steps 200 --num_vis_samples 4
+
+------
+
+exp 
+
+CUDA_VISIBLE_DEVICES=4 /data/fhr/miniconda3/envs/videox/bin/accelerate launch --num_processes=1 scripts/pv_simulator/train_stage1.py \
+  --use_physics_conditioned_decoder \
+  --lambda_physics_point 1.0 \
+  --lambda_chamfer_coarse 0.5 \
+  --lambda_residual_reg 0.1 \
+  --lambda_residual_mag 0.1 \
+  --dataset_type movi \
+  --data_root /data/fhr/kubric/new_output/movi_physics_50 \
+  --ae_ckpt_dir outputs/stage0/diag/stage_mlp/causal-mae-long-fp32-50k/final \
+  --output_dir outputs/stage1/new-physics-50-rigid-residual-v2 \
+  --padded_batch \
+  --max_objects 1 \
+  --max_T_raw 21 \
+  --max_points_per_object 200 \
+  --num_train_epochs 800 \
+  --max_train_steps 5000 \
+  --lr_warmup_steps 300 \
+  --train_batch_size 4 \
+  --gradient_accumulation_steps 2 \
+  --mixed_precision no \
+  --dataloader_num_workers 4 \
+  --d_sim 512 \
+  --sim_ffn_dim 2048 \
+  --use_factorized_attention \
+  --use_temporal_correspondence \
+  --use_temporal_rope \
+  --lambda_diffusion 1.0 \
+  --lambda_vel 0.2 \
+  --lambda_local_dist 0.2 \
+  --lambda_momentum 0.1 \
+  --lambda_floor 0.1 \
+  --gravity_axis z \
+  --report_to wandb \
+  --wandb_project pv-simulator-stage1 \
+  --wandb_run_name new-physics-50-rigid-residual-v2 \
+  --vis_steps 200 \
+  --num_vis_samples 4
+
+-----
+
+exp redesign physicsdecoder
+
+## Task: Redesign PhysicsDecoder to Use Full Geometry for Pose Prediction
+
+### Current Fatal Flaw (Confirmed)
+The existing `PhysicsConditionedRigidResidualDecoder` at `/data/fhr/projects/PV-Simulator/videox_fun/models/physics_rigid_decoder.py` pools per-object latent via:
+
+```python
+pooled[b, :, obj_id] = latent[b, :, points].mean(dim=1)
+```
+
+This mean-pooling discards all shape/rotation information. The SE(3) pose head (axis-angle + translation) therefore cannot predict rotation from a centroid alone. For rigid bodies (`stiffness=1.0`, `deformability=0`, `residual=0`), the output is purely `SE3(canonical)` with wrong rotation, causing trajectories to be completely incorrect.
+
+### Redesign Requirements
+
+#### 1. Pose Prediction Must Use Full Geometry
+Replace the centroid-pooling pose prediction with a **differentiable correspondence-based rigid alignment** or **geometry-aware pose prediction**.
+
+Recommended approach (choose one, justify your choice):
+
+**Option A: Differentiable Kabsch/Procrustes SE3**
+- Do NOT predict axis-angle/translation from a pooled vector.
+- Instead, compute the optimal rigid transformation between `canonical_points` and `pred_x0_pos_raw` using differentiable Kabsch algorithm (SVD-based).
+- The "pose network" is replaced by a differentiable geometry solver.
+- Input to the solver: `canonical_points` and `pred_x0_pos_raw` (both `[B, T, N, 3]`).
+- Output: `R` (rotation matrix) and `t` (translation) per object per timestep.
+- This guarantees the coarse output is the **best rigid fit** to the predicted coordinates, not a learned guess from a centroid.
+
+**Option B: PointNet-style Feature Aggregation**
+- If you must keep a learned pose head, aggregate per-point features using max-pooling (not mean-pooling) over the full point cloud to preserve shape information.
+- Use a small PointNet/MLP on `canonical_points` to extract a rotation-equivariant feature.
+- Predict SE3 from this full-shape feature.
+
+**Option C: Hybrid**
+- Use Kabsch to compute initial SE3 from `pred_x0_pos_raw` vs `canonical`.
+- Use a small residual network to predict a correction delta to the Kabsch SE3 (for handling soft bodies later).
+
+We recommend **Option A** for rigid bodies because it is deterministic, differentiable, and guaranteed to find the optimal rigid alignment. It also removes the "pose network" entirely, eliminating the gradient bottleneck.
+
+#### 2. Residual Branch Design
+- For rigid bodies (`stiffness=1.0`), residual should remain near zero.
+- For future soft bodies, residual should be per-point and conditioned on physics.
+- The residual head should take per-point latent (not pooled) and output per-point displacement.
+
+#### 3. Inference Pipeline Integration (CRITICAL)
+The `SimulationPipeline` at `/data/fhr/projects/PV-Simulator/videox_fun/pipeline/pipeline_simulation.py` currently does NOT load or use `physics_decoder.pt`. You must:
+
+- Add `physics_decoder` parameter to `SimulationPipeline.__init__`.
+- Load `physics_decoder.pt` from the checkpoint directory in `from_pretrained` or initialization.
+- In the forward pass, after `ae.decode()` produces coordinates, pass them through `physics_decoder` (with `canonical_points` from the first frame, `physics_attrs`, and `point_obj_idx`).
+- Return the decoder's output as the final prediction.
+
+#### 4. Training Loop Compatibility
+The redesigned decoder must maintain the same interface as the current one so `train_stage1.py` requires minimal changes:
+
+```python
+decoder_out = physics_decoder(
+    latent=pred_x0_pos_raw,          # (B, T, N, 3)
+    canonical_points=canonical_points, # (B, N, 3)
+    physics_attrs=physics_attrs,       # (B, num_objects, 4)
+    point_obj_idx=point_obj_idx,       # (B, N)
+    point_mask=point_mask,             # (B, N)
+)
+```
+
+Return dict must contain:
+```python
+{
+    "positions":        (B, T, N, 3),  # final output
+    "coarse_positions": (B, T, N, 3),  # SE3-only output
+    "residual":         (B, T, N, 3),  # deformation residual
+    "deformability":    (B, T, num_objects, 1),  # learned gate
+}
+```
+
+### Step-by-Step Implementation
+
+Please do the following:
+
+1. **Read** the current `physics_rigid_decoder.py` and `pipeline_simulation.py`.
+2. **Propose** which option (A, B, or C) you will implement and why.
+3. **Implement** the redesigned `PhysicsConditionedRigidResidualDecoder` in `physics_rigid_decoder.py`.
+4. **Implement** the `SimulationPipeline` modifications to load and use the decoder.
+5. **Show** the exact code changes for both files.
+
+### Critical Constraints
+- Use pure PyTorch for Kabsch/Procrustes (no `torchgeometry`, `scipy`, `opencv`).
+- The Kabsch implementation must handle the case where `pred_x0_pos_raw` and `canonical_points` may have different per-object point counts (use `point_obj_idx` to separate objects).
+- Frame-0 bypass in training should still work: `pred_points[:, 0] = pred_x0_pos_raw[:, 0]`.
+- Rigid-only (`stiffness=1.0`) behavior: `coarse_positions` should be the Kabsch-aligned canonical, `residual` should be near zero, `positions` should equal `coarse_positions`.
+- Do not modify `train_stage1.py` yet; we will handle that after decoder redesign is confirmed.
+
+### Verification
+After implementation, we will verify:
+- `coarse_positions` for rigid bodies is exactly the Kabsch alignment of canonical to `pred_x0_pos_raw`.
+- `deformability_mean` is near 0 for rigid data.
+- Inference pipeline outputs match training outputs.
+
+Please proceed with Step 1 (read files) and Step 2 (propose option) now.
+
+----
+
+exp kabsch
+
+CUDA_VISIBLE_DEVICES=4 /data/fhr/miniconda3/envs/videox/bin/accelerate launch --num_processes=1 scripts/pv_simulator/train_stage1.py \
+  --use_physics_conditioned_decoder \
+  --lambda_chamfer_coarse 0.5 \
+  --lambda_residual_reg 0.1 \
+  --lambda_residual_mag 0.1 \
+  --dataset_type movi \
+  --data_root /data/fhr/kubric/new_output/movi_physics_50 \
+  --ae_ckpt_dir outputs/stage0/diag/stage_mlp/causal-mae-long-fp32-50k/final \
+  --output_dir outputs/stage1/new-physics-50-kabsch-rigid \
+  --padded_batch \
+  --max_objects 1 \
+  --max_T_raw 21 \
+  --max_points_per_object 200 \
+  --num_train_epochs 800 \
+  --max_train_steps 5000 \
+  --lr_warmup_steps 300 \
+  --train_batch_size 4 \
+  --gradient_accumulation_steps 2 \
+  --mixed_precision no \
+  --dataloader_num_workers 4 \
+  --d_sim 512 \
+  --sim_ffn_dim 2048 \
+  --use_factorized_attention \
+  --use_temporal_correspondence \
+  --use_temporal_rope \
+  --lambda_diffusion 1.0 \
+  --lambda_vel 0.2 \
+  --lambda_local_dist 0.2 \
+  --lambda_momentum 0.1 \
+  --lambda_floor 0.1 \
+  --gravity_axis z \
+  --report_to wandb \
+  --wandb_project pv-simulator-stage1 \
+  --wandb_run_name new-physics-50-kabsch-rigid \
+  --vis_steps 200 \
+  --num_vis_samples 4

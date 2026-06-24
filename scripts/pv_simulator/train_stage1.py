@@ -146,6 +146,12 @@ def parse_args():
                              "so batch_size > 1 can be used with variable-length data.")
     parser.add_argument("--max_T_raw", type=int, default=21,
                         help="Max raw frame count in padded batch mode (must be 4k+1). Default: 21.")
+    parser.add_argument("--use_raw_transformer", action="store_true",
+                        help="Stage-1-only ablation: operate directly on raw (position, velocity) "
+                             "trajectories instead of AE-compressed state latents.")
+    parser.add_argument("--center_on_contact", action="store_true",
+                        help="For MOVi padded batches, crop each trajectory to a max_T_raw window "
+                             "centred on its first metadata contact frame. Defaults to the initial window.")
     parser.add_argument("--max_points_per_object", type=int, default=200,
                         help="Max surface points per object in padded batch mode. "
                              "max_N = max_objects * max_points_per_object. Default: 200.")
@@ -208,6 +214,26 @@ def parse_args():
                         help="Weight for direct Kabsch rotation-matrix supervision.")
     parser.add_argument("--lambda_rotation_temporal", type=float, default=0.0,
                         help="Weight for relative Kabsch rotation consistency across frames.")
+    parser.add_argument("--lambda_deformation_gradient", type=float, default=0.0,
+                        help="Weight for local deformation-gradient matching on canonical k-NN neighborhoods.")
+    parser.add_argument("--lambda_local_volume", type=float, default=0.0,
+                        help="Weight for local log-volume-change matching derived from deformation gradients.")
+    parser.add_argument("--lambda_local_covariance", type=float, default=0.0,
+                        help="Weight for per-particle local covariance/anisotropy matching.")
+    # Direction A: ramp auxiliary physics terms after the shape objective stabilizes.
+    parser.add_argument("--physics_loss_warmup_steps", type=int, default=0,
+                        help="Ramp physics auxiliary losses from 0 to 1 over this many optimizer steps. 0 disables.")
+    # Direction B: staged parameter freezing for ablations.
+    parser.add_argument("--training_stage", type=str, default="joint",
+                        choices=["joint", "shape_only", "physics_only"],
+                        help="joint=all trainable; shape_only=freeze decoder; physics_only=train output head plus decoder.")
+    # Direction C: rotate predicted velocities into the GT Kabsch frame before vector MSE.
+    parser.add_argument("--velocity_coord_align", action="store_true",
+                        help="Align predicted velocity vectors to the GT object frame for velocity-vector supervision.")
+    # Direction D: choose an independently testable subset of physics losses.
+    parser.add_argument("--physics_mode", type=str, default="full",
+                        choices=["full", "minimal", "shape_only"],
+                        help="full=all enabled losses; minimal=rotation/centroid/local-dist only; shape_only=disable physics auxiliaries.")
     parser.add_argument("--lambda_chamfer", type=float, default=0.01,
                         help="Weight for per-frame raw-position Chamfer distance loss.")
     parser.add_argument("--lambda_momentum", type=float, default=0.01,
@@ -289,6 +315,8 @@ def parse_args():
         parser.error("--sim_metrics_steps must be >= 0")
     if args.initial_global_step < 0:
         parser.error("--initial_global_step must be >= 0")
+    if args.physics_loss_warmup_steps < 0:
+        parser.error("--physics_loss_warmup_steps must be >= 0")
     if args.resume_from_checkpoint and args.init_from_model_dir:
         parser.error("Use only one of --resume_from_checkpoint and --init_from_model_dir")
     if args.initial_global_step and not args.init_from_model_dir:
@@ -296,6 +324,7 @@ def parse_args():
     for name in (
         "lambda_diffusion", "lambda_vel", "lambda_ang_vel", "lambda_velocity_vector",
         "lambda_velocity_accel", "lambda_centroid", "lambda_rotation", "lambda_rotation_temporal",
+        "lambda_deformation_gradient", "lambda_local_volume", "lambda_local_covariance",
         "lambda_local_dist", "lambda_covariance", "lambda_chamfer",
         "lambda_momentum", "lambda_floor", "lambda_chamfer_coarse", "lambda_residual_reg",
         "lambda_residual_mag", "lambda_physics_point",
@@ -307,7 +336,8 @@ def parse_args():
 
 
 def _run_vis(vis_samples, sim_transformer, ae, sim_cond_embedder,
-             global_step, device, weight_dtype, num_inference_steps, fps, anchor_mode, physics_decoder=None):
+             global_step, device, weight_dtype, num_inference_steps, fps, anchor_mode,
+             physics_decoder=None, use_raw_transformer=False):
     """Run inference on fixed samples, render GT+pred videos, and log to wandb.
 
     Must be called on main process only. Imports wandb and pipeline lazily so
@@ -315,7 +345,8 @@ def _run_vis(vis_samples, sim_transformer, ae, sim_cond_embedder,
     """
     import wandb
     from diffusers import FlowMatchEulerDiscreteScheduler
-    from videox_fun.pipeline.pipeline_simulation import SimulationPipeline
+    if not use_raw_transformer:
+        from videox_fun.pipeline.pipeline_simulation import SimulationPipeline
 
     # visualize.py lives in the same directory — defer import so matplotlib
     # backend is set inside (it calls matplotlib.use('Agg') at import time).
@@ -324,14 +355,16 @@ def _run_vis(vis_samples, sim_transformer, ae, sim_cond_embedder,
         sys.path.insert(0, _vis_dir)
     from visualize import visualize_point_cloud_motion
 
-    pipeline = SimulationPipeline(
-        sim_transformer=sim_transformer,
-        ae=ae,
-        sim_cond_embedder=sim_cond_embedder,
-        physics_decoder=physics_decoder,
-        scheduler=FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000),
-        anchor_mode=anchor_mode,
-    )
+    pipeline = None
+    if not use_raw_transformer:
+        pipeline = SimulationPipeline(
+            sim_transformer=sim_transformer,
+            ae=ae,
+            sim_cond_embedder=sim_cond_embedder,
+            physics_decoder=physics_decoder,
+            scheduler=FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000),
+            anchor_mode=anchor_mode,
+        )
 
     log_dict = {}
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -353,17 +386,78 @@ def _run_vis(vis_samples, sim_transformer, ae, sim_cond_embedder,
             x_s_init      = x_s_raw[:, :1, :, :]                          # (1, 1, N, 6)
 
             T_raw = x_s_raw.shape[1]
-            T = (T_raw - 1) // 4 + 1
+            if use_raw_transformer:
+                # Stage-1 raw-mode sampler.  The production SimulationPipeline
+                # intentionally remains latent-only; this branch is only for
+                # validating raw-transformer checkpoints during Stage 1.
+                T = T_raw
+                B, _, N, _ = x_s_raw.shape
+                init_padded = x_s_init.expand(-1, T, -1, -1).contiguous()
+                init_mask = torch.ones(B, T, N, 1, device=device, dtype=weight_dtype)
+                init_mask[:, :1] = 0.0
+                point_anchor = _compute_point_anchor(
+                    x_s_init, point_obj_idx, anchor_mode,
+                ).to(device=device, dtype=weight_dtype)
+                if sim_transformer.d_anchor == 0:
+                    point_anchor = point_anchor[..., :0]
+                point_anchor = point_anchor.expand(-1, T, -1, -1).contiguous()
+                with torch.no_grad(), torch.amp.autocast("cuda", dtype=weight_dtype):
+                    c_sim = sim_cond_embedder(
+                        c_floor=c_floor,
+                        c_id=c_id,
+                        c_mat=c_mat,
+                        c_mass=c_mass,
+                        c_static=c_static,
+                        c_force_enc=c_force_raw,
+                        point_obj_idx=point_obj_idx,
+                        T=T,
+                        point_mask=None,
+                    )
+                    raw_sample = torch.randn(B, T, N, 6, device=device, dtype=weight_dtype)
+                    raw_sample[:, :1] = x_s_init
+                    scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
+                    scheduler.set_timesteps(num_inference_steps, device=device)
+                    for timestep in scheduler.timesteps:
+                        timestep_batch = timestep.unsqueeze(0)
+                        pred_raw = sim_transformer(
+                            raw_sample, init_padded, init_mask, point_anchor, c_sim,
+                            timestep_batch, dtype=weight_dtype,
+                        )
+                        raw_sample = scheduler.step(
+                            pred_raw, timestep, raw_sample,
+                        ).prev_sample
+                        raw_sample[:, :1] = x_s_init
 
-            with torch.amp.autocast("cuda", dtype=weight_dtype):
-                result = pipeline(
-                    c_floor=c_floor, c_id=c_id, c_mat=c_mat, c_mass=c_mass,
-                    c_static=c_static, c_force_raw=c_force_raw,
-                    x_s_init=x_s_init,
-                    point_obj_idx=point_obj_idx, T=T,
-                    num_inference_steps=num_inference_steps, show_progress=False,
-                )
-            x_s_pred = result['x_s'][0].float().cpu()   # (T_raw, N, 6)
+                    if physics_decoder is not None:
+                        physics_attrs = torch.ones(
+                            B, physics_decoder.num_objects, 4,
+                            device=device, dtype=torch.float32,
+                        )
+                        physics_attrs[:, :, 0] = 1.0
+                        point_mask = torch.ones(B, N, device=device, dtype=torch.bool)
+                        decoder_out = physics_decoder(
+                            latent=raw_sample[..., :3].float(),
+                            canonical_points=x_s_init[:, 0, :, :3].float(),
+                            physics_attrs=physics_attrs,
+                            point_obj_idx=point_obj_idx,
+                            point_mask=point_mask,
+                        )
+                        raw_sample[..., :3] = torch.cat(
+                            [raw_sample[:, :1, :, :3], decoder_out["positions"][:, 1:]],
+                            dim=1,
+                        ).to(raw_sample.dtype)
+                x_s_pred = raw_sample[0].float().cpu()
+            else:
+                T = (T_raw - 1) // 4 + 1
+                with torch.amp.autocast("cuda", dtype=weight_dtype):
+                    result = pipeline(
+                        c_floor=c_floor, c_id=c_id, c_mat=c_mat, c_mass=c_mass,
+                        c_static=c_static, c_force_raw=c_force_raw,
+                        x_s_init=x_s_init,
+                        point_obj_idx=point_obj_idx, T=T,
+                        num_inference_steps=num_inference_steps, show_progress=False,
+                    )
+                x_s_pred = result['x_s'][0].float().cpu()   # (T_raw, N, 6)
 
             gt_np  = sample['x_s_raw']        # (T_raw, N, 6) — numpy/tensor from dataset
             obj_np = sample['point_obj_idx']   # (N,)
@@ -835,6 +929,139 @@ def _compute_rotation_consistency_losses(
     return absolute_loss, temporal_loss
 
 
+def _align_velocity_to_gt_frame(
+    velocity_pred: torch.Tensor,
+    pos_pred: torch.Tensor,
+    pos_gt: torch.Tensor,
+    canonical_points: torch.Tensor,
+    point_obj_idx: torch.Tensor,
+    point_mask: torch.Tensor | None,
+    num_objects: int,
+) -> torch.Tensor:
+    """Direction C: map predicted velocity vectors into each GT object frame.
+
+    If R_pred and R_gt map canonical coordinates to predicted and GT frames,
+    A = R_gt @ R_pred^T maps a predicted-frame vector into the GT frame.
+    Translation is deliberately absent because velocity vectors are translationally
+    invariant.
+    """
+    rotations_pred, valid_pred = _fit_kabsch_rotations(
+        canonical_points, pos_pred, point_obj_idx, point_mask, num_objects,
+    )
+    rotations_gt, valid_gt = _fit_kabsch_rotations(
+        canonical_points, pos_gt, point_obj_idx, point_mask, num_objects,
+    )
+    alignment = rotations_gt @ rotations_pred.transpose(-1, -2)
+    aligned_velocity = velocity_pred.clone()
+    B, T_raw, N, _ = velocity_pred.shape
+    for b in range(B):
+        valid_points = (
+            point_mask[b]
+            if point_mask is not None
+            else torch.ones(N, device=velocity_pred.device, dtype=torch.bool)
+        )
+        for object_id in range(num_objects):
+            if not torch.any(valid_pred[b, :, object_id] & valid_gt[b, :, object_id]):
+                continue
+            object_points = (point_obj_idx[b] == object_id) & valid_points
+            if not torch.any(object_points):
+                continue
+            aligned_velocity[b, :, object_points] = torch.matmul(
+                velocity_pred[b, :, object_points],
+                alignment[b, :, object_id].transpose(-1, -2),
+            )
+    return aligned_velocity
+
+
+def _compute_local_geometry_losses(
+    pos_pred: torch.Tensor,
+    pos_gt: torch.Tensor,
+    point_obj_idx: torch.Tensor,
+    point_mask: torch.Tensor | None,
+    valid_frame_mask: torch.Tensor | None,
+    k: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Match local deformation, volume, and covariance on canonical k-NN charts.
+
+    For reference offsets dX from GT frame 0 and current offsets dx,
+    ``F = sum_j dx_j outer dX_j @ (sum_j dX_j outer dX_j + eps I)^-1``.
+    ``det(F)`` is the local volume-change proxy and
+    ``C = mean_j(dx_j outer dx_j)`` is a local covariance/anisotropy field.
+    """
+    device = pos_pred.device
+    B, T_raw, N, _ = pos_pred.shape
+    deformation_total = pos_pred.new_tensor(0.0)
+    volume_total = pos_pred.new_tensor(0.0)
+    covariance_total = pos_pred.new_tensor(0.0)
+    total_weight = pos_pred.new_tensor(0.0)
+    identity = torch.eye(3, device=device, dtype=pos_pred.dtype)
+
+    for b in range(B):
+        valid_points = (
+            point_mask[b]
+            if point_mask is not None
+            else torch.ones(N, device=device, dtype=torch.bool)
+        )
+        valid_frames = (
+            valid_frame_mask[b]
+            if valid_frame_mask is not None
+            else torch.ones(T_raw, device=device, dtype=torch.bool)
+        )
+        frame_idx = valid_frames.nonzero(as_tuple=True)[0]
+        frame_idx = frame_idx[frame_idx > 0]
+        if frame_idx.numel() == 0:
+            continue
+
+        for object_id in torch.unique(point_obj_idx[b][valid_points]).tolist():
+            object_idx = ((point_obj_idx[b] == object_id) & valid_points).nonzero(
+                as_tuple=True,
+            )[0]
+            num_points = object_idx.numel()
+            if num_points < 2:
+                continue
+
+            reference = pos_gt[b, 0, object_idx]
+            pairwise = torch.cdist(reference, reference)
+            pairwise.fill_diagonal_(torch.finfo(pairwise.dtype).max)
+            k_eff = min(k, num_points - 1)
+            neighbors = torch.topk(pairwise, k=k_eff, largest=False).indices
+            reference_offsets = reference.unsqueeze(1) - reference[neighbors]
+
+            # (P, 3, 3), regularized local reference chart inverse.
+            reference_chart = torch.einsum(
+                "pki,pkj->pij", reference_offsets, reference_offsets,
+            ) / k_eff
+            reference_chart_inv = torch.linalg.inv(reference_chart + 1e-6 * identity)
+
+            pred_points = pos_pred[b, frame_idx][:, object_idx]
+            gt_points = pos_gt[b, frame_idx][:, object_idx]
+            pred_offsets = pred_points.unsqueeze(2) - pred_points[:, neighbors]
+            gt_offsets = gt_points.unsqueeze(2) - gt_points[:, neighbors]
+
+            pred_cross = torch.einsum("fpki,pkj->fpij", pred_offsets, reference_offsets) / k_eff
+            gt_cross = torch.einsum("fpki,pkj->fpij", gt_offsets, reference_offsets) / k_eff
+            F_pred = pred_cross @ reference_chart_inv
+            F_gt = gt_cross @ reference_chart_inv
+
+            covariance_pred = torch.einsum("fpki,fpkj->fpij", pred_offsets, pred_offsets) / k_eff
+            covariance_gt = torch.einsum("fpki,fpkj->fpij", gt_offsets, gt_offsets) / k_eff
+            log_volume_pred = torch.log(torch.linalg.det(F_pred).abs().clamp_min(1e-6))
+            log_volume_gt = torch.log(torch.linalg.det(F_gt).abs().clamp_min(1e-6))
+
+            weight = frame_idx.numel() * num_points
+            deformation_total = deformation_total + (F_pred - F_gt).square().mean() * weight
+            volume_total = volume_total + (log_volume_pred - log_volume_gt).square().mean() * weight
+            covariance_total = covariance_total + (covariance_pred - covariance_gt).square().mean() * weight
+            total_weight = total_weight + weight
+
+    normalizer = total_weight.clamp_min(1)
+    return (
+        deformation_total / normalizer,
+        volume_total / normalizer,
+        covariance_total / normalizer,
+    )
+
+
 def _compute_momentum_loss(
     velocity_pred: torch.Tensor,
     velocity_gt: torch.Tensor,
@@ -1007,20 +1234,30 @@ def main():
     for p in ae.parameters():
         p.requires_grad_(False)
     d_latent = ae.d_latent
-    d_state_actual = 2 * d_latent  # pos + vel AE latents concatenated
+    d_state_actual = 6 if args.use_raw_transformer else 2 * d_latent
     if args.d_state != d_state_actual:
         logger.warning(
             f"--d_state={args.d_state} overridden to {d_state_actual} "
-            f"(2 * AE d_latent={d_latent})"
+            + (
+                "for --use_raw_transformer"
+                if args.use_raw_transformer
+                else f"(2 * AE d_latent={d_latent})"
+            )
         )
         args.d_state = d_state_actual
-    logger.info(f"Loaded frozen CausalAE from {args.ae_ckpt_dir} (d_latent={d_latent})")
+    logger.info(
+        "Loaded frozen CausalAE from %s (d_latent=%s); Stage-1 state representation=%s",
+        args.ae_ckpt_dir,
+        d_latent,
+        "raw" if args.use_raw_transformer else "latent",
+    )
 
     # --- Build Models ---
-    # d_force = 2 * d_latent to match the AE-encoded force+contact representation.
+    # Raw mode keeps force/contact at the native temporal resolution so that
+    # c_sim has the same 21-frame timeline as the raw state trajectory.
     sim_cond_embedder = SimConditionEmbedder(
         max_objects=args.max_objects,
-        d_force=2 * d_latent,
+        d_force=6 if args.use_raw_transformer else 2 * d_latent,
     )
     d_cond = sim_cond_embedder.d_cond
 
@@ -1036,6 +1273,7 @@ def main():
         use_temporal_correspondence=args.use_temporal_correspondence,
         use_temporal_rope=args.use_temporal_rope,
         use_object_local_attention=args.use_object_local_attention,
+        input_representation="raw" if args.use_raw_transformer else "latent",
     )
 
     physics_decoder = None
@@ -1108,6 +1346,37 @@ def main():
         # Keep this module FP32 because its specified physics attributes are FP32.
         physics_decoder.to(accelerator.device)
 
+    # Direction B: parameter-stage ablations. The rigid Kabsch transform is
+    # parameter-free, so physics_only retains SimTransformer's output head to
+    # preserve a gradient path from coordinate-space physics losses.
+    if args.training_stage == "shape_only" and physics_decoder is not None:
+        for parameter in physics_decoder.parameters():
+            parameter.requires_grad_(False)
+        logger.info("training_stage=shape_only: physics decoder parameters frozen")
+    elif args.training_stage == "physics_only":
+        for parameter in sim_transformer.parameters():
+            parameter.requires_grad_(False)
+        for parameter in sim_cond_embedder.parameters():
+            parameter.requires_grad_(False)
+        output_head_params = [
+            parameter
+            for name, parameter in sim_transformer.named_parameters()
+            if name.startswith("head_proj")
+        ]
+        if not output_head_params:
+            raise RuntimeError(
+                "training_stage=physics_only requires SimTransformer.head_proj parameters"
+            )
+        for parameter in output_head_params:
+            parameter.requires_grad_(True)
+        if physics_decoder is not None:
+            for parameter in physics_decoder.parameters():
+                parameter.requires_grad_(True)
+        logger.info(
+            "training_stage=physics_only: frozen transformer trunk/condition embedder; "
+            "training output head and decoder parameters"
+        )
+
     # Count parameters
     total_params = (
         sum(p.numel() for p in sim_transformer.parameters()) +
@@ -1127,12 +1396,19 @@ def main():
     else:
         optimizer_cls = torch.optim.AdamW
 
-    trainable_params = (
-        list(sim_transformer.parameters()) +
-        list(sim_cond_embedder.parameters())
-    )
+    trainable_params = [
+        parameter
+        for parameter in (
+            list(sim_transformer.parameters()) + list(sim_cond_embedder.parameters())
+        )
+        if parameter.requires_grad
+    ]
     if physics_decoder is not None:
-        trainable_params += list(physics_decoder.parameters())
+        trainable_params += [
+            parameter for parameter in physics_decoder.parameters() if parameter.requires_grad
+        ]
+    if not trainable_params:
+        raise RuntimeError("No trainable parameters remain after applying --training_stage")
 
 
     optimizer = optimizer_cls(
@@ -1148,6 +1424,8 @@ def main():
         train_dataset = MoviSimulationDataset(
             data_root=args.data_root,
             max_objects=args.max_objects,
+            max_T_raw=args.max_T_raw if args.padded_batch else None,
+            center_on_contact=args.center_on_contact,
         )
     else:
         train_dataset = SimulationDataset(
@@ -1183,7 +1461,8 @@ def main():
         logger.info(
             f"Padded batch mode enabled: max_T_raw={args.max_T_raw}, "
             f"max_objects={args.max_objects}, max_points_per_object={args.max_points_per_object}, "
-            f"max_N={args.max_objects * args.max_points_per_object}"
+            f"max_N={args.max_objects * args.max_points_per_object}, "
+            f"center_on_contact={args.center_on_contact}"
         )
     else:
         collate_fn = sim_collate_fn
@@ -1318,22 +1597,27 @@ def main():
                     point_mask = None
                     T_raw_tensor = None
 
-                # --- Encode x_s_raw and c_force_raw once via frozen AE (LDM-style) ---
+                # --- Build latent or raw Stage-1 state representation ---
                 B_sz = x_s_raw.shape[0]
                 T_raw_dim = x_s_raw.shape[1]
                 N_sz = x_s_raw.shape[2]
                 bsz = B_sz
-                with torch.no_grad():
-                    pos_enc = ae.encode(x_s_raw[..., :3])        # (B, T, N, d_latent)
-                    vel_enc = ae.encode(x_s_raw[..., 3:6])       # (B, T, N, d_latent)
-                    # c_force_raw: force(3) and contact(3) each → d_latent via frozen AE
-                    force_enc   = ae.encode(c_force_raw[..., :3])
-                    contact_enc = ae.encode(c_force_raw[..., 3:6])
-                x_s_enc = torch.cat([pos_enc, vel_enc], dim=-1)  # (B, T, N, d_state)
-                c_force_enc = torch.cat([force_enc, contact_enc], dim=-1)  # (B, T, N, d_force)
+                if args.use_raw_transformer:
+                    # Preserve all raw frames for both state and time-varying
+                    # force/contact conditions. No AE encode/decode is used.
+                    x_s_enc = x_s_raw
+                    c_force_enc = c_force_raw
+                else:
+                    with torch.no_grad():
+                        pos_enc = ae.encode(x_s_raw[..., :3])
+                        vel_enc = ae.encode(x_s_raw[..., 3:6])
+                        force_enc = ae.encode(c_force_raw[..., :3])
+                        contact_enc = ae.encode(c_force_raw[..., 3:6])
+                    x_s_enc = torch.cat([pos_enc, vel_enc], dim=-1)
+                    c_force_enc = torch.cat([force_enc, contact_enc], dim=-1)
                 T = x_s_enc.shape[1]
 
-                # --- Flow matching noise (in latent space) ---
+                # --- Flow-matching noise in the selected state representation ---
                 noise = torch.randn_like(x_s_enc)   # (B, T, N, d_state)
 
                 if not args.uniform_sampling:
@@ -1359,25 +1643,25 @@ def main():
                 while len(sigma.shape) < x_s_enc.ndim:
                     sigma = sigma.unsqueeze(-1)
 
-                # Noisy latents: zt = (1 - sigma) * z + sigma * noise.
+                # Noisy state: zt = (1 - sigma) * z + sigma * noise.
                 # Keep frame 0 fixed so Stage 1 conditions on the true initial state
                 # instead of trying to regenerate it.
                 noisy_x_s_enc = (1.0 - sigma) * x_s_enc + sigma * noise # (B, T, N, d_state)
                 noisy_x_s_enc[:, :1] = x_s_enc[:, :1]
 
-                # Flow matching target (latent space): velocity = noise - z
+                # Flow-matching target: velocity = noise - z
                 target = noise - x_s_enc    # sigma(t) = t          (B, T, N, d_state)
 
                 # --- Initial frame conditioning ---
-                # Repeat frame-0 latent on every timestep token. Zero-padding the
+                # Repeat frame-0 state on every timestep token. Zero-padding the
                 # future steps removed the strongest per-point identity signal and
                 # forced the model to rely on a weak 3D anchor plus object-level
                 # conditions, which is a direct source of identity ambiguity.
-                init_enc_1 = x_s_enc[:, :1]  # (B, 1, N, d_state) — already encoded, no grad
+                init_enc_1 = x_s_enc[:, :1]  # (B, 1, N, d_state)
                 init_enc_padded = init_enc_1.expand(-1, T, -1, -1).contiguous()  # (B, T, N, d_state)
                 init_mask = torch.ones(B_sz, T, N_sz, 1,
                                        device=accelerator.device, dtype=weight_dtype)
-                init_mask[:, 0, :, :] = 0.0  # first latent frame is given
+                init_mask[:, 0, :, :] = 0.0  # first state frame is given
                 point_anchor_1 = _compute_point_anchor(
                     x_s_raw[:, :1], point_obj_idx, args.anchor_mode
                 ).to(device=accelerator.device, dtype=weight_dtype)
@@ -1387,11 +1671,15 @@ def main():
 
                 # --- Build valid sequence mask for DiT attention (padded batch mode) ---
                 if args.padded_batch:
-                    t_latent = (T_raw_tensor - 1) // 4 + 1   # (B,)
+                    t_state = (
+                        T_raw_tensor
+                        if args.use_raw_transformer
+                        else (T_raw_tensor - 1) // 4 + 1
+                    )
                     t_idx = torch.arange(T, device=accelerator.device).unsqueeze(0)  # (1, T)
-                    t_valid = t_idx < t_latent.unsqueeze(1)   # (B, T)
-                    latent_seq_mask = t_valid.unsqueeze(2) & point_mask.unsqueeze(1)
-                    valid_seq_mask = latent_seq_mask.view(B_sz, T * N_sz)
+                    t_valid = t_idx < t_state.unsqueeze(1)    # (B, T)
+                    state_seq_mask = t_valid.unsqueeze(2) & point_mask.unsqueeze(1)
+                    valid_seq_mask = state_seq_mask.view(B_sz, T * N_sz)
                 else:
                     valid_seq_mask = None
 
@@ -1408,7 +1696,7 @@ def main():
                     point_mask=point_mask,
                 )  # (B, T, N, d_cond)
 
-                # --- Forward pass: DiT in latent space (LDM-style) ---
+                # --- Forward pass in latent or raw state space ---
                 with torch.amp.autocast("cuda", dtype=weight_dtype):
                     pred_enc = sim_transformer(
                         noisy_x_s_enc, init_enc_padded, init_mask, point_anchor, c_sim, timesteps,
@@ -1419,30 +1707,34 @@ def main():
                             if args.use_object_local_attention
                             else None
                         ),
-                    )  # (B, T, N, d_state) — predicted latent velocity
+                    )  # (B, T, N, d_state) — predicted flow-matching velocity
 
-                # --- Default flow-matching loss (latent space) ---
+                # --- Default flow-matching loss in the selected state space ---
                 weighting = compute_loss_weighting_for_sd3(
                     weighting_scheme=args.weighting_scheme, sigmas=sigma,
                 )
                 loss_per_elem = F.mse_loss(pred_enc.float(), target.float(), reduction='none')
 
                 if args.padded_batch and point_mask is not None:
-                    # Build latent-space mask: (B, T, N). Padded positions are excluded
+                    # Build state-space mask: (B, T, N). Padded positions are excluded
                     # from both the numerator and denominator (zero contribution, not counted).
-                    t_latent = (T_raw_tensor - 1) // 4 + 1                 # (B,)
+                    t_state = (
+                        T_raw_tensor
+                        if args.use_raw_transformer
+                        else (T_raw_tensor - 1) // 4 + 1
+                    )
                     t_idx = torch.arange(T, device=accelerator.device).unsqueeze(0)  # (1, T)
-                    t_valid = t_idx < t_latent.unsqueeze(1)                # (B, T)
-                    latent_mask = t_valid.unsqueeze(2) & point_mask.unsqueeze(1)  # (B, T, N)
-                    latent_mask[:, :1] = False
-                    loss_per_elem = loss_per_elem * latent_mask.unsqueeze(-1).float()
-                    n_valid = latent_mask.float().sum() * args.d_state
+                    t_valid = t_idx < t_state.unsqueeze(1)                 # (B, T)
+                    state_mask = t_valid.unsqueeze(2) & point_mask.unsqueeze(1)  # (B, T, N)
+                    state_mask[:, :1] = False
+                    loss_per_elem = loss_per_elem * state_mask.unsqueeze(-1).float()
+                    n_valid = state_mask.float().sum() * args.d_state
                     latent_diffusion_loss = (loss_per_elem * weighting.float()).sum() / n_valid.clamp(min=1)
                 else:
-                    latent_mask = torch.ones(B_sz, T, N_sz, device=accelerator.device, dtype=torch.bool)
-                    latent_mask[:, :1] = False
-                    loss_per_elem = loss_per_elem * latent_mask.unsqueeze(-1).float()
-                    n_valid = latent_mask.float().sum() * args.d_state
+                    state_mask = torch.ones(B_sz, T, N_sz, device=accelerator.device, dtype=torch.bool)
+                    state_mask[:, :1] = False
+                    loss_per_elem = loss_per_elem * state_mask.unsqueeze(-1).float()
+                    n_valid = state_mask.float().sum() * args.d_state
                     latent_diffusion_loss = (loss_per_elem * weighting.float()).sum() / n_valid.clamp(min=1)
 
                 # Selected below when a raw-space objective is enabled.
@@ -1451,6 +1743,7 @@ def main():
 
                 loss_mse_raw = x_s_raw.new_tensor(0.0)
                 loss_mse_total = x_s_raw.new_tensor(0.0)
+                decoder_refinement_loss = x_s_raw.new_tensor(0.0)
                 loss_chamfer_coarse = x_s_raw.new_tensor(0.0)
                 loss_residual_reg = x_s_raw.new_tensor(0.0)
                 loss_residual_mag = x_s_raw.new_tensor(0.0)
@@ -1469,6 +1762,9 @@ def main():
                 centroid_loss = x_s_raw.new_tensor(0.0)
                 rotation_loss = x_s_raw.new_tensor(0.0)
                 rotation_temporal_loss = x_s_raw.new_tensor(0.0)
+                deformation_gradient_loss = x_s_raw.new_tensor(0.0)
+                local_volume_loss = x_s_raw.new_tensor(0.0)
+                local_covariance_loss = x_s_raw.new_tensor(0.0)
                 chamfer_loss = x_s_raw.new_tensor(0.0)
                 momentum_loss = x_s_raw.new_tensor(0.0)
                 floor_loss = x_s_raw.new_tensor(0.0)
@@ -1489,6 +1785,9 @@ def main():
                     args.lambda_centroid > 0.0,
                     args.lambda_rotation > 0.0,
                     args.lambda_rotation_temporal > 0.0,
+                    args.lambda_deformation_gradient > 0.0,
+                    args.lambda_local_volume > 0.0,
+                    args.lambda_local_covariance > 0.0,
                     args.lambda_chamfer > 0.0,
                     args.lambda_momentum > 0.0,
                     args.lambda_floor > 0.0,
@@ -1537,9 +1836,10 @@ def main():
                     raw_point_mask[:, :1] = False
 
                     if args.use_physics_conditioned_decoder:
-                        pred_x0_pos_raw = ae.decode(
-                            pred_x0_enc[..., :d_latent],
-                            T_raw_dim,
+                        pred_x0_pos_raw = (
+                            pred_x0_enc[..., :3]
+                            if args.use_raw_transformer
+                            else ae.decode(pred_x0_enc[..., :d_latent], T_raw_dim)
                         )
                         target_points = x_s_raw[..., :3].float()
                         canonical_points = x_s_raw[:, 0, :, :3].float()
@@ -1664,15 +1964,22 @@ def main():
                             + args.lambda_residual_reg * loss_residual_reg
                             + args.lambda_residual_mag * loss_residual_mag
                         )
-                        diffusion_loss = loss_point
+                        # Separate direct coordinate supervision from Kabsch/decoder
+                        # refinement so Direction A can warm up every physics term.
+                        diffusion_loss = loss_mse_raw
+                        decoder_refinement_loss = loss_point - loss_mse_raw
                         deformability_mean = decoder_out["deformability"].mean()
 
                     elif args.use_raw_point_mse_target:
-                        pred_x0_pos_raw = ae.decode(
-                            pred_x0_enc[..., :d_latent], T_raw_dim
+                        pred_x0_pos_raw = (
+                            pred_x0_enc[..., :3]
+                            if args.use_raw_transformer
+                            else ae.decode(pred_x0_enc[..., :d_latent], T_raw_dim)
                         )
-                        target_x0_pos_raw = ae.decode(
-                            x_s_enc[..., :d_latent], T_raw_dim
+                        target_x0_pos_raw = (
+                            x_s_raw[..., :3]
+                            if args.use_raw_transformer
+                            else ae.decode(x_s_enc[..., :d_latent], T_raw_dim)
                         )
                         point_mse = (
                             pred_x0_pos_raw.float() - target_x0_pos_raw.float()
@@ -1691,8 +1998,10 @@ def main():
                     # velocity, local-distance, momentum, floor, and diffusion
                     # losses remain unchanged below.
                     if pred_x0_pos_raw is None:
-                        pred_x0_pos_raw = ae.decode(
-                            pred_x0_enc[..., :d_latent], T_raw_dim
+                        pred_x0_pos_raw = (
+                            pred_x0_enc[..., :3]
+                            if args.use_raw_transformer
+                            else ae.decode(pred_x0_enc[..., :d_latent], T_raw_dim)
                         )
                     pos_pred = (
                         pred_points
@@ -1712,8 +2021,10 @@ def main():
                         args.lambda_velocity_vector > 0.0,
                         args.lambda_velocity_accel > 0.0,
                     ]):
-                        velocity_pred = ae.decode(
-                            pred_x0_enc[..., d_latent:], T_raw_dim,
+                        velocity_pred = (
+                            pred_x0_enc[..., 3:6]
+                            if args.use_raw_transformer
+                            else ae.decode(pred_x0_enc[..., d_latent:], T_raw_dim)
                         ).float()
                         velocity_gt = x_s_raw[..., 3:6].float()
 
@@ -1735,8 +2046,20 @@ def main():
                             valid_frame_mask=valid_raw_frame_mask,
                         )
                     if args.lambda_velocity_vector > 0.0:
+                        # Direction C: optional object-frame alignment ablation.
+                        velocity_for_vector_loss = velocity_pred
+                        if args.velocity_coord_align:
+                            velocity_for_vector_loss = _align_velocity_to_gt_frame(
+                                velocity_pred=velocity_pred,
+                                pos_pred=pred_x0_pos_raw.float(),
+                                pos_gt=x_s_raw[..., :3].float(),
+                                canonical_points=x_s_raw[:, 0, :, :3].float(),
+                                point_obj_idx=point_obj_idx,
+                                point_mask=point_mask,
+                                num_objects=args.max_objects,
+                            )
                         velocity_vector_loss = _compute_velocity_vector_loss(
-                            velocity_pred=velocity_pred,
+                            velocity_pred=velocity_for_vector_loss,
                             velocity_gt=velocity_gt,
                             point_mask=point_mask,
                             valid_frame_mask=valid_raw_frame_mask,
@@ -1765,6 +2088,23 @@ def main():
                             point_mask=point_mask,
                             valid_frame_mask=valid_raw_frame_mask,
                             num_objects=args.max_objects,
+                        )
+                    if any([
+                        args.lambda_deformation_gradient > 0.0,
+                        args.lambda_local_volume > 0.0,
+                        args.lambda_local_covariance > 0.0,
+                    ]):
+                        (
+                            deformation_gradient_loss,
+                            local_volume_loss,
+                            local_covariance_loss,
+                        ) = _compute_local_geometry_losses(
+                            pos_pred=pred_x0_pos_raw.float(),
+                            pos_gt=x_s_raw[..., :3].float(),
+                            point_obj_idx=point_obj_idx,
+                            point_mask=point_mask,
+                            valid_frame_mask=valid_raw_frame_mask,
+                            k=args.knn_k,
                         )
                     if args.lambda_local_dist > 0.0:
                         local_dist_loss = _compute_local_distance_loss(
@@ -1840,24 +2180,88 @@ def main():
                                 point_mask=point_mask,
                             ))
 
-                loss = (
-                    args.lambda_diffusion * diffusion_loss
-                    + args.lambda_vel * velocity_loss
-                    + args.lambda_ang_vel * angular_velocity_loss
-                    + args.lambda_velocity_vector * velocity_vector_loss
-                    + args.lambda_velocity_accel * velocity_acceleration_loss
-                    + args.lambda_centroid * centroid_loss
-                    + args.lambda_rotation * rotation_loss
-                    + args.lambda_rotation_temporal * rotation_temporal_loss
-                    + args.lambda_local_dist * local_dist_loss
-                    + args.lambda_covariance * covariance_loss
-                    + args.lambda_chamfer * chamfer_loss
-                    + args.lambda_momentum * momentum_loss
-                    + args.lambda_floor * floor_loss
+                # Direction D: select a stable, independently testable physics subset.
+                if args.physics_mode == "full":
+                    effective_weights = {
+                        "decoder_refinement": 1.0,
+                        "vel": args.lambda_vel,
+                        "ang_vel": args.lambda_ang_vel,
+                        "velocity_vector": args.lambda_velocity_vector,
+                        "velocity_accel": args.lambda_velocity_accel,
+                        "centroid": args.lambda_centroid,
+                        "rotation": args.lambda_rotation,
+                        "rotation_temporal": args.lambda_rotation_temporal,
+                        "deformation_gradient": args.lambda_deformation_gradient,
+                        "local_volume": args.lambda_local_volume,
+                        "local_covariance": args.lambda_local_covariance,
+                        "local_dist": args.lambda_local_dist,
+                        "covariance": args.lambda_covariance,
+                        "chamfer": args.lambda_chamfer,
+                        "momentum": args.lambda_momentum,
+                        "floor": args.lambda_floor,
+                    }
+                elif args.physics_mode == "minimal":
+                    effective_weights = {
+                        "decoder_refinement": 0.0,
+                        "vel": 0.0,
+                        "ang_vel": 0.0,
+                        "velocity_vector": 0.0,
+                        "velocity_accel": 0.0,
+                        "centroid": args.lambda_centroid,
+                        "rotation": args.lambda_rotation,
+                        "rotation_temporal": args.lambda_rotation_temporal,
+                        "deformation_gradient": 0.0,
+                        "local_volume": 0.0,
+                        "local_covariance": 0.0,
+                        "local_dist": args.lambda_local_dist,
+                        "covariance": 0.0,
+                        "chamfer": 0.0,
+                        "momentum": 0.0,
+                        "floor": 0.0,
+                    }
+                else:  # shape_only
+                    effective_weights = {name: 0.0 for name in (
+                        "decoder_refinement",
+                        "vel", "ang_vel", "velocity_vector", "velocity_accel",
+                        "centroid", "rotation", "rotation_temporal",
+                        "deformation_gradient", "local_volume", "local_covariance",
+                        "local_dist", "covariance", "chamfer", "momentum", "floor",
+                    )}
+
+                # Direction A: warm up every non-diffusion physics term together.
+                if args.physics_loss_warmup_steps > 0:
+                    physics_loss_scale = min(
+                        1.0,
+                        global_step / args.physics_loss_warmup_steps,
+                    )
+                else:
+                    physics_loss_scale = 1.0
+                if args.training_stage == "shape_only":
+                    physics_loss_scale = 0.0
+
+                physics_loss = (
+                    args.lambda_diffusion * effective_weights["decoder_refinement"] * decoder_refinement_loss
+                    + effective_weights["vel"] * velocity_loss
+                    + effective_weights["ang_vel"] * angular_velocity_loss
+                    + effective_weights["velocity_vector"] * velocity_vector_loss
+                    + effective_weights["velocity_accel"] * velocity_acceleration_loss
+                    + effective_weights["centroid"] * centroid_loss
+                    + effective_weights["rotation"] * rotation_loss
+                    + effective_weights["rotation_temporal"] * rotation_temporal_loss
+                    + effective_weights["deformation_gradient"] * deformation_gradient_loss
+                    + effective_weights["local_volume"] * local_volume_loss
+                    + effective_weights["local_covariance"] * local_covariance_loss
+                    + effective_weights["local_dist"] * local_dist_loss
+                    + effective_weights["covariance"] * covariance_loss
+                    + effective_weights["chamfer"] * chamfer_loss
+                    + effective_weights["momentum"] * momentum_loss
+                    + effective_weights["floor"] * floor_loss
                 )
+                loss = args.lambda_diffusion * diffusion_loss + physics_loss_scale * physics_loss
 
                 # --- Backward ---
                 avg_loss = accelerator.gather(loss.repeat(bsz)).mean()
+                avg_physics_loss = accelerator.gather(physics_loss.repeat(bsz)).mean()
                 avg_diffusion_loss = accelerator.gather(diffusion_loss.repeat(bsz)).mean()
                 avg_latent_diffusion_loss = accelerator.gather(
                     latent_diffusion_loss.repeat(bsz)
@@ -1870,6 +2274,9 @@ def main():
                 ).mean()
                 avg_loss_mse_total = accelerator.gather(
                     loss_mse_total.repeat(bsz)
+                ).mean()
+                avg_decoder_refinement_loss = accelerator.gather(
+                    decoder_refinement_loss.repeat(bsz)
                 ).mean()
                 avg_loss_chamfer_coarse = accelerator.gather(
                     loss_chamfer_coarse.repeat(bsz)
@@ -1906,6 +2313,15 @@ def main():
                 avg_rotation_temporal_loss = accelerator.gather(
                     rotation_temporal_loss.repeat(bsz)
                 ).mean()
+                avg_deformation_gradient_loss = accelerator.gather(
+                    deformation_gradient_loss.repeat(bsz)
+                ).mean()
+                avg_local_volume_loss = accelerator.gather(
+                    local_volume_loss.repeat(bsz)
+                ).mean()
+                avg_local_covariance_loss = accelerator.gather(
+                    local_covariance_loss.repeat(bsz)
+                ).mean()
                 avg_chamfer_loss = accelerator.gather(chamfer_loss.repeat(bsz)).mean()
                 avg_momentum_loss = accelerator.gather(momentum_loss.repeat(bsz)).mean()
                 avg_floor_loss = accelerator.gather(floor_loss.repeat(bsz)).mean()
@@ -1939,6 +2355,8 @@ def main():
                         "latent_diffusion_loss": avg_latent_diffusion_loss.item(),
                         "raw_point_mse_target_loss": avg_raw_point_mse_target_loss.item(),
                         "weighted_diffusion_loss": args.lambda_diffusion * avg_diffusion_loss.item(),
+                        "physics_loss": avg_physics_loss.item(),
+                        "physics_loss_scale": physics_loss_scale,
                         "local_dist_loss": avg_local_dist_loss.item(),
                         "covariance_loss": avg_covariance_loss.item(),
                         "velocity_loss": avg_velocity_loss.item(),
@@ -1948,29 +2366,46 @@ def main():
                         "centroid_loss": avg_centroid_loss.item(),
                         "rotation_loss": avg_rotation_loss.item(),
                         "rotation_temporal_loss": avg_rotation_temporal_loss.item(),
+                        "deformation_gradient_loss": avg_deformation_gradient_loss.item(),
+                        "local_volume_loss": avg_local_volume_loss.item(),
+                        "local_covariance_loss": avg_local_covariance_loss.item(),
                         "chamfer_loss": avg_chamfer_loss.item(),
                         "momentum_loss": avg_momentum_loss.item(),
                         "floor_loss": avg_floor_loss.item(),
-                        "weighted_local_dist_loss": args.lambda_local_dist * avg_local_dist_loss.item(),
-                        "weighted_covariance_loss": args.lambda_covariance * avg_covariance_loss.item(),
-                        "weighted_velocity_loss": args.lambda_vel * avg_velocity_loss.item(),
+                        "weighted_local_dist_loss": physics_loss_scale * effective_weights["local_dist"] * avg_local_dist_loss.item(),
+                        "weighted_covariance_loss": physics_loss_scale * effective_weights["covariance"] * avg_covariance_loss.item(),
+                        "weighted_velocity_loss": physics_loss_scale * effective_weights["vel"] * avg_velocity_loss.item(),
                         "weighted_angular_velocity_loss": (
-                            args.lambda_ang_vel * avg_angular_velocity_loss.item()
+                            physics_loss_scale * effective_weights["ang_vel"] * avg_angular_velocity_loss.item()
                         ),
                         "weighted_velocity_vector_loss": (
-                            args.lambda_velocity_vector * avg_velocity_vector_loss.item()
+                            physics_loss_scale * effective_weights["velocity_vector"] * avg_velocity_vector_loss.item()
                         ),
                         "weighted_velocity_acceleration_loss": (
-                            args.lambda_velocity_accel * avg_velocity_acceleration_loss.item()
+                            physics_loss_scale * effective_weights["velocity_accel"] * avg_velocity_acceleration_loss.item()
                         ),
-                        "weighted_centroid_loss": args.lambda_centroid * avg_centroid_loss.item(),
-                        "weighted_rotation_loss": args.lambda_rotation * avg_rotation_loss.item(),
+                        "weighted_centroid_loss": physics_loss_scale * effective_weights["centroid"] * avg_centroid_loss.item(),
+                        "weighted_rotation_loss": physics_loss_scale * effective_weights["rotation"] * avg_rotation_loss.item(),
                         "weighted_rotation_temporal_loss": (
-                            args.lambda_rotation_temporal * avg_rotation_temporal_loss.item()
+                            physics_loss_scale * effective_weights["rotation_temporal"] * avg_rotation_temporal_loss.item()
                         ),
-                        "weighted_chamfer_loss": args.lambda_chamfer * avg_chamfer_loss.item(),
-                        "weighted_momentum_loss": args.lambda_momentum * avg_momentum_loss.item(),
-                        "weighted_floor_loss": args.lambda_floor * avg_floor_loss.item(),
+                        "weighted_decoder_refinement_loss": (
+                            physics_loss_scale * args.lambda_diffusion
+                            * effective_weights["decoder_refinement"]
+                            * avg_decoder_refinement_loss.item()
+                        ),
+                        "weighted_deformation_gradient_loss": (
+                            physics_loss_scale * effective_weights["deformation_gradient"] * avg_deformation_gradient_loss.item()
+                        ),
+                        "weighted_local_volume_loss": (
+                            physics_loss_scale * effective_weights["local_volume"] * avg_local_volume_loss.item()
+                        ),
+                        "weighted_local_covariance_loss": (
+                            physics_loss_scale * effective_weights["local_covariance"] * avg_local_covariance_loss.item()
+                        ),
+                        "weighted_chamfer_loss": physics_loss_scale * effective_weights["chamfer"] * avg_chamfer_loss.item(),
+                        "weighted_momentum_loss": physics_loss_scale * effective_weights["momentum"] * avg_momentum_loss.item(),
+                        "weighted_floor_loss": physics_loss_scale * effective_weights["floor"] * avg_floor_loss.item(),
                         "lr": current_lr,
                         "epoch": epoch,
                         "global_step": global_step,
@@ -1979,6 +2414,7 @@ def main():
                     log_values.update({
                         "loss_mse_raw": avg_loss_mse_raw.item(),
                         "loss_mse_total": avg_loss_mse_total.item(),
+                        "decoder_refinement_loss": avg_decoder_refinement_loss.item(),
                         "loss_chamfer_coarse": avg_loss_chamfer_coarse.item(),
                         "loss_residual_reg": avg_loss_residual_reg.item(),
                         "loss_residual_mag": avg_loss_residual_mag.item(),
@@ -2029,6 +2465,7 @@ def main():
                             args.vis_fps,
                             args.anchor_mode,
                             physics_decoder=unwrapped_physics,
+                            use_raw_transformer=args.use_raw_transformer,
                         )
                     finally:
                         unwrapped_sim.train()
@@ -2084,6 +2521,9 @@ def main():
                 "centroid": centroid_loss.detach().item(),
                 "rotation": rotation_loss.detach().item(),
                 "rotation_temporal": rotation_temporal_loss.detach().item(),
+                "deformation_gradient": deformation_gradient_loss.detach().item(),
+                "local_volume": local_volume_loss.detach().item(),
+                "local_covariance": local_covariance_loss.detach().item(),
                 "chamfer": chamfer_loss.detach().item(),
                 "momentum": momentum_loss.detach().item(),
                 "floor": floor_loss.detach().item(),

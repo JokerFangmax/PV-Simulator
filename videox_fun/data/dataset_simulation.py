@@ -147,7 +147,8 @@ class MoviSimulationDataset(Dataset):
       - point_cloud_states.pkl: point states (T_raw_avail, N, 6), instance point ranges
       - metadata.json: per-instance friction, restitution, mass, positions, velocities
 
-    Frames are clipped to the largest valid T_raw = 4k+1 ≤ T_raw_available.
+    Frames are cropped to a valid ``4k+1`` window.  In padded-batch mode the
+    window can optionally be centred on the first metadata contact frame.
 
     Each sample may have different n_objects and N (total points). When batching with
     batch_size > 1, all samples in a batch must have identical shapes — the DataLoader
@@ -157,6 +158,9 @@ class MoviSimulationDataset(Dataset):
         data_root: Root directory containing subdirectories (one per sample).
         max_objects: Skip samples with more than this many objects.
         temporal_compression_ratio: Temporal compression ratio (default 4).
+        max_T_raw: Optional maximum raw-frame window length. Must be ``4k+1``.
+        center_on_contact: Centre the window on the first contact frame when
+            ``metadata["physics"]["force_nonzero_frames"]`` is available.
     """
 
     def __init__(
@@ -164,10 +168,19 @@ class MoviSimulationDataset(Dataset):
         data_root: str,
         max_objects: int = 16,
         temporal_compression_ratio: int = 4,
+        max_T_raw: int = None,
+        center_on_contact: bool = False,
     ):
         self.data_root = data_root
         self.max_objects = max_objects
         self.temporal_compression_ratio = temporal_compression_ratio
+        if max_T_raw is not None and (max_T_raw - 1) % temporal_compression_ratio != 0:
+            raise ValueError(
+                "max_T_raw must satisfy T_raw = 4k+1 for the temporal "
+                f"compression ratio {temporal_compression_ratio}; got {max_T_raw}."
+            )
+        self.max_T_raw = max_T_raw
+        self.center_on_contact = center_on_contact
         self._shard_tars = {}
         self._shard_members = {}
         # DataLoader workers are forked lazily.  If the main process has already
@@ -235,6 +248,7 @@ class MoviSimulationDataset(Dataset):
 
     def _build_sample_from_movi_parts(
         self, point_states, instances, meta_instances, sample_name, physics=None,
+        contact_frames=None,
     ):
         """Convert MOVI point-cloud + metadata parts into the Stage 1 sample dict."""
         physics = {} if physics is None else physics
@@ -242,12 +256,35 @@ class MoviSimulationDataset(Dataset):
         point_states = point_states.astype(np.float32)  # (T_avail, N, 6)
         T_avail = point_states.shape[0]
 
-        # Clip to largest valid T_raw = 4k+1
+        # Select a contiguous valid ``4k+1`` window.  The default is the
+        # historical prefix window.  Contact-centred sampling is deliberately
+        # deterministic so every worker sees the same trajectory window.
         r = self.temporal_compression_ratio
-        k = (T_avail - 1) // r
+        max_window = T_avail if self.max_T_raw is None else min(self.max_T_raw, T_avail)
+        k = (max_window - 1) // r
         T_raw = k * r + 1
         assert T_raw >= r + 1, f"Too few frames in {sample_name}: T_avail={T_avail}"
-        point_states = point_states[:T_raw]  # (T_raw, N, 6)
+
+        window_start = 0
+        # A shorter-than-requested source sequence cannot supply the requested
+        # temporal context, so retain the historical prefix in that case.
+        can_center_window = (
+            self.max_T_raw is None or T_avail >= self.max_T_raw
+        )
+        if self.center_on_contact and can_center_window and contact_frames:
+            valid_contact_frames = [
+                int(frame) for frame in contact_frames
+                if 0 <= int(frame) < T_avail
+            ]
+            if valid_contact_frames:
+                first_contact = min(valid_contact_frames)
+                # For odd T_raw (all supported lengths), this places the first
+                # contact at the centre frame whenever enough context exists.
+                window_start = max(0, first_contact - T_raw // 2)
+                window_start = min(window_start, T_avail - T_raw)
+
+        window_end = window_start + T_raw
+        point_states = point_states[window_start:window_end]  # (T_raw, N, 6)
         T_raw, N, _ = point_states.shape
 
         n_objects = len(instances)
@@ -280,8 +317,11 @@ class MoviSimulationDataset(Dataset):
             c_mat[obj_i, 0] = mi.get('friction', 0.5)
             c_mat[obj_i, 1] = mi.get('restitution', 0.5)
             c_mass[obj_i] = mi.get('mass', 1.0)
-            pos0 = mi['positions'][0]   # [x, y, z]
-            vel0 = mi['velocities'][0]  # [vx, vy, vz]
+            # The model conditions on x_s_raw[:, 0].  When a contact-centred
+            # crop starts later in the source trajectory, condition metadata
+            # must refer to the crop's first frame as well.
+            pos0 = mi['positions'][window_start]   # [x, y, z]
+            vel0 = mi['velocities'][window_start]  # [vx, vy, vz]
             c_init_state[obj_i, :3] = pos0
             c_init_state[obj_i, 3:6] = vel0
 
@@ -293,7 +333,7 @@ class MoviSimulationDataset(Dataset):
         if c_force_raw is None:
             c_force_raw = np.zeros((T_raw, N, 6), dtype=np.float32)
         else:
-            c_force_raw = np.asarray(c_force_raw, dtype=np.float32)[:T_raw]
+            c_force_raw = np.asarray(c_force_raw, dtype=np.float32)[window_start:window_end]
             if c_force_raw.shape != (T_raw, N, 6):
                 raise ValueError(
                     f"Invalid c_force_raw shape {c_force_raw.shape} in {sample_name}; "
@@ -308,7 +348,7 @@ class MoviSimulationDataset(Dataset):
             c_static = np.asarray(physics['c_static'], dtype=np.int64)
         else:
             c_static = np.zeros(n_objects, dtype=np.int64)
-        if 'c_init' in physics:
+        if 'c_init' in physics and window_start == 0:
             c_init = np.asarray(physics['c_init'], dtype=np.float32)
 
         if c_mat.shape != (n_objects, 2) or c_mass.shape != (n_objects,):
@@ -380,6 +420,10 @@ class MoviSimulationDataset(Dataset):
             meta_instances=meta["instances"],
             sample_name=f"{os.path.basename(shard_path)}:{sample_id}",
             physics=physics,
+            contact_frames=meta.get(
+                "force_nonzero_frames",
+                meta.get("physics", {}).get("force_nonzero_frames", []),
+            ),
         )
 
     def __getitem__(self, idx):
@@ -408,6 +452,10 @@ class MoviSimulationDataset(Dataset):
                     meta_instances=meta["instances"],
                     sample_name=sample_dir,
                     physics=physics,
+                    contact_frames=meta.get(
+                        "force_nonzero_frames",
+                        meta.get("physics", {}).get("force_nonzero_frames", []),
+                    ),
                 )
 
             except Exception as e:

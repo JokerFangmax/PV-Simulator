@@ -62,6 +62,58 @@ def _spatial_sinusoidal_embedding(anchor_positions: torch.Tensor, dim: int) -> t
     return embedding
 
 
+class TemporalProjection(nn.Module):
+    """Learned 4x temporal projection for future raw-to-joint Stage-2 alignment.
+
+    Frame 0 is projected independently.  Every subsequent contiguous group of
+    ``compression_ratio`` frames is concatenated and projected per point.  Thus
+    the default mapping converts ``(B, 21, N, C)`` to ``(B, 6, N, C)``.
+    Stage-1 raw-transformer training does not use this module; it is an explicit
+    bridge for a future Stage-2 integration.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        compression_ratio: int = 4,
+        hidden_dim: Optional[int] = None,
+    ):
+        super().__init__()
+        if compression_ratio < 1:
+            raise ValueError("compression_ratio must be at least 1")
+        self.channels = channels
+        self.compression_ratio = compression_ratio
+        hidden_dim = hidden_dim or max(2 * channels, 32)
+        self.first_projection = nn.Linear(channels, channels)
+        self.group_projection = nn.Sequential(
+            nn.Linear(compression_ratio * channels, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, channels),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Project ``(B, T_raw, N, C)`` to ``(B, 1+(T_raw-1)/r, N, C)``."""
+        if x.ndim != 4:
+            raise ValueError(f"Expected (B, T, N, C), got shape {tuple(x.shape)}")
+        B, T_raw, N, channels = x.shape
+        if channels != self.channels:
+            raise ValueError(f"Expected {self.channels} channels, got {channels}")
+        if (T_raw - 1) % self.compression_ratio != 0:
+            raise ValueError(
+                f"T_raw={T_raw} must satisfy T_raw = {self.compression_ratio}k+1"
+            )
+
+        first = self.first_projection(x[:, :1])
+        if T_raw == 1:
+            return first
+        groups = (T_raw - 1) // self.compression_ratio
+        rest = x[:, 1:].reshape(B, groups, self.compression_ratio, N, channels)
+        rest = rest.permute(0, 1, 3, 2, 4).reshape(
+            B, groups, N, self.compression_ratio * channels,
+        )
+        return torch.cat([first, self.group_projection(rest)], dim=1)
+
+
 class SimSelfAttention(nn.Module):
     """Self-attention for simulation tokens.
 
@@ -289,16 +341,17 @@ class SimTemporalCorrespondenceBlock(nn.Module):
 class SimTransformer(nn.Module):
     """Simulation DiT: 10-block Transformer for physics trajectory denoising.
 
-    Input: encoded noisy states x_enc (B, T, N, d_state), initial frame
-    encoding init_enc (B, T, N, d_state) zero-padded beyond t=0, inpainting
+    Input: latent or raw noisy states x_enc (B, T, N, d_state), initial-frame
+    representation init_enc (B, T, N, d_state), and an inpainting
     mask init_mask (B, T, N, 1), per-point anchors point_anchor (B, T, N, d_anchor)
     repeated across time, and conditions c_sim (B, T, N, d_cond). All concatenated
     and projected to hidden dim.
 
-    Output: predicted value in latent space (B, T, N, d_state).
+    Output: predicted flow-matching velocity in the input representation.
 
     Args:
-        d_state: Dimension of encoded point states (AE pos+vel concat = 32).
+        d_state: State dimension (AE latents by default; raw pos+vel is 6).
+        input_representation: ``"latent"`` or ``"raw"`` checkpoint metadata.
         d_cond: Dimension of condition embedding (60).
         d_sim: Hidden dimension of the transformer.
         ffn_dim: FFN intermediate dimension.
@@ -326,9 +379,16 @@ class SimTransformer(nn.Module):
         freq_dim: int = 256,
         qk_norm: bool = True,
         eps: float = 1e-6,
+        input_representation: str = "latent",
     ):
         super().__init__()
+        if input_representation not in {"latent", "raw"}:
+            raise ValueError(
+                "input_representation must be 'latent' or 'raw', got "
+                f"{input_representation!r}"
+            )
         self.d_state = d_state
+        self.input_representation = input_representation
         self.d_cond = d_cond
         self.d_anchor = d_anchor
         self.d_sim = d_sim
@@ -393,8 +453,8 @@ class SimTransformer(nn.Module):
                 point_obj_idx: Optional[torch.Tensor] = None):
         """
         Args:
-            x_enc: (B, T, N, d_state) — AE-encoded noisy point states.
-            init_enc: (B, T, N, d_state) — AE-encoded initial frame, zero-padded beyond t=0.
+            x_enc: (B, T, N, d_state) — noisy latent or raw point states.
+            init_enc: (B, T, N, d_state) — initial frame in the same representation.
             init_mask: (B, T, N, 1) — 0 at t=0 (given frame), 1 elsewhere.
             point_anchor: (B, T, N, d_anchor) — per-point anchor features repeated across time.
             c_sim: (B, T, N, d_cond) — condition embeddings.
@@ -407,7 +467,7 @@ class SimTransformer(nn.Module):
                 ``use_object_local_attention`` is enabled, different objects are
                 masked from each other at every temporal position.
         Returns:
-            (B, T, N, d_state) — predicted value in latent space.
+            (B, T, N, d_state) — predicted velocity in the input representation.
         """
         B, T, N, _ = x_enc.shape
         if point_anchor.ndim == 3:

@@ -214,6 +214,8 @@ def parse_args():
                         help="Weight for direct Kabsch rotation-matrix supervision.")
     parser.add_argument("--lambda_rotation_temporal", type=float, default=0.0,
                         help="Weight for relative Kabsch rotation consistency across frames.")
+    parser.add_argument("--lambda_rotation_axis", type=float, default=0.0,
+                        help="Weight for consecutive incremental Kabsch rotation-axis consistency.")
     parser.add_argument("--lambda_deformation_gradient", type=float, default=0.0,
                         help="Weight for local deformation-gradient matching on canonical k-NN neighborhoods.")
     parser.add_argument("--lambda_local_volume", type=float, default=0.0,
@@ -234,6 +236,9 @@ def parse_args():
     parser.add_argument("--physics_mode", type=str, default="full",
                         choices=["full", "minimal", "shape_only"],
                         help="full=all enabled losses; minimal=rotation/centroid/local-dist only; shape_only=disable physics auxiliaries.")
+    parser.add_argument("--minimal_include_momentum", action="store_true",
+                        help="Include --lambda_momentum in physics_mode=minimal. Off by default "
+                             "to preserve the original minimal-loss ablation.")
     parser.add_argument("--lambda_chamfer", type=float, default=0.01,
                         help="Weight for per-frame raw-position Chamfer distance loss.")
     parser.add_argument("--lambda_momentum", type=float, default=0.01,
@@ -324,6 +329,7 @@ def parse_args():
     for name in (
         "lambda_diffusion", "lambda_vel", "lambda_ang_vel", "lambda_velocity_vector",
         "lambda_velocity_accel", "lambda_centroid", "lambda_rotation", "lambda_rotation_temporal",
+        "lambda_rotation_axis",
         "lambda_deformation_gradient", "lambda_local_volume", "lambda_local_covariance",
         "lambda_local_dist", "lambda_covariance", "lambda_chamfer",
         "lambda_momentum", "lambda_floor", "lambda_chamfer_coarse", "lambda_residual_reg",
@@ -849,7 +855,12 @@ def _fit_kabsch_rotations(
     point_mask: torch.Tensor | None,
     num_objects: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return per-frame Kabsch rotations and a mask of non-degenerate fits."""
+    """Return row-vector Kabsch rotations and a mask of non-degenerate fits.
+
+    The returned ``R`` follows ``target_points = source_points @ R + t``.
+    Equivalently, the physics decoder's column-vector convention stores
+    ``R_column = R.T`` and applies ``source_points @ R_column.T + t``.
+    """
     B, T_raw, N, _ = positions.shape
     identity = torch.eye(3, device=positions.device, dtype=positions.dtype)
     rotations = identity.view(1, 1, 1, 3, 3).expand(
@@ -878,15 +889,17 @@ def _fit_kabsch_rotations(
             if not torch.any(non_degenerate):
                 continue
             U_valid = U[non_degenerate]
-            V_valid = Vh[non_degenerate].transpose(-1, -2)
+            Vh_valid = Vh[non_degenerate]
             correction = identity.expand(U_valid.shape[0], -1, -1).clone()
             correction[:, 2, 2] = torch.where(
-                torch.det(V_valid @ U_valid.transpose(-1, -2)) < 0,
+                torch.det(U_valid @ Vh_valid) < 0,
                 correction.new_tensor(-1.0),
                 correction.new_tensor(1.0),
             )
+            # Row-vector Kabsch: H = source^T target = U S V^T, therefore
+            # target_points = source_points @ (U D V^T) + t.
             rotations[b, non_degenerate, object_id] = (
-                V_valid @ correction @ U_valid.transpose(-1, -2)
+                U_valid @ correction @ Vh_valid
             )
             valid_rotation[b, non_degenerate, object_id] = True
     return rotations, valid_rotation
@@ -918,8 +931,9 @@ def _compute_rotation_consistency_losses(
 
     if rotations_pred.shape[1] < 2:
         return absolute_loss, absolute_loss * 0.0
-    relative_pred = rotations_pred[:, 1:] @ rotations_pred[:, :-1].transpose(-1, -2)
-    relative_gt = rotations_gt[:, 1:] @ rotations_gt[:, :-1].transpose(-1, -2)
+    # For row-vector canonical-to-frame maps, the t -> t+1 map is R_t^T R_{t+1}.
+    relative_pred = rotations_pred[:, :-1].transpose(-1, -2) @ rotations_pred[:, 1:]
+    relative_gt = rotations_gt[:, :-1].transpose(-1, -2) @ rotations_gt[:, 1:]
     valid_pairs = valid[:, 1:] & valid[:, :-1]
     temporal_error = (relative_pred - relative_gt).square().mean(dim=(-1, -2))
     temporal_loss = (
@@ -927,6 +941,69 @@ def _compute_rotation_consistency_losses(
         / valid_pairs.float().sum().clamp_min(1)
     )
     return absolute_loss, temporal_loss
+
+
+def _compute_rotation_axis_loss(
+    pos_pred: torch.Tensor,
+    canonical_points: torch.Tensor,
+    point_obj_idx: torch.Tensor,
+    point_mask: torch.Tensor | None,
+    valid_frame_mask: torch.Tensor | None,
+    num_objects: int,
+    min_angle: float = 1e-3,
+) -> torch.Tensor:
+    """Penalize sign flips between consecutive *incremental* rotation axes.
+
+    Kabsch rotations map canonical row-vectors to each raw predicted frame. The
+    relevant rolling direction is therefore the relative transform
+    ``R[t]^T @ R[t+1]``, not the cumulative canonical-to-frame rotation. Its
+    Rodrigues axis is signed, so alternating forward/backward rolling yields
+    antiparallel adjacent axes and a loss near 2.  Near-zero-angle increments
+    have no stable axis and are excluded from the average.
+    """
+    rotations, valid_rotation = _fit_kabsch_rotations(
+        canonical_points, pos_pred, point_obj_idx, point_mask, num_objects,
+    )
+    if rotations.shape[1] < 3:
+        return pos_pred.new_tensor(0.0)
+
+    relative = rotations[:, :-1].transpose(-1, -2) @ rotations[:, 1:]
+    trace = relative.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+    angles = torch.acos(((trace - 1.0) * 0.5).clamp(-1.0, 1.0))
+    # vee(R - R^T) = 2 sin(theta) * axis.  Normalizing the vee vector is
+    # numerically safer than dividing by sin(theta), except when it vanishes.
+    axis_vector = torch.stack(
+        [
+            relative[..., 2, 1] - relative[..., 1, 2],
+            relative[..., 0, 2] - relative[..., 2, 0],
+            relative[..., 1, 0] - relative[..., 0, 1],
+        ],
+        dim=-1,
+    )
+    axis_norm = axis_vector.norm(dim=-1)
+    valid_increment = valid_rotation[:, 1:] & valid_rotation[:, :-1]
+    if valid_frame_mask is not None:
+        valid_increment = (
+            valid_increment
+            & valid_frame_mask[:, 1:, None]
+            & valid_frame_mask[:, :-1, None]
+        )
+    valid_increment = (
+        valid_increment
+        & (angles > min_angle)
+        & (axis_norm > 1e-6)
+    )
+    axes = axis_vector / axis_norm.unsqueeze(-1).clamp_min(1e-6)
+
+    # Compare intervals (t -> t+1) and (t+1 -> t+2).
+    valid_axis_pairs = valid_increment[:, 1:] & valid_increment[:, :-1]
+    if not torch.any(valid_axis_pairs):
+        return pos_pred.new_tensor(0.0)
+    axis_dot = (axes[:, 1:] * axes[:, :-1]).sum(dim=-1).clamp(-1.0, 1.0)
+    return (
+        ((1.0 - axis_dot) * valid_axis_pairs.float()).sum()
+        / valid_axis_pairs.float().sum().clamp_min(1)
+    )
 
 
 def _align_velocity_to_gt_frame(
@@ -940,8 +1017,9 @@ def _align_velocity_to_gt_frame(
 ) -> torch.Tensor:
     """Direction C: map predicted velocity vectors into each GT object frame.
 
-    If R_pred and R_gt map canonical coordinates to predicted and GT frames,
-    A = R_gt @ R_pred^T maps a predicted-frame vector into the GT frame.
+    If row-vector R_pred and R_gt map canonical coordinates to predicted and
+    GT frames, ``A = R_pred^T @ R_gt`` maps a predicted-frame vector into the
+    GT frame via ``v_gt = v_pred @ A``.
     Translation is deliberately absent because velocity vectors are translationally
     invariant.
     """
@@ -951,7 +1029,7 @@ def _align_velocity_to_gt_frame(
     rotations_gt, valid_gt = _fit_kabsch_rotations(
         canonical_points, pos_gt, point_obj_idx, point_mask, num_objects,
     )
-    alignment = rotations_gt @ rotations_pred.transpose(-1, -2)
+    alignment = rotations_pred.transpose(-1, -2) @ rotations_gt
     aligned_velocity = velocity_pred.clone()
     B, T_raw, N, _ = velocity_pred.shape
     for b in range(B):
@@ -968,7 +1046,7 @@ def _align_velocity_to_gt_frame(
                 continue
             aligned_velocity[b, :, object_points] = torch.matmul(
                 velocity_pred[b, :, object_points],
-                alignment[b, :, object_id].transpose(-1, -2),
+                alignment[b, :, object_id],
             )
     return aligned_velocity
 
@@ -1070,7 +1148,15 @@ def _compute_momentum_loss(
     point_mask: torch.Tensor | None,
     valid_frame_mask: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Match total linear momentum per object after uniform per-point mass split."""
+    """Match total linear momentum per object after uniform per-point mass split.
+
+    ``c_mass[b, obj_id]`` is the object mass.  Surface samples have no
+    individual masses in MOVi, so the mass is deliberately distributed as
+    ``m_object / n_valid_object_points``.  Both padded points and padded frames
+    are excluded before the sum.  This is a world-frame velocity comparison;
+    force/contact conditioning is not used by this loss and cannot introduce a
+    coordinate-frame mismatch in raw-transformer mode.
+    """
     device = velocity_pred.device
     total_loss = velocity_pred.new_tensor(0.0)
     total_weight = velocity_pred.new_tensor(0.0)
@@ -1762,6 +1848,7 @@ def main():
                 centroid_loss = x_s_raw.new_tensor(0.0)
                 rotation_loss = x_s_raw.new_tensor(0.0)
                 rotation_temporal_loss = x_s_raw.new_tensor(0.0)
+                rotation_axis_loss = x_s_raw.new_tensor(0.0)
                 deformation_gradient_loss = x_s_raw.new_tensor(0.0)
                 local_volume_loss = x_s_raw.new_tensor(0.0)
                 local_covariance_loss = x_s_raw.new_tensor(0.0)
@@ -1785,6 +1872,7 @@ def main():
                     args.lambda_centroid > 0.0,
                     args.lambda_rotation > 0.0,
                     args.lambda_rotation_temporal > 0.0,
+                    args.lambda_rotation_axis > 0.0,
                     args.lambda_deformation_gradient > 0.0,
                     args.lambda_local_volume > 0.0,
                     args.lambda_local_covariance > 0.0,
@@ -2089,6 +2177,15 @@ def main():
                             valid_frame_mask=valid_raw_frame_mask,
                             num_objects=args.max_objects,
                         )
+                    if args.lambda_rotation_axis > 0.0:
+                        rotation_axis_loss = _compute_rotation_axis_loss(
+                            pos_pred=pred_x0_pos_raw.float(),
+                            canonical_points=x_s_raw[:, 0, :, :3].float(),
+                            point_obj_idx=point_obj_idx,
+                            point_mask=point_mask,
+                            valid_frame_mask=valid_raw_frame_mask,
+                            num_objects=args.max_objects,
+                        )
                     if any([
                         args.lambda_deformation_gradient > 0.0,
                         args.lambda_local_volume > 0.0,
@@ -2191,6 +2288,7 @@ def main():
                         "centroid": args.lambda_centroid,
                         "rotation": args.lambda_rotation,
                         "rotation_temporal": args.lambda_rotation_temporal,
+                        "rotation_axis": args.lambda_rotation_axis,
                         "deformation_gradient": args.lambda_deformation_gradient,
                         "local_volume": args.lambda_local_volume,
                         "local_covariance": args.lambda_local_covariance,
@@ -2210,20 +2308,23 @@ def main():
                         "centroid": args.lambda_centroid,
                         "rotation": args.lambda_rotation,
                         "rotation_temporal": args.lambda_rotation_temporal,
+                        "rotation_axis": args.lambda_rotation_axis,
                         "deformation_gradient": 0.0,
                         "local_volume": 0.0,
                         "local_covariance": 0.0,
                         "local_dist": args.lambda_local_dist,
                         "covariance": 0.0,
                         "chamfer": 0.0,
-                        "momentum": 0.0,
+                        "momentum": (
+                            args.lambda_momentum if args.minimal_include_momentum else 0.0
+                        ),
                         "floor": 0.0,
                     }
                 else:  # shape_only
                     effective_weights = {name: 0.0 for name in (
                         "decoder_refinement",
                         "vel", "ang_vel", "velocity_vector", "velocity_accel",
-                        "centroid", "rotation", "rotation_temporal",
+                        "centroid", "rotation", "rotation_temporal", "rotation_axis",
                         "deformation_gradient", "local_volume", "local_covariance",
                         "local_dist", "covariance", "chamfer", "momentum", "floor",
                     )}
@@ -2248,6 +2349,7 @@ def main():
                     + effective_weights["centroid"] * centroid_loss
                     + effective_weights["rotation"] * rotation_loss
                     + effective_weights["rotation_temporal"] * rotation_temporal_loss
+                    + effective_weights["rotation_axis"] * rotation_axis_loss
                     + effective_weights["deformation_gradient"] * deformation_gradient_loss
                     + effective_weights["local_volume"] * local_volume_loss
                     + effective_weights["local_covariance"] * local_covariance_loss
@@ -2313,6 +2415,9 @@ def main():
                 avg_rotation_temporal_loss = accelerator.gather(
                     rotation_temporal_loss.repeat(bsz)
                 ).mean()
+                avg_rotation_axis_loss = accelerator.gather(
+                    rotation_axis_loss.repeat(bsz)
+                ).mean()
                 avg_deformation_gradient_loss = accelerator.gather(
                     deformation_gradient_loss.repeat(bsz)
                 ).mean()
@@ -2366,6 +2471,7 @@ def main():
                         "centroid_loss": avg_centroid_loss.item(),
                         "rotation_loss": avg_rotation_loss.item(),
                         "rotation_temporal_loss": avg_rotation_temporal_loss.item(),
+                        "rotation_axis_loss": avg_rotation_axis_loss.item(),
                         "deformation_gradient_loss": avg_deformation_gradient_loss.item(),
                         "local_volume_loss": avg_local_volume_loss.item(),
                         "local_covariance_loss": avg_local_covariance_loss.item(),
@@ -2388,6 +2494,9 @@ def main():
                         "weighted_rotation_loss": physics_loss_scale * effective_weights["rotation"] * avg_rotation_loss.item(),
                         "weighted_rotation_temporal_loss": (
                             physics_loss_scale * effective_weights["rotation_temporal"] * avg_rotation_temporal_loss.item()
+                        ),
+                        "weighted_rotation_axis_loss": (
+                            physics_loss_scale * effective_weights["rotation_axis"] * avg_rotation_axis_loss.item()
                         ),
                         "weighted_decoder_refinement_loss": (
                             physics_loss_scale * args.lambda_diffusion
@@ -2521,6 +2630,7 @@ def main():
                 "centroid": centroid_loss.detach().item(),
                 "rotation": rotation_loss.detach().item(),
                 "rotation_temporal": rotation_temporal_loss.detach().item(),
+                "rotation_axis": rotation_axis_loss.detach().item(),
                 "deformation_gradient": deformation_gradient_loss.detach().item(),
                 "local_volume": local_volume_loss.detach().item(),
                 "local_covariance": local_covariance_loss.detach().item(),

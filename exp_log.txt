@@ -1116,3 +1116,243 @@ CUDA_VISIBLE_DEVICES=4 /data/fhr/miniconda3/envs/videox/bin/accelerate launch \
   --wandb_run_name new-physics-50-raw-minimal \
   --vis_steps 200 \
   --num_vis_samples 4
+
+----
+
+CUDA_VISIBLE_DEVICES=4 /data/fhr/miniconda3/envs/videox/bin/accelerate launch --num_processes=1 scripts/pv_simulator/train_stage1.py \
+  --use_raw_transformer \
+  --use_physics_conditioned_decoder \
+  --lambda_physics_point 1.0 \
+  --lambda_chamfer_coarse 0.5 \
+  --lambda_residual_reg 0.1 \
+  --lambda_residual_mag 0.1 \
+  --lambda_ang_vel 0.05 \
+  --lambda_centroid 0.20 \
+  --lambda_rotation 0.25 \
+  --lambda_rotation_temporal 0.10 \
+  --physics_mode minimal \
+  --dataset_type movi \
+  --data_root /data/fhr/kubric/new_output/movi_physics_50 \
+  --ae_ckpt_dir outputs/stage0/diag/stage_mlp/causal-mae-long-fp32-50k/final \
+  --padded_batch \
+  --max_objects 1 \
+  --max_T_raw 21 \
+  --max_points_per_object 200 \
+  --lr_warmup_steps 300 \
+  --train_batch_size 2 \
+  --gradient_accumulation_steps 4 \
+  --mixed_precision no \
+  --dataloader_num_workers 4 \
+  --d_sim 512 \
+  --sim_ffn_dim 2048 \
+  --use_factorized_attention \
+  --use_temporal_correspondence \
+  --use_temporal_rope \
+  --lambda_diffusion 1.0 \
+  --lambda_vel 0.2 \
+  --lambda_local_dist 0.2 \
+  --lambda_momentum 0.1 \
+  --lambda_floor 0.1 \
+  --gravity_axis z \
+  --report_to wandb \
+  --wandb_project pv-simulator-stage1 \
+  --vis_steps 200 \
+  --num_vis_samples 4 \
+  --max_train_steps 10000 \
+  --num_train_epochs 1600 \
+  --output_dir outputs/stage1/new-physics-50-raw-minimal-10k \
+  --wandb_run_name new-physics-50-raw-minimal-10k
+
+----
+
+exp
+
+CUDA_VISIBLE_DEVICES=5 /data/fhr/miniconda3/envs/videox/bin/accelerate launch --num_processes=1 scripts/pv_simulator/train_stage1.py \
+  --use_raw_transformer \
+  --use_physics_conditioned_decoder \
+  --lambda_physics_point 1.0 \
+  --lambda_chamfer_coarse 0.5 \
+  --lambda_residual_reg 0.1 \
+  --lambda_residual_mag 0.1 \
+  --lambda_ang_vel 0.05 \
+  --lambda_centroid 0.20 \
+  --lambda_rotation 0.25 \
+  --lambda_rotation_temporal 0.10 \
+  --physics_mode minimal \
+  --dataset_type movi \
+  --data_root /data/fhr/kubric/new_output/movi_physics_50 \
+  --ae_ckpt_dir outputs/stage0/diag/stage_mlp/causal-mae-long-fp32-50k/final \
+  --padded_batch \
+  --max_objects 1 \
+  --max_T_raw 21 \
+  --max_points_per_object 200 \
+  --lr_warmup_steps 300 \
+  --train_batch_size 2 \
+  --gradient_accumulation_steps 4 \
+  --mixed_precision no \
+  --dataloader_num_workers 4 \
+  --d_sim 512 \
+  --sim_ffn_dim 2048 \
+  --use_factorized_attention \
+  --use_temporal_correspondence \
+  --use_temporal_rope \
+  --lambda_diffusion 1.0 \
+  --lambda_vel 0.2 \
+  --lambda_local_dist 0.2 \
+  --lambda_momentum 0.1 \
+  --lambda_floor 0.1 \
+  --gravity_axis z \
+  --report_to wandb \
+  --wandb_project pv-simulator-stage1 \
+  --vis_steps 200 \
+  --num_vis_samples 4 \
+  --max_train_steps 5000 \
+  --num_train_epochs 800 \
+  --lambda_rotation_axis 0.5 \
+  --output_dir outputs/stage1/new-physics-50-raw-axis-0.5 \
+  --wandb_run_name new-physics-50-raw-axis-0.5
+
+-----
+
+exp
+
+CUDA_VISIBLE_DEVICES=6 /data/fhr/miniconda3/envs/videox/bin/accelerate launch --num_processes=1 scripts/pv_simulator/train_stage1.py \
+  --use_raw_transformer \
+  --use_physics_conditioned_decoder \
+  --lambda_physics_point 1.0 \
+  --lambda_chamfer_coarse 0.5 \
+  --lambda_residual_reg 0.1 \
+  --lambda_residual_mag 0.1 \
+  --lambda_ang_vel 0.05 \
+  --lambda_centroid 0.20 \
+  --lambda_rotation 0.25 \
+  --lambda_rotation_temporal 0.10 \
+  --physics_mode minimal \
+  --dataset_type movi \
+  --data_root /data/fhr/kubric/new_output/movi_physics_50 \
+  --ae_ckpt_dir outputs/stage0/diag/stage_mlp/causal-mae-long-fp32-50k/final \
+  --padded_batch \
+  --max_objects 1 \
+  --max_T_raw 21 \
+  --max_points_per_object 200 \
+  --lr_warmup_steps 300 \
+  --train_batch_size 2 \
+  --gradient_accumulation_steps 4 \
+  --mixed_precision no \
+  --dataloader_num_workers 4 \
+  --d_sim 512 \
+  --sim_ffn_dim 2048 \
+  --use_factorized_attention \
+  --use_temporal_correspondence \
+  --use_temporal_rope \
+  --lambda_diffusion 1.0 \
+  --lambda_vel 0.2 \
+  --lambda_local_dist 0.2 \
+  --lambda_momentum 0.1 \
+  --lambda_floor 0.1 \
+  --gravity_axis z \
+  --report_to wandb \
+  --wandb_project pv-simulator-stage1 \
+  --vis_steps 200 \
+  --num_vis_samples 4 \
+  --max_train_steps 5000 \
+  --num_train_epochs 800 \
+  --lambda_rotation_axis 1.0 \
+  --output_dir outputs/stage1/new-physics-50-raw-axis-1.0 \
+  --wandb_run_name new-physics-50-raw-axis-1.0
+
+----
+
+exp
+
+CUDA_VISIBLE_DEVICES=7 /data/fhr/miniconda3/envs/videox/bin/accelerate launch --num_processes=1 scripts/pv_simulator/train_stage1.py \
+  --use_raw_transformer \
+  --use_physics_conditioned_decoder \
+  --lambda_physics_point 1.0 \
+  --lambda_chamfer_coarse 0.5 \
+  --lambda_residual_reg 0.1 \
+  --lambda_residual_mag 0.1 \
+  --lambda_ang_vel 0.05 \
+  --lambda_centroid 0.20 \
+  --lambda_rotation 0.25 \
+  --lambda_rotation_temporal 0.10 \
+  --physics_mode minimal \
+  --dataset_type movi \
+  --data_root /data/fhr/kubric/new_output/movi_physics_50 \
+  --ae_ckpt_dir outputs/stage0/diag/stage_mlp/causal-mae-long-fp32-50k/final \
+  --padded_batch \
+  --max_objects 1 \
+  --max_T_raw 21 \
+  --max_points_per_object 200 \
+  --lr_warmup_steps 300 \
+  --train_batch_size 2 \
+  --gradient_accumulation_steps 4 \
+  --mixed_precision no \
+  --dataloader_num_workers 4 \
+  --d_sim 512 \
+  --sim_ffn_dim 2048 \
+  --use_factorized_attention \
+  --use_temporal_correspondence \
+  --use_temporal_rope \
+  --lambda_diffusion 1.0 \
+  --lambda_vel 0.2 \
+  --lambda_local_dist 0.2 \
+  --lambda_momentum 0.1 \
+  --lambda_floor 0.1 \
+  --gravity_axis z \
+  --report_to wandb \
+  --wandb_project pv-simulator-stage1 \
+  --vis_steps 200 \
+  --num_vis_samples 4 \
+  --max_train_steps 5000 \
+  --num_train_epochs 800 \
+  --lambda_rotation_axis 0.5 \
+  --minimal_include_momentum \
+  --output_dir outputs/stage1/new-physics-50-raw-axis-momentum \
+  --wandb_run_name new-physics-50-raw-axis-momentum
+
+----
+
+CUDA_VISIBLE_DEVICES=3 /data/fhr/miniconda3/envs/videox/bin/accelerate launch --num_processes=1 scripts/pv_simulator/train_stage1.py \
+  --use_raw_transformer \
+  --use_physics_conditioned_decoder \
+  --lambda_physics_point 1.0 \
+  --lambda_chamfer_coarse 0.5 \
+  --lambda_residual_reg 0.1 \
+  --lambda_residual_mag 0.1 \
+  --lambda_ang_vel 0.05 \
+  --lambda_centroid 0.20 \
+  --lambda_rotation 0.25 \
+  --lambda_rotation_temporal 0.10 \
+  --physics_mode minimal \
+  --dataset_type movi \
+  --data_root /data/fhr/kubric/new_output/movi_physics_50 \
+  --ae_ckpt_dir outputs/stage0/diag/stage_mlp/causal-mae-long-fp32-50k/final \
+  --output_dir outputs/stage1/new-physics-50-raw-fixed-kabsch \
+  --padded_batch \
+  --max_objects 1 \
+  --max_T_raw 21 \
+  --max_points_per_object 200 \
+  --num_train_epochs 800 \
+  --max_train_steps 5000 \
+  --lr_warmup_steps 300 \
+  --train_batch_size 2 \
+  --gradient_accumulation_steps 4 \
+  --mixed_precision no \
+  --dataloader_num_workers 4 \
+  --d_sim 512 \
+  --sim_ffn_dim 2048 \
+  --use_factorized_attention \
+  --use_temporal_correspondence \
+  --use_temporal_rope \
+  --lambda_diffusion 1.0 \
+  --lambda_vel 0.2 \
+  --lambda_local_dist 0.2 \
+  --lambda_momentum 0.1 \
+  --lambda_floor 0.1 \
+  --gravity_axis z \
+  --report_to wandb \
+  --wandb_project pv-simulator-stage1 \
+  --wandb_run_name new-physics-50-raw-fixed-kabsch \
+  --vis_steps 200 \
+  --num_vis_samples 4

@@ -216,6 +216,12 @@ def parse_args():
                         help="Weight for relative Kabsch rotation consistency across frames.")
     parser.add_argument("--lambda_rotation_axis", type=float, default=0.0,
                         help="Weight for consecutive incremental Kabsch rotation-axis consistency.")
+    parser.add_argument("--lambda_contact_com_velocity", type=float, default=0.0,
+                        help="Weight for post-contact object-centroid finite-difference velocity matching.")
+    parser.add_argument("--lambda_contact_pose_ang_speed", type=float, default=0.0,
+                        help="Weight for post-contact Kabsch incremental angular-speed matching.")
+    parser.add_argument("--contact_loss_post_frames", type=int, default=3,
+                        help="Number of consecutive frame pairs starting at first contact used by contact losses.")
     parser.add_argument("--lambda_deformation_gradient", type=float, default=0.0,
                         help="Weight for local deformation-gradient matching on canonical k-NN neighborhoods.")
     parser.add_argument("--lambda_local_volume", type=float, default=0.0,
@@ -322,6 +328,8 @@ def parse_args():
         parser.error("--initial_global_step must be >= 0")
     if args.physics_loss_warmup_steps < 0:
         parser.error("--physics_loss_warmup_steps must be >= 0")
+    if args.contact_loss_post_frames < 1:
+        parser.error("--contact_loss_post_frames must be >= 1")
     if args.resume_from_checkpoint and args.init_from_model_dir:
         parser.error("Use only one of --resume_from_checkpoint and --init_from_model_dir")
     if args.initial_global_step and not args.init_from_model_dir:
@@ -329,7 +337,7 @@ def parse_args():
     for name in (
         "lambda_diffusion", "lambda_vel", "lambda_ang_vel", "lambda_velocity_vector",
         "lambda_velocity_accel", "lambda_centroid", "lambda_rotation", "lambda_rotation_temporal",
-        "lambda_rotation_axis",
+        "lambda_rotation_axis", "lambda_contact_com_velocity", "lambda_contact_pose_ang_speed",
         "lambda_deformation_gradient", "lambda_local_volume", "lambda_local_covariance",
         "lambda_local_dist", "lambda_covariance", "lambda_chamfer",
         "lambda_momentum", "lambda_floor", "lambda_chamfer_coarse", "lambda_residual_reg",
@@ -845,6 +853,181 @@ def _compute_centroid_consistency_loss(
             gt_centroid = pos_gt[b, frame_idx][:, object_idx].mean(dim=1)
             total_loss = total_loss + (pred_centroid - gt_centroid).square().mean() * frame_idx.numel()
             total_weight = total_weight + frame_idx.numel()
+    return total_loss / total_weight.clamp_min(1)
+
+
+def _contact_post_pair_mask(
+    c_force_raw: torch.Tensor,
+    point_mask: torch.Tensor | None,
+    valid_frame_mask: torch.Tensor | None,
+    post_frames: int,
+) -> torch.Tensor:
+    """Select consecutive frame pairs immediately following the first contact.
+
+    ``c_force_raw[..., :3]`` is the per-point applied-force vector.  A frame
+    is a contact frame when any valid point has a nonzero force.  For a first
+    contact at frame ``c``, this returns pairs ``(c, c + 1)``, ...,
+    ``(c + post_frames - 1, c + post_frames)`` when those frames exist.
+    Samples with no in-window contact have no selected pairs.
+    """
+    B, T_raw, _, _ = c_force_raw.shape
+    pair_mask = torch.zeros(
+        B, max(T_raw - 1, 0), device=c_force_raw.device, dtype=torch.bool,
+    )
+    if T_raw < 2:
+        return pair_mask
+
+    # Contact is an input condition, not a learned quantity: detach avoids
+    # retaining an unnecessary autograd path through the condition tensor.
+    force_norm = c_force_raw[..., :3].detach().norm(dim=-1)
+    if point_mask is not None:
+        force_norm = force_norm.masked_fill(~point_mask[:, None, :], 0.0)
+    contact_frames = force_norm.amax(dim=-1) > 1e-8
+    if valid_frame_mask is not None:
+        contact_frames = contact_frames & valid_frame_mask
+        valid_pairs = valid_frame_mask[:, :-1] & valid_frame_mask[:, 1:]
+    else:
+        valid_pairs = torch.ones_like(pair_mask)
+
+    for b in range(B):
+        first_contact = contact_frames[b].nonzero(as_tuple=True)[0]
+        if first_contact.numel() == 0:
+            continue
+        start = int(first_contact[0].item())
+        end = min(start + post_frames, T_raw - 1)
+        pair_mask[b, start:end] = True
+    return pair_mask & valid_pairs
+
+
+def _compute_contact_com_velocity_loss(
+    pos_pred: torch.Tensor,
+    pos_gt: torch.Tensor,
+    c_force_raw: torch.Tensor,
+    point_obj_idx: torch.Tensor,
+    point_mask: torch.Tensor | None,
+    valid_frame_mask: torch.Tensor | None,
+    num_objects: int,
+    post_frames: int,
+) -> torch.Tensor:
+    """Match post-contact object-centroid finite-difference velocities.
+
+    For object centroid ``c_t``, the supervised quantity is
+    ``v_com,t = c_(t+1) - c_t``.  This uses position channels only, so it
+    directly couples the predicted rolling pose trajectory to translation.
+    """
+    B, _, N, _ = pos_pred.shape
+    pair_mask = _contact_post_pair_mask(
+        c_force_raw, point_mask, valid_frame_mask, post_frames,
+    )
+    total_loss = pos_pred.sum() * 0.0
+    total_weight = pos_pred.new_tensor(0.0)
+    for b in range(B):
+        selected_pairs = pair_mask[b]
+        if not torch.any(selected_pairs):
+            continue
+        valid_points = (
+            point_mask[b]
+            if point_mask is not None
+            else torch.ones(N, device=pos_pred.device, dtype=torch.bool)
+        )
+        for object_id in range(num_objects):
+            object_points = (point_obj_idx[b] == object_id) & valid_points
+            if not torch.any(object_points):
+                continue
+            pred_centroid = pos_pred[b, :, object_points].mean(dim=1)
+            gt_centroid = pos_gt[b, :, object_points].mean(dim=1)
+            pred_velocity = pred_centroid[1:] - pred_centroid[:-1]
+            gt_velocity = gt_centroid[1:] - gt_centroid[:-1]
+            error = (pred_velocity - gt_velocity).square().mean(dim=-1)
+            total_loss = total_loss + error[selected_pairs].sum()
+            total_weight = total_weight + selected_pairs.float().sum()
+    return total_loss / total_weight.clamp_min(1)
+
+
+def _row_kabsch_incremental_angle(
+    source: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor | None:
+    """Return the row-vector Kabsch angle for one same-object frame pair.
+
+    With ``H = source.T @ target = U S V^T``, the row-vector map is
+    ``R = U D V^T`` such that ``target ~= source @ R + t``.  Degenerate fits
+    are omitted rather than injecting an arbitrary identity-angle target.
+    """
+    if source.shape[0] < 3:
+        return None
+    source_centered = source - source.mean(dim=0, keepdim=True)
+    target_centered = target - target.mean(dim=0, keepdim=True)
+    covariance = source_centered.transpose(0, 1) @ target_centered
+    U, singular_values, Vh = torch.linalg.svd(covariance, full_matrices=False)
+    if singular_values[-1].detach().item() < 1e-6:
+        return None
+    correction = torch.eye(3, device=source.device, dtype=source.dtype)
+    correction[-1, -1] = torch.where(
+        torch.det(U @ Vh) < 0,
+        correction.new_tensor(-1.0),
+        correction.new_tensor(1.0),
+    )
+    rotation = U @ correction @ Vh
+    trace = rotation.diagonal().sum()
+    # ``acos`` has an infinite derivative at +/-1.  Keep the requested trace
+    # clamp, with a tiny interior margin, so a stationary predicted pair does
+    # not turn this auxiliary loss into NaN gradients.
+    cosine = ((trace - 1.0) * 0.5).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+    return torch.acos(cosine)
+
+
+def _compute_contact_pose_ang_speed_loss(
+    pos_pred: torch.Tensor,
+    pos_gt: torch.Tensor,
+    c_force_raw: torch.Tensor,
+    point_obj_idx: torch.Tensor,
+    point_mask: torch.Tensor | None,
+    valid_frame_mask: torch.Tensor | None,
+    num_objects: int,
+    post_frames: int,
+    dt: float = 1.0 / 12.0,
+) -> torch.Tensor:
+    """Match post-contact Kabsch incremental angular speeds from positions.
+
+    For each selected pair, independently fit row-vector Kabsch transforms
+    from frame ``t`` to ``t + 1`` and compare ``acos((tr(R)-1)/2) / dt``.
+    The fixed ``dt=1/12`` matches the MOVi sampling rate used by this setup.
+    """
+    B, _, N, _ = pos_pred.shape
+    pair_mask = _contact_post_pair_mask(
+        c_force_raw, point_mask, valid_frame_mask, post_frames,
+    )
+    total_loss = pos_pred.sum() * 0.0
+    total_weight = pos_pred.new_tensor(0.0)
+    for b in range(B):
+        selected_pair_idx = pair_mask[b].nonzero(as_tuple=True)[0]
+        if selected_pair_idx.numel() == 0:
+            continue
+        valid_points = (
+            point_mask[b]
+            if point_mask is not None
+            else torch.ones(N, device=pos_pred.device, dtype=torch.bool)
+        )
+        for object_id in range(num_objects):
+            object_points = (point_obj_idx[b] == object_id) & valid_points
+            if int(object_points.sum().item()) < 3:
+                continue
+            for frame_idx in selected_pair_idx.tolist():
+                pred_angle = _row_kabsch_incremental_angle(
+                    pos_pred[b, frame_idx, object_points],
+                    pos_pred[b, frame_idx + 1, object_points],
+                )
+                gt_angle = _row_kabsch_incremental_angle(
+                    pos_gt[b, frame_idx, object_points],
+                    pos_gt[b, frame_idx + 1, object_points],
+                )
+                if pred_angle is None or gt_angle is None:
+                    continue
+                pred_speed = pred_angle / dt
+                gt_speed = gt_angle / dt
+                total_loss = total_loss + (pred_speed - gt_speed).square()
+                total_weight = total_weight + 1
     return total_loss / total_weight.clamp_min(1)
 
 
@@ -1849,6 +2032,8 @@ def main():
                 rotation_loss = x_s_raw.new_tensor(0.0)
                 rotation_temporal_loss = x_s_raw.new_tensor(0.0)
                 rotation_axis_loss = x_s_raw.new_tensor(0.0)
+                contact_com_velocity_loss = x_s_raw.new_tensor(0.0)
+                contact_pose_ang_speed_loss = x_s_raw.new_tensor(0.0)
                 deformation_gradient_loss = x_s_raw.new_tensor(0.0)
                 local_volume_loss = x_s_raw.new_tensor(0.0)
                 local_covariance_loss = x_s_raw.new_tensor(0.0)
@@ -1873,6 +2058,8 @@ def main():
                     args.lambda_rotation > 0.0,
                     args.lambda_rotation_temporal > 0.0,
                     args.lambda_rotation_axis > 0.0,
+                    args.lambda_contact_com_velocity > 0.0,
+                    args.lambda_contact_pose_ang_speed > 0.0,
                     args.lambda_deformation_gradient > 0.0,
                     args.lambda_local_volume > 0.0,
                     args.lambda_local_covariance > 0.0,
@@ -2186,6 +2373,28 @@ def main():
                             valid_frame_mask=valid_raw_frame_mask,
                             num_objects=args.max_objects,
                         )
+                    if args.lambda_contact_com_velocity > 0.0:
+                        contact_com_velocity_loss = _compute_contact_com_velocity_loss(
+                            pos_pred=pred_x0_pos_raw.float(),
+                            pos_gt=x_s_raw[..., :3].float(),
+                            c_force_raw=c_force_raw.float(),
+                            point_obj_idx=point_obj_idx,
+                            point_mask=point_mask,
+                            valid_frame_mask=valid_raw_frame_mask,
+                            num_objects=args.max_objects,
+                            post_frames=args.contact_loss_post_frames,
+                        )
+                    if args.lambda_contact_pose_ang_speed > 0.0:
+                        contact_pose_ang_speed_loss = _compute_contact_pose_ang_speed_loss(
+                            pos_pred=pred_x0_pos_raw.float(),
+                            pos_gt=x_s_raw[..., :3].float(),
+                            c_force_raw=c_force_raw.float(),
+                            point_obj_idx=point_obj_idx,
+                            point_mask=point_mask,
+                            valid_frame_mask=valid_raw_frame_mask,
+                            num_objects=args.max_objects,
+                            post_frames=args.contact_loss_post_frames,
+                        )
                     if any([
                         args.lambda_deformation_gradient > 0.0,
                         args.lambda_local_volume > 0.0,
@@ -2289,6 +2498,8 @@ def main():
                         "rotation": args.lambda_rotation,
                         "rotation_temporal": args.lambda_rotation_temporal,
                         "rotation_axis": args.lambda_rotation_axis,
+                        "contact_com_velocity": args.lambda_contact_com_velocity,
+                        "contact_pose_ang_speed": args.lambda_contact_pose_ang_speed,
                         "deformation_gradient": args.lambda_deformation_gradient,
                         "local_volume": args.lambda_local_volume,
                         "local_covariance": args.lambda_local_covariance,
@@ -2309,6 +2520,10 @@ def main():
                         "rotation": args.lambda_rotation,
                         "rotation_temporal": args.lambda_rotation_temporal,
                         "rotation_axis": args.lambda_rotation_axis,
+                        # Contact coupling is intentionally available in minimal
+                        # mode: it targets the diagnosed post-contact failure.
+                        "contact_com_velocity": args.lambda_contact_com_velocity,
+                        "contact_pose_ang_speed": args.lambda_contact_pose_ang_speed,
                         "deformation_gradient": 0.0,
                         "local_volume": 0.0,
                         "local_covariance": 0.0,
@@ -2325,6 +2540,7 @@ def main():
                         "decoder_refinement",
                         "vel", "ang_vel", "velocity_vector", "velocity_accel",
                         "centroid", "rotation", "rotation_temporal", "rotation_axis",
+                        "contact_com_velocity", "contact_pose_ang_speed",
                         "deformation_gradient", "local_volume", "local_covariance",
                         "local_dist", "covariance", "chamfer", "momentum", "floor",
                     )}
@@ -2350,6 +2566,8 @@ def main():
                     + effective_weights["rotation"] * rotation_loss
                     + effective_weights["rotation_temporal"] * rotation_temporal_loss
                     + effective_weights["rotation_axis"] * rotation_axis_loss
+                    + effective_weights["contact_com_velocity"] * contact_com_velocity_loss
+                    + effective_weights["contact_pose_ang_speed"] * contact_pose_ang_speed_loss
                     + effective_weights["deformation_gradient"] * deformation_gradient_loss
                     + effective_weights["local_volume"] * local_volume_loss
                     + effective_weights["local_covariance"] * local_covariance_loss
@@ -2418,6 +2636,12 @@ def main():
                 avg_rotation_axis_loss = accelerator.gather(
                     rotation_axis_loss.repeat(bsz)
                 ).mean()
+                avg_contact_com_velocity_loss = accelerator.gather(
+                    contact_com_velocity_loss.repeat(bsz)
+                ).mean()
+                avg_contact_pose_ang_speed_loss = accelerator.gather(
+                    contact_pose_ang_speed_loss.repeat(bsz)
+                ).mean()
                 avg_deformation_gradient_loss = accelerator.gather(
                     deformation_gradient_loss.repeat(bsz)
                 ).mean()
@@ -2472,6 +2696,8 @@ def main():
                         "rotation_loss": avg_rotation_loss.item(),
                         "rotation_temporal_loss": avg_rotation_temporal_loss.item(),
                         "rotation_axis_loss": avg_rotation_axis_loss.item(),
+                        "contact_com_velocity_loss": avg_contact_com_velocity_loss.item(),
+                        "contact_pose_ang_speed_loss": avg_contact_pose_ang_speed_loss.item(),
                         "deformation_gradient_loss": avg_deformation_gradient_loss.item(),
                         "local_volume_loss": avg_local_volume_loss.item(),
                         "local_covariance_loss": avg_local_covariance_loss.item(),
@@ -2497,6 +2723,14 @@ def main():
                         ),
                         "weighted_rotation_axis_loss": (
                             physics_loss_scale * effective_weights["rotation_axis"] * avg_rotation_axis_loss.item()
+                        ),
+                        "weighted_contact_com_velocity_loss": (
+                            physics_loss_scale * effective_weights["contact_com_velocity"]
+                            * avg_contact_com_velocity_loss.item()
+                        ),
+                        "weighted_contact_pose_ang_speed_loss": (
+                            physics_loss_scale * effective_weights["contact_pose_ang_speed"]
+                            * avg_contact_pose_ang_speed_loss.item()
                         ),
                         "weighted_decoder_refinement_loss": (
                             physics_loss_scale * args.lambda_diffusion

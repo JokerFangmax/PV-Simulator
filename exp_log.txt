@@ -1356,3 +1356,155 @@ CUDA_VISIBLE_DEVICES=3 /data/fhr/miniconda3/envs/videox/bin/accelerate launch --
   --wandb_run_name new-physics-50-raw-fixed-kabsch \
   --vis_steps 200 \
   --num_vis_samples 4
+
+------
+
+CUDA_VISIBLE_DEVICES=3 /data/fhr/miniconda3/envs/videox/bin/accelerate launch --num_processes=1 scripts/pv_simulator/train_stage1.py \
+  --use_raw_transformer --use_physics_conditioned_decoder \
+  --dataset_type movi --data_root /data/fhr/kubric/new_output/movi_physics_50 \
+  --ae_ckpt_dir outputs/stage0/diag/stage_mlp/causal-mae-long-fp32-50k/final \
+  --output_dir outputs/stage1/raw-fixed-kabsch-active-angvel \
+  --padded_batch --max_objects 1 --max_T_raw 21 --max_points_per_object 200 \
+  --d_sim 512 --sim_ffn_dim 2048 --use_factorized_attention --use_temporal_correspondence --use_temporal_rope \
+  --train_batch_size 2 --gradient_accumulation_steps 4 --mixed_precision no --dataloader_num_workers 4 \
+  --num_train_epochs 800 --max_train_steps 5000 --lr_warmup_steps 300 \
+  --lambda_diffusion 1.0 --lambda_ang_vel 0.01 \
+  --lambda_centroid 0.20 --lambda_rotation 0.25 --lambda_rotation_temporal 0.10 \
+  --lambda_vel 0 --lambda_local_dist 0 --lambda_covariance 0 --lambda_chamfer 0 --lambda_momentum 0 --lambda_floor 0 \
+  --lambda_chamfer_coarse 0 --lambda_residual_reg 0 --lambda_residual_mag 0 \
+  --physics_mode full --gravity_axis z \
+  --report_to wandb --wandb_project pv-simulator-stage1 --wandb_run_name raw-fixed-kabsch-active-angvel \
+  --vis_steps 200 --num_vis_samples 4
+
+------
+
+CUDA_VISIBLE_DEVICES=5 /data/fhr/miniconda3/envs/videox/bin/accelerate launch --num_processes=1 scripts/pv_simulator/train_stage1.py \
+  --use_raw_transformer --use_physics_conditioned_decoder \
+  --dataset_type movi --data_root /data/fhr/kubric/new_output/movi_physics_50 \
+  --ae_ckpt_dir outputs/stage0/diag/stage_mlp/causal-mae-long-fp32-50k/final \
+  --output_dir outputs/stage1/raw-fixed-kabsch-temporal-axis \
+  --padded_batch --max_objects 1 --max_T_raw 21 --max_points_per_object 200 \
+  --d_sim 512 --sim_ffn_dim 2048 --use_factorized_attention --use_temporal_correspondence --use_temporal_rope \
+  --train_batch_size 2 --gradient_accumulation_steps 4 --mixed_precision no --dataloader_num_workers 4 \
+  --num_train_epochs 800 --max_train_steps 5000 --lr_warmup_steps 300 \
+  --lambda_diffusion 1.0 --lambda_ang_vel 0.05 \
+  --lambda_centroid 0.20 --lambda_rotation 0.25 --lambda_rotation_temporal 50.0 --lambda_rotation_axis 0.5 \
+  --lambda_local_dist 0.20 --lambda_momentum 0.1 --lambda_floor 0.1 \
+  --lambda_chamfer_coarse 0.5 --lambda_residual_reg 0.1 --lambda_residual_mag 0.1 \
+  --physics_mode minimal --gravity_axis z \
+  --report_to wandb --wandb_project pv-simulator-stage1 --wandb_run_name raw-fixed-kabsch-temporal-axis \
+  --vis_steps 200 --num_vis_samples 4
+
+------
+
+> **Context**: We implemented two contact-frame-weighted losses in `train_stage1.py` and trained two new experiments. Both use `--use_raw_transformer` and `--physics_mode minimal`, building on the J baseline (`new-physics-50-raw-fixed-kabsch`) which showed correct rolling direction but insufficient travel distance and slight wobble.
+>
+> **Baseline J**: `outputs/stage1/new-physics-50-raw-fixed-kabsch`
+> - Final `train_loss` = 0.007130
+> - Post-contact positional `||ω||` = 0.923×GT
+> - Post-contact rotational KE = 1.026×GT
+> - `avg_relative_rotation_angle` = 5.241°
+> - `avg_centroid_error` = 2.136
+>
+> **Experiment A — `raw-contact-centroid-velocity`**:
+> - Output dir: `outputs/stage1/raw-contact-centroid-velocity`
+> - New loss: `--lambda_contact_com_velocity 0.10 --contact_loss_post_frames 3`
+> - Hypothesis: Supervising post-contact center-of-mass velocity will improve translation-rotation coupling and increase travel distance.
+>
+> **Experiment B — `raw-contact-pose-angular-speed`**:
+> - Output dir: `outputs/stage1/raw-contact-pose-angular-speed`
+> - New loss: `--lambda_contact_pose_ang_speed 0.05 --contact_loss_post_frames 3`
+> - Hypothesis: Supervising post-contact incremental angular speed from Kabsch positions will push the 8% post-contact rotational deficit toward 1.0×GT.
+>
+> **Your task**:
+>
+> 1. **Read the final training states** from both output directories. Extract final step-5000 metrics for:
+>    - `train_loss`
+>    - `rotation_loss`
+>    - `rotation_temporal_loss`
+>    - `contact_com_velocity_loss` (A) or `contact_pose_ang_speed_loss` (B)
+>    - `weighted_contact_com_velocity_loss` (A) or `weighted_contact_pose_ang_speed_loss` (B)
+>    - `angular_velocity_loss`
+>    - `avg_relative_rotation_angle`
+>    - `avg_centroid_error`
+>    - `momentum_loss`
+>    - `chamfer_loss`
+>    - `diffusion_loss`
+>
+> 2. **Run the fixed-seed 50-trajectory checkpoint evaluation** on both experiments, using the same method as before. Report:
+>    - Position/Kabsch `||ω||` ratio (pred / GT)
+>    - Post-contact Kabsch `||ω||`, frames 10–20
+>    - Rotational KE proxy ratio
+>    - Total KE proxy ratio
+>    - Post-contact rotational KE proxy
+>    - Post-contact total KE proxy
+>    - **New**: post-contact center-of-mass displacement ratio (path length traveled vs GT)
+>
+> 3. **Inspect visualization outputs** (`vis/` or W&B step-5000 media) for both experiments. Compare with J:
+>    - Does the object roll farther after collision?
+>    - Is wobble reduced, unchanged, or increased?
+>    - Does the object stop at a physically plausible point, or does it overshoot/undershoot?
+>
+> 4. **Answer these diagnostic questions**:
+>    - If Experiment A's `contact_com_velocity_loss` converged but travel distance did not improve: is the issue that the network lacks capacity to simultaneously optimize translation and rotation, or that the contact window (3 frames) is too short?
+>    - If Experiment B's post-contact `||ω||` improved but travel distance did not: does this confirm that rotation speed is sufficient and the bottleneck is purely translation (centroid motion)?
+>    - If both experiments show no meaningful improvement over J: is the 21-frame temporal horizon simply too short to capture the full rolling motion? Should we abandon 21-frame optimization and regenerate data with 45+ frames?
+>
+> 5. **Recommend exactly 1 next experiment** based on your analysis. Provide:
+>    - The hypothesis
+>    - The exact bash command
+>    - The key metrics to verify
+>    - The expected outcome if successful
+>
+> **Constraints**:
+> - Do not modify code for this analysis.
+> - If metrics files are missing, state that explicitly.
+> - Be quantitative: provide exact numbers and ratios, not qualitative impressions.
+> - If you recommend data regeneration, explain why no amount of loss engineering can fix the current bottleneck.
+
+-----
+
+CUDA_VISIBLE_DEVICES=3 /data/fhr/miniconda3/envs/videox/bin/accelerate launch --num_processes=1 scripts/pv_simulator/train_stage1.py \
+  --use_raw_transformer --use_physics_conditioned_decoder \
+  --dataset_type movi \
+  --data_root /data/fhr/kubric/new_output/movi_physics_50 \
+  --ae_ckpt_dir outputs/stage0/diag/stage_mlp/causal-mae-long-fp32-50k/final \
+  --output_dir outputs/stage1/raw-contact-centroid-velocity-long10 \
+  --padded_batch \
+  --max_objects 1 \
+  --max_T_raw 21 \
+  --max_points_per_object 200 \
+  --num_train_epochs 800 \
+  --max_train_steps 5000 \
+  --lr_warmup_steps 300 \
+  --train_batch_size 2 \
+  --gradient_accumulation_steps 4 \
+  --mixed_precision no \
+  --dataloader_num_workers 4 \
+  --d_sim 512 \
+  --sim_ffn_dim 2048 \
+  --use_factorized_attention \
+  --use_temporal_correspondence \
+  --use_temporal_rope \
+  --lambda_diffusion 1.0 \
+  --lambda_vel 0.2 \
+  --lambda_local_dist 0.2 \
+  --lambda_chamfer 0.01 \
+  --lambda_momentum 0.1 \
+  --lambda_floor 0.1 \
+  --lambda_ang_vel 0.05 \
+  --lambda_centroid 0.20 \
+  --lambda_rotation 0.25 \
+  --lambda_rotation_temporal 0.10 \
+  --lambda_chamfer_coarse 0.5 \
+  --lambda_residual_reg 0.1 \
+  --lambda_residual_mag 0.1 \
+  --lambda_contact_com_velocity 0.25 \
+  --contact_loss_post_frames 10 \
+  --physics_mode minimal \
+  --gravity_axis z \
+  --report_to wandb \
+  --wandb_project pv-simulator-stage1 \
+  --wandb_run_name raw-contact-centroid-velocity-long10 \
+  --vis_steps 200 \
+  --num_vis_samples 4

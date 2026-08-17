@@ -136,9 +136,9 @@ def parse_args():
     parser.add_argument("--ae_ckpt_dir", type=str, required=True,
                         help="Path to Stage 0 CausalAE checkpoint directory")
     # Model architecture (must match the checkpoint)
-    parser.add_argument("--d_state", type=int, default=64)
-    parser.add_argument("--d_sim", type=int, default=512)
-    parser.add_argument("--sim_ffn_dim", type=int, default=2048)
+    parser.add_argument("--d_state", type=int, default=32)
+    parser.add_argument("--d_sim", type=int, default=256)
+    parser.add_argument("--sim_ffn_dim", type=int, default=1024)
     parser.add_argument("--sim_num_heads", type=int, default=8)
     parser.add_argument("--sim_num_layers", type=int, default=10)
     parser.add_argument("--max_objects", type=int, default=5)

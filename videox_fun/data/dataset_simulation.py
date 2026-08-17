@@ -54,7 +54,7 @@ class SimulationDataset(Dataset):
 
         self.data_root = data_root
         self.load_video = load_video
-        self.temporal_compression_ratio = temporal_compression_ratio
+        self.temporal_compression_ratio = temporal_compression_ratio or None
 
     def __len__(self):
         return self.length
@@ -80,9 +80,10 @@ class SimulationDataset(Dataset):
                 x_s_raw = torch.from_numpy(data['x_s_raw'].astype(np.float32))
                 T_raw, N, _ = x_s_raw.shape
 
-                # Validate T_raw is compatible with temporal compression: T_raw = 4k+1
-                assert (T_raw - 1) % self.temporal_compression_ratio == 0, \
-                    f"T_raw={T_raw} is not compatible with temporal_compression_ratio={self.temporal_compression_ratio}"
+                # Latent mode requires T_raw=r*k+1; raw-state mode accepts any length.
+                if self.temporal_compression_ratio is not None:
+                    assert (T_raw - 1) % self.temporal_compression_ratio == 0, \
+                        f"T_raw={T_raw} is not compatible with temporal_compression_ratio={self.temporal_compression_ratio}"
 
                 # Force: (T_raw, N, 6)
                 if 'c_force_raw' in data:
@@ -141,11 +142,14 @@ class SimulationDataset(Dataset):
 class MoviSimulationDataset(Dataset):
     """Dataset for the MOVI-AB style simulation data (directory-based format).
 
-    Each sample is a subdirectory containing:
+    Each sample is a subdirectory containing either:
+      - physics.npz: prepacked Stage 1 tensors, preferred when present
       - point_cloud_states.pkl: point states (T_raw_avail, N, 6), instance point ranges
       - metadata.json: per-instance friction, restitution, mass, positions, velocities
 
-    Frames are clipped to the largest valid T_raw = 4k+1 ≤ T_raw_available.
+    If temporal_compression_ratio is set, frames are clipped to the largest
+    valid T_raw = rk+1 <= T_raw_available. Set it to None or 0 for raw-xyz
+    training where no AE temporal compression is used.
 
     Each sample may have different n_objects and N (total points). When batching with
     batch_size > 1, all samples in a batch must have identical shapes — the DataLoader
@@ -162,10 +166,12 @@ class MoviSimulationDataset(Dataset):
         data_root: str,
         max_objects: int = 16,
         temporal_compression_ratio: int = 4,
+        prefer_physics_npz: bool = True,
     ):
         self.data_root = data_root
         self.max_objects = max_objects
-        self.temporal_compression_ratio = temporal_compression_ratio
+        self.temporal_compression_ratio = temporal_compression_ratio or None
+        self.prefer_physics_npz = prefer_physics_npz
 
         # Discover all subdirectories
         all_dirs = sorted([
@@ -177,9 +183,12 @@ class MoviSimulationDataset(Dataset):
         self.samples = []
         for d in all_dirs:
             sample_dir = os.path.join(data_root, d)
+            npz_path = os.path.join(sample_dir, 'physics.npz')
             pkl_path = os.path.join(sample_dir, 'point_cloud_states.pkl')
             meta_path = os.path.join(sample_dir, 'metadata.json')
-            if not os.path.exists(pkl_path) or not os.path.exists(meta_path):
+            has_npz = os.path.exists(npz_path)
+            has_legacy = os.path.exists(pkl_path) and os.path.exists(meta_path)
+            if not has_npz and not has_legacy:
                 continue
             self.samples.append(sample_dir)
 
@@ -192,8 +201,53 @@ class MoviSimulationDataset(Dataset):
         while True:
             try:
                 sample_dir = self.samples[idx]
+                npz_path = os.path.join(sample_dir, 'physics.npz')
                 pkl_path = os.path.join(sample_dir, 'point_cloud_states.pkl')
                 meta_path = os.path.join(sample_dir, 'metadata.json')
+
+                if self.prefer_physics_npz and os.path.exists(npz_path):
+                    data = np.load(npz_path, allow_pickle=True)
+                    x_s_raw = data['x_s_raw'].astype(np.float32)
+                    c_force_raw = data['c_force_raw'].astype(np.float32)
+                    T_avail = x_s_raw.shape[0]
+
+                    if self.temporal_compression_ratio is not None:
+                        r = self.temporal_compression_ratio
+                        k = (T_avail - 1) // r
+                        T_raw = k * r + 1
+                        assert T_raw >= r + 1, f"Too few frames in {sample_dir}: T_avail={T_avail}"
+                    else:
+                        T_raw = T_avail
+
+                    x_s_raw = x_s_raw[:T_raw]
+                    c_force_raw = c_force_raw[:T_raw]
+                    n_objects = data['c_mat'].shape[0]
+
+                    if n_objects > self.max_objects:
+                        raise ValueError(f"Too many objects ({n_objects}) in {sample_dir}")
+
+                    c_init = data['c_init'].astype(np.float32)
+                    if c_init.shape[-1] == 6:
+                        c_init = np.concatenate(
+                            [c_init, np.ones((c_init.shape[0], 1), dtype=np.float32)],
+                            axis=-1,
+                        )
+
+                    sample = {
+                        'x_s_raw': torch.from_numpy(x_s_raw),
+                        'c_force_raw': torch.from_numpy(c_force_raw),
+                        'c_floor': torch.tensor(float(data['c_floor']), dtype=torch.float32),
+                        'c_id': torch.arange(n_objects, dtype=torch.long),
+                        'c_mat': torch.from_numpy(data['c_mat'].astype(np.float32)),
+                        'c_mass': torch.from_numpy(data['c_mass'].astype(np.float32)),
+                        'c_static': torch.from_numpy(data['c_static'].astype(np.int64)),
+                        'c_init': torch.from_numpy(c_init),
+                        'point_obj_idx': torch.from_numpy(data['point_obj_idx'].astype(np.int64)),
+                        'T_raw': T_raw,
+                        'N': x_s_raw.shape[1],
+                        'n_objects': n_objects,
+                    }
+                    return sample
 
                 with open(pkl_path, 'rb') as f:
                     pkl = pickle.load(f)
@@ -204,11 +258,14 @@ class MoviSimulationDataset(Dataset):
                 point_states = pkl['point_states'].astype(np.float32)  # (T_avail, N, 6)
                 T_avail = point_states.shape[0]
 
-                # Clip to largest valid T_raw = 4k+1
-                r = self.temporal_compression_ratio
-                k = (T_avail - 1) // r
-                T_raw = k * r + 1
-                assert T_raw >= r + 1, f"Too few frames in {sample_dir}: T_avail={T_avail}"
+                if self.temporal_compression_ratio is not None:
+                    # Clip to largest valid T_raw = rk+1
+                    r = self.temporal_compression_ratio
+                    k = (T_avail - 1) // r
+                    T_raw = k * r + 1
+                    assert T_raw >= r + 1, f"Too few frames in {sample_dir}: T_avail={T_avail}"
+                else:
+                    T_raw = T_avail
                 point_states = point_states[:T_raw]  # (T_raw, N, 6)
                 T_raw, N, _ = point_states.shape
 
@@ -288,7 +345,9 @@ def sim_collate_fn(batch):
     return result
 
 
-def sim_collate_fn_padded(batch, max_T_raw: int, max_objects: int, max_points_per_object: int):
+def sim_collate_fn_padded(batch, max_T_raw: int, max_objects: int,
+                          max_points_per_object: int,
+                          temporal_compression_ratio: int = 4):
     """Padded collate function enabling batch_size > 1 with variable-length samples.
 
     Pads (or truncates) all samples to fixed shapes:
@@ -314,7 +373,7 @@ def sim_collate_fn_padded(batch, max_T_raw: int, max_objects: int, max_points_pe
         max_points_per_object: Maximum surface points per object.
     """
     max_N = max_objects * max_points_per_object
-    r = 4  # temporal compression ratio
+    r = temporal_compression_ratio or None
 
     processed = []
     for sample in batch:
@@ -326,11 +385,14 @@ def sim_collate_fn_padded(batch, max_T_raw: int, max_objects: int, max_points_pe
         N_orig = x_s_raw.shape[1]
         n_obj_orig = sample['n_objects']
 
-        # --- Clip T_raw to largest valid 4k+1 ≤ max_T_raw ---
-        k_max = (max_T_raw - 1) // r
-        k_cur = (T_orig - 1) // r
-        k_clip = min(k_max, k_cur)
-        T_clip = k_clip * r + 1
+        # Latent mode preserves r*k+1 compatibility; raw-state mode only clips.
+        if r is not None:
+            k_max = (max_T_raw - 1) // r
+            k_cur = (T_orig - 1) // r
+            k_clip = min(k_max, k_cur)
+            T_clip = k_clip * r + 1
+        else:
+            T_clip = min(T_orig, max_T_raw)
 
         x_s_raw = x_s_raw[:T_clip]             # (T_clip, N_orig, 6)
         c_force_raw = c_force_raw[:T_clip]

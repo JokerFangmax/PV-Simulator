@@ -30,6 +30,7 @@ Usage:
     x_s_pred = result['x_s']   # (1, T_raw, N, 6) predicted pos + vel
 """
 
+import json
 import os
 from typing import Optional
 
@@ -81,6 +82,18 @@ class SimulationPipeline:
                         sim_ffn_dim: int = 1024, sim_num_heads: int = 8,
                         sim_num_layers: int = 10):
         """Load a SimulationPipeline from a Stage 1 checkpoint directory."""
+        # Prefer checkpoint metadata over caller defaults so training and
+        # inference architectures cannot silently diverge.
+        args_path = os.path.join(ckpt_dir, "training_args.json")
+        if os.path.exists(args_path):
+            with open(args_path, "r") as f:
+                saved_args = json.load(f)
+            max_objects = saved_args.get("max_objects", max_objects)
+            d_sim = saved_args.get("d_sim", d_sim)
+            sim_ffn_dim = saved_args.get("sim_ffn_dim", sim_ffn_dim)
+            sim_num_heads = saved_args.get("sim_num_heads", sim_num_heads)
+            sim_num_layers = saved_args.get("sim_num_layers", sim_num_layers)
+
         # Load frozen AE
         ae = CausalAE.load(ae_ckpt_dir)
         ae.to(device, dtype=dtype)
@@ -88,6 +101,7 @@ class SimulationPipeline:
         for p in ae.parameters():
             p.requires_grad_(False)
 
+        d_state = 2 * ae.d_latent
         sim_cond_embedder = SimConditionEmbedder(
             max_objects=max_objects,
             d_force=2 * ae.d_latent,
@@ -100,9 +114,11 @@ class SimulationPipeline:
         )
 
         sim_transformer.load_state_dict(
-            torch.load(os.path.join(ckpt_dir, "sim_transformer.pt"), map_location="cpu"))
+            torch.load(os.path.join(ckpt_dir, "sim_transformer.pt"),
+                       map_location="cpu", weights_only=True))
         sim_cond_embedder.load_state_dict(
-            torch.load(os.path.join(ckpt_dir, "sim_cond_embedder.pt"), map_location="cpu"))
+            torch.load(os.path.join(ckpt_dir, "sim_cond_embedder.pt"),
+                       map_location="cpu", weights_only=True))
 
         sim_transformer = sim_transformer.to(device, dtype=dtype)
         sim_cond_embedder = sim_cond_embedder.to(device, dtype=dtype)
@@ -223,7 +239,7 @@ class SimulationPipeline:
 
         progress_bar = tqdm(timesteps, desc="Denoising", disable=not show_progress)
         for t in progress_bar:
-            t_batch = t.unsqueeze(0)
+            t_batch = t.expand(B)
 
             # DiT forward in latent space with init conditioning
             pred_latent = self.sim_transformer(

@@ -268,3 +268,204 @@ class SimTransformer(nn.Module):
         x = x.view(B, T, N, self.d_sim)
         x = self.head_proj(self.head_norm(x.to(self.head_proj.weight.dtype)))  # (B, T, N, d_state)
         return x
+
+
+class SimSTAttentionBlock(nn.Module):
+    """Spatial-then-temporal Transformer block for raw-state flow matching.
+
+    Spatial attention runs across points inside each frame. Temporal attention
+    then runs across frames for each point trajectory.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        ffn_dim: int,
+        num_heads: int,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.norm_spatial = nn.LayerNorm(dim, eps=eps)
+        self.spatial_attn = SimSelfAttention(dim, num_heads, qk_norm=True, eps=eps)
+        self.norm_temporal = nn.LayerNorm(dim, eps=eps)
+        self.temporal_attn = SimSelfAttention(dim, num_heads, qk_norm=True, eps=eps)
+        self.norm_ffn = nn.LayerNorm(dim, eps=eps)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, ffn_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(ffn_dim, dim),
+        )
+        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim ** 0.5)
+
+    @staticmethod
+    def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        return x * (1 + scale) + shift
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        e: torch.Tensor,
+        point_mask: Optional[torch.Tensor] = None,
+        frame_mask: Optional[torch.Tensor] = None,
+        dtype=torch.bfloat16,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: (B, F, N, D)
+            e: (B, 6, D)
+            point_mask: optional (B, N) bool, True for valid points.
+            frame_mask: optional (B, F) bool, True for valid frames.
+        """
+        B, F, N, D = x.shape
+        shift_s, scale_s, gate_s, shift_t, scale_t, gate_t = (
+            self.modulation + e
+        ).chunk(6, dim=1)
+
+        # Spatial MHA: (B, F, N, D) -> (B*F, N, D)
+        h = self._modulate(
+            self.norm_spatial(x),
+            shift_s[:, None, :, :],
+            scale_s[:, None, :, :],
+        )
+        h = h.reshape(B * F, N, D)
+        spatial_attn_mask = None
+        if point_mask is not None:
+            spatial_valid = point_mask[:, None, :].expand(B, F, N).reshape(B * F, N)
+            spatial_attn_mask = torch.zeros(
+                B * F, 1, 1, N, device=x.device, dtype=dtype
+            )
+            spatial_attn_mask.masked_fill_(
+                ~spatial_valid[:, None, None, :], torch.finfo(dtype).min
+            )
+        y = self.spatial_attn(h, dtype=dtype, attn_mask=spatial_attn_mask)
+        y = y.reshape(B, F, N, D)
+        x = x + y * gate_s[:, None, :, :]
+
+        # Temporal MHA: (B, F, N, D) -> (B*N, F, D)
+        h = self._modulate(
+            self.norm_temporal(x),
+            shift_t[:, None, :, :],
+            scale_t[:, None, :, :],
+        )
+        h = h.permute(0, 2, 1, 3).reshape(B * N, F, D)
+        temporal_attn_mask = None
+        if frame_mask is not None:
+            temporal_valid = frame_mask[:, None, :].expand(B, N, F).reshape(B * N, F)
+            temporal_attn_mask = torch.zeros(
+                B * N, 1, 1, F, device=x.device, dtype=dtype
+            )
+            temporal_attn_mask.masked_fill_(
+                ~temporal_valid[:, None, None, :], torch.finfo(dtype).min
+            )
+        y = self.temporal_attn(h, dtype=dtype, attn_mask=temporal_attn_mask)
+        y = y.reshape(B, N, F, D).permute(0, 2, 1, 3)
+        x = x + y * gate_t[:, None, :, :]
+
+        x = x + self.ffn(self.norm_ffn(x))
+        return x
+
+
+class SimSTTransformer(nn.Module):
+    """Raw-state denoiser with efficient permutation-equivariant attention.
+
+    Spatial and temporal attention are factorized to avoid the quadratic cost
+    of full ``F*N`` attention, while both paths reuse the optimized shared
+    attention backend. A temporal embedding identifies frames; no point-index
+    embedding is used because point clouds are unordered.
+
+    The model predicts a 6-D flow field for normalized position and velocity.
+    The clean initial 6-D state is supplied through a dedicated conditioning
+    channel and is broadcast over time; it is never inserted as an extra frame.
+    """
+
+    def __init__(
+        self,
+        d_state: int = 6,
+        d_cond: int = 34,
+        d_sim: int = 256,
+        ffn_dim: int = 1024,
+        num_heads: int = 8,
+        num_layers: int = 10,
+        freq_dim: int = 256,
+        frame_cond: bool = True,
+        pred_offset: bool = False,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.d_state = d_state
+        self.d_cond = d_cond
+        self.d_sim = d_sim
+        self.num_layers = num_layers
+        self.freq_dim = freq_dim
+        self.frame_cond = frame_cond
+        self.pred_offset = pred_offset
+
+        input_dim = d_state + d_cond + (d_state if frame_cond else 0)
+        self.input_proj = nn.Linear(input_dim, d_sim)
+        self.time_embedding = nn.Sequential(
+            nn.Linear(freq_dim, d_sim),
+            nn.SiLU(),
+            nn.Linear(d_sim, d_sim),
+        )
+        self.time_projection = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(d_sim, d_sim * 6),
+        )
+        self.blocks = nn.ModuleList([
+            SimSTAttentionBlock(d_sim, ffn_dim, num_heads, eps)
+            for _ in range(num_layers)
+        ])
+        self.head_norm = nn.LayerNorm(d_sim, eps=eps)
+        self.head_proj = nn.Linear(d_sim, d_state)
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.zeros_(self.head_proj.weight)
+        nn.init.zeros_(self.head_proj.bias)
+
+    def forward(
+        self,
+        x_state: torch.Tensor,
+        c_sim: torch.Tensor,
+        t: torch.Tensor,
+        dtype=torch.bfloat16,
+        init_state: Optional[torch.Tensor] = None,
+        point_mask: Optional[torch.Tensor] = None,
+        frame_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Predict the raw-state flow field.
+
+        Args:
+            x_state: ``(B, F, N, 6)`` normalized noisy position and velocity.
+            c_sim: ``(B, F, N, d_cond)`` condition features.
+            t: ``(B,)`` flow-matching timestep.
+            init_state: optional clean initial state ``(B, N, 6)``.
+            point_mask: optional ``(B, N)`` point-validity mask.
+            frame_mask: optional ``(B, F)`` frame-validity mask.
+        """
+        B, F, N, _ = x_state.shape
+        inputs = [x_state, c_sim]
+        if self.frame_cond:
+            if init_state is None:
+                raise ValueError("init_state is required when frame_cond=True")
+            inputs.append(init_state[:, None].expand(-1, F, -1, -1))
+        x = self.input_proj(torch.cat(inputs, dim=-1))
+
+        # Time has an ordering; point indices do not. Omitting point-index
+        # embeddings preserves permutation equivariance of the point cloud.
+        time_pos = sinusoidal_embedding_1d(
+            self.d_sim, torch.arange(F, device=x.device)
+        ).to(device=x.device, dtype=x.dtype)
+        x = x + time_pos[None, :, None, :]
+
+        emb_dtype = self.time_embedding[0].weight.dtype
+        e = self.time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim, t).to(dtype=emb_dtype)
+        )
+        e = self.time_projection(e).unflatten(1, (6, self.d_sim)).to(x.dtype)
+
+        for block in self.blocks:
+            x = block(
+                x, e, point_mask=point_mask, frame_mask=frame_mask, dtype=dtype
+            )
+        return self.head_proj(self.head_norm(x.to(self.head_proj.weight.dtype)))

@@ -32,6 +32,7 @@ Based on scripts/wan2.1_fun/train_lora.py training loop structure.
 
 import argparse
 import gc
+import json
 import logging
 import math
 import os
@@ -46,7 +47,7 @@ import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
-from diffusers import FlowMatchEulerDiscreteScheduler
+from diffusers import DDPMScheduler, FlowMatchEulerDiscreteScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import (compute_density_for_timestep_sampling,
                                       compute_loss_weighting_for_sd3)
@@ -71,7 +72,7 @@ from videox_fun.data.dataset_simulation import (MoviSimulationDataset,
                                                   sim_collate_fn_padded)
 from videox_fun.models.sim_ae import CausalAE
 from videox_fun.models.sim_condition import SimConditionEmbedder
-from videox_fun.models.sim_transformer import SimTransformer
+from videox_fun.models.sim_transformer import SimSTTransformer, SimTransformer
 from videox_fun.utils.discrete_sampler import DiscreteSampling
 
 logger = get_logger(__name__, log_level="INFO")
@@ -89,10 +90,21 @@ def parse_args():
                         help="Path to annotation JSON (required for --dataset_type simulation).")
     parser.add_argument("--data_root", type=str, default=None,
                         help="Root directory for data files or MOVI dataset root.")
+    parser.add_argument("--movi_temporal_compression_ratio", type=int, default=None,
+                        help="MOVI frame clipping ratio. Default: 4 for latent AE mode, "
+                             "keep all frames for --raw_xyz_diffusion. Use 0 to keep all frames.")
 
     # Pre-trained AE (from Stage 0)
-    parser.add_argument("--ae_ckpt_dir", type=str, required=True,
+    parser.add_argument("--ae_ckpt_dir", type=str, default=None,
                         help="Path to Stage 0 CausalAE checkpoint directory (e.g. outputs/ae/final)")
+    parser.add_argument("--raw_xyz_diffusion", action="store_true",
+                        help="Bypass the AE and train diffusion directly on normalized xyz coordinates.")
+    parser.add_argument("--xyz_norm_fac", type=float, default=5.0,
+                        help="Coordinate normalization center. xyz_norm=(xyz - norm_fac) / 2.")
+    parser.add_argument("--frame_cond", action=argparse.BooleanOptionalAction, default=True,
+                        help="Raw xyz mode: prepend the clean initial frame as a conditioning frame.")
+    parser.add_argument("--pred_offset", action=argparse.BooleanOptionalAction, default=True,
+                        help="Raw xyz mode: predict residuals relative to the initial point cloud.")
 
     # Model architecture
     parser.add_argument("--d_state", type=int, default=32,
@@ -132,6 +144,8 @@ def parse_args():
     parser.add_argument("--use_8bit_adam", action="store_true")
     parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"])
     parser.add_argument("--allow_tf32", action="store_true")
+    parser.add_argument("--allow_cpu", action="store_true",
+                        help="Allow CPU training. By default, Stage 1 fails fast when CUDA is unavailable.")
     parser.add_argument("--dataloader_num_workers", type=int, default=4)
 
     # Diffusion
@@ -142,6 +156,21 @@ def parse_args():
     parser.add_argument("--logit_mean", type=float, default=0.0)
     parser.add_argument("--logit_std", type=float, default=1.0)
     parser.add_argument("--mode_scale", type=float, default=1.29)
+    parser.add_argument("--prediction_type", type=str, default="sample",
+                        choices=["sample", "epsilon"],
+                        help="Raw xyz mode DDPM prediction type. Use 'sample' for clean-sample prediction.")
+    parser.add_argument("--clip_sample", action="store_true",
+                        help="Raw xyz mode DDPM clip_sample flag. Default is False.")
+    parser.add_argument("--lambda_xyz", type=float, default=1.0,
+                        help="Raw xyz mode coordinate MSE weight.")
+    parser.add_argument("--lambda_vel", type=float, default=0.1,
+                        help="Raw xyz mode velocity consistency weight.")
+    parser.add_argument("--lambda_floor", type=float, default=0.1,
+                        help="Raw xyz mode floor penetration weight.")
+    parser.add_argument("--floor_axis", type=str, default="z", choices=["x", "y", "z"],
+                        help="Raw xyz mode vertical axis for floor loss. Kubric/MOVI uses z.")
+    parser.add_argument("--lambda_mask", type=float, default=1.0,
+                        help="Raw xyz mode extra MSE weight for drag_mask if present.")
 
     # Checkpointing & logging
     parser.add_argument("--checkpointing_steps", type=int, default=5000)
@@ -166,8 +195,43 @@ def parse_args():
 
     if args.dataset_type == "simulation" and args.ann_path is None:
         parser.error("--ann_path is required when --dataset_type simulation")
+    if not args.raw_xyz_diffusion and args.ae_ckpt_dir is None:
+        parser.error("--ae_ckpt_dir is required unless --raw_xyz_diffusion is enabled")
+    if args.movi_temporal_compression_ratio is not None and args.movi_temporal_compression_ratio <= 0:
+        args.movi_temporal_compression_ratio = None
+    if not args.allow_cpu and not torch.cuda.is_available():
+        parser.error(
+            "CUDA is not available in this Python process. Refusing to train on CPU. "
+            "Use the conda env's launcher explicitly, e.g. "
+            "`/data/fhr/miniconda3/envs/videox/bin/python -m accelerate.commands.launch ...`, "
+            "or pass --allow_cpu for an intentional CPU debug run."
+        )
 
     return args
+
+
+def _normalize_xyz(x, norm_fac: float):
+    return (x - norm_fac) / 2.0
+
+
+def _denormalize_xyz(x, norm_fac: float):
+    return x * 2.0 + norm_fac
+
+
+def _normalize_raw_force(c_force_raw, norm_fac: float):
+    """Keep force channels raw; normalize contact-point xyz channels."""
+    c_force = c_force_raw.clone()
+    c_force[..., 3:6] = _normalize_xyz(c_force[..., 3:6], norm_fac)
+    return c_force
+
+
+def _masked_mean(x, mask, eps: float = 1e-8):
+    if mask is None:
+        return x.mean()
+    while mask.ndim < x.ndim:
+        mask = mask.unsqueeze(-1)
+    mask = mask.to(dtype=x.dtype)
+    return (x * mask).sum() / mask.sum().mul(x.shape[-1]).clamp(min=eps)
 
 
 def _run_vis(vis_samples, sim_transformer, ae, sim_cond_embedder,
@@ -245,6 +309,97 @@ def _run_vis(vis_samples, sim_transformer, ae, sim_cond_embedder,
     logger.info(f"[Step {global_step}] Logged {len(vis_samples) * 2} vis videos to wandb.")
 
 
+def _run_vis_raw_xyz(vis_samples, sim_transformer, sim_cond_embedder, args,
+                     global_step, device, weight_dtype, num_inference_steps, fps):
+    """Visualize raw-xyz denoising predictions against GT trajectories."""
+    import wandb
+
+    _vis_dir = os.path.dirname(os.path.abspath(__file__))
+    if _vis_dir not in sys.path:
+        sys.path.insert(0, _vis_dir)
+    from visualize import visualize_point_cloud_motion
+
+    scheduler = DDPMScheduler(
+        num_train_timesteps=args.train_sampling_steps,
+        prediction_type=args.prediction_type,
+        clip_sample=args.clip_sample,
+    )
+
+    log_dict = {}
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for i, sample in enumerate(vis_samples):
+            def _b(t, as_float=False):
+                if not isinstance(t, torch.Tensor):
+                    t = torch.as_tensor(t)
+                t = t.unsqueeze(0).to(device)
+                return t.to(weight_dtype) if as_float else t
+
+            x_s_raw = _b(sample["x_s_raw"], as_float=True)
+            c_force_raw = _b(sample["c_force_raw"], as_float=True)
+            c_floor = _b(sample["c_floor"], as_float=True)
+            c_id = _b(sample["c_id"])
+            c_mat = _b(sample["c_mat"], as_float=True)
+            c_mass = _b(sample["c_mass"], as_float=True)
+            c_static = _b(sample["c_static"])
+            point_obj_idx = _b(sample["point_obj_idx"])
+
+            xyz = _normalize_xyz(x_s_raw[..., :3], args.xyz_norm_fac)
+            init_pc = xyz[:, 0]
+            c_force = _normalize_raw_force(c_force_raw, args.xyz_norm_fac)
+            c_floor_norm = _normalize_xyz(c_floor, args.xyz_norm_fac)
+            B, T_raw, N, _ = xyz.shape
+
+            c_sim = sim_cond_embedder(
+                c_floor=c_floor_norm,
+                c_id=c_id,
+                c_mat=c_mat,
+                c_mass=c_mass,
+                c_static=c_static,
+                c_force_enc=c_force,
+                point_obj_idx=point_obj_idx,
+                T=T_raw,
+            )
+            if args.frame_cond:
+                c_sim = torch.cat([c_sim[:, :1], c_sim], dim=1)
+                frame_mask = torch.ones(B, T_raw + 1, device=device, dtype=torch.bool)
+            else:
+                frame_mask = torch.ones(B, T_raw, device=device, dtype=torch.bool)
+
+            sample_xyz = torch.randn(B, T_raw, N, 3, device=device, dtype=weight_dtype)
+            scheduler.set_timesteps(num_inference_steps, device=device)
+
+            for t in scheduler.timesteps:
+                t_batch = t.expand(B)
+                model_in = sample_xyz
+                if args.frame_cond:
+                    model_in = torch.cat([init_pc.unsqueeze(1), sample_xyz], dim=1)
+                pred = sim_transformer(
+                    model_in, c_sim, t_batch, dtype=weight_dtype, frame_mask=frame_mask,
+                )
+                if args.pred_offset:
+                    pred = pred + init_pc.unsqueeze(1)
+                sample_xyz = scheduler.step(pred, t, sample_xyz).prev_sample
+
+            pred_pos = _denormalize_xyz(sample_xyz.float(), args.xyz_norm_fac)[0].cpu()
+            pred_vel = torch.zeros_like(pred_pos)
+            pred_vel[1:] = pred_pos[1:] - pred_pos[:-1]
+            pred_state = torch.cat([pred_pos, pred_vel], dim=-1)
+
+            gt_path = os.path.join(tmpdir, f"s{i}_gt.mp4")
+            pred_path = os.path.join(tmpdir, f"s{i}_pred.mp4")
+            visualize_point_cloud_motion(sample["x_s_raw"], sample["point_obj_idx"], gt_path,
+                                         fps=fps, views=["birdseye", "side", "iso"])
+            visualize_point_cloud_motion(pred_state, sample["point_obj_idx"], pred_path,
+                                         fps=fps, views=["birdseye", "side", "iso"])
+            log_dict[f"vis/sample{i}_gt"] = wandb.Video(gt_path, fps=fps, format="mp4")
+            log_dict[f"vis/sample{i}_pred"] = wandb.Video(pred_path, fps=fps, format="mp4")
+
+        if log_dict:
+            wandb.log(log_dict, step=global_step)
+
+    logger.info(f"[Step {global_step}] Logged {len(vis_samples) * 2} raw xyz vis videos to wandb.")
+
+
 def main():
     args = parse_args()
 
@@ -280,38 +435,63 @@ def main():
     elif args.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    # --- Load frozen CausalAE (from Stage 0) ---
-    ae = CausalAE.load(args.ae_ckpt_dir)
-    ae.to(accelerator.device, dtype=weight_dtype)
-    ae.eval()
-    for p in ae.parameters():
-        p.requires_grad_(False)
-    d_latent = ae.d_latent
-    d_state_actual = 2 * d_latent  # pos + vel AE latents concatenated
-    if args.d_state != d_state_actual:
-        logger.warning(
-            f"--d_state={args.d_state} overridden to {d_state_actual} "
-            f"(2 * AE d_latent={d_latent})"
+    ae = None
+    if args.raw_xyz_diffusion:
+        if args.prediction_type != "sample":
+            raise ValueError("Raw xyz PhysCtrl baseline requires --prediction_type sample.")
+        args.d_state = 3
+        sim_cond_embedder = SimConditionEmbedder(
+            max_objects=args.max_objects,
+            d_force=6,
         )
-        args.d_state = d_state_actual
-    logger.info(f"Loaded frozen CausalAE from {args.ae_ckpt_dir} (d_latent={d_latent})")
+        d_cond = sim_cond_embedder.d_cond
+        sim_transformer = SimSTTransformer(
+            d_state=args.d_state,
+            d_cond=d_cond,
+            d_sim=args.d_sim,
+            ffn_dim=args.sim_ffn_dim,
+            num_heads=args.sim_num_heads,
+            num_layers=args.sim_num_layers,
+            frame_cond=args.frame_cond,
+            pred_offset=args.pred_offset,
+        )
+        logger.info(
+            "Raw xyz diffusion enabled: AE bypassed, frame_cond=%s, pred_offset=%s, norm_fac=%s",
+            args.frame_cond, args.pred_offset, args.xyz_norm_fac,
+        )
+    else:
+        # --- Load frozen CausalAE (from Stage 0) ---
+        ae = CausalAE.load(args.ae_ckpt_dir)
+        ae.to(accelerator.device, dtype=weight_dtype)
+        ae.eval()
+        for p in ae.parameters():
+            p.requires_grad_(False)
+        d_latent = ae.d_latent
+        d_state_actual = 2 * d_latent  # pos + vel AE latents concatenated
+        if args.d_state != d_state_actual:
+            logger.warning(
+                f"--d_state={args.d_state} overridden to {d_state_actual} "
+                f"(2 * AE d_latent={d_latent})"
+            )
+            args.d_state = d_state_actual
+        logger.info(f"Loaded frozen CausalAE from {args.ae_ckpt_dir} (d_latent={d_latent})")
 
-    # --- Build Models ---
-    # d_force = 2 * d_latent to match the AE-encoded force+contact representation.
-    sim_cond_embedder = SimConditionEmbedder(
-        max_objects=args.max_objects,
-        d_force=2 * d_latent,
-    )
-    d_cond = sim_cond_embedder.d_cond
+        # --- Build Models ---
+        # d_force = 2 * d_latent to match the AE-encoded force+contact representation.
+        sim_cond_embedder = SimConditionEmbedder(
+            max_objects=args.max_objects,
+            d_force=2 * d_latent,
+        )
+        d_cond = sim_cond_embedder.d_cond
 
-    sim_transformer = SimTransformer(
-        d_state=args.d_state,
-        d_cond=d_cond,
-        d_sim=args.d_sim,
-        ffn_dim=args.sim_ffn_dim,
-        num_heads=args.sim_num_heads,
-        num_layers=args.sim_num_layers,
-    )
+        sim_transformer = SimTransformer(
+            d_state=args.d_state,
+            d_cond=d_cond,
+            d_sim=args.d_sim,
+            ffn_dim=args.sim_ffn_dim,
+            num_heads=args.sim_num_heads,
+            num_layers=args.sim_num_layers,
+        )
 
     # Move to device
     sim_cond_embedder.to(accelerator.device, dtype=weight_dtype)
@@ -346,9 +526,14 @@ def main():
 
     # --- Dataset & Dataloader ---
     if args.dataset_type == "movi":
+        movi_temporal_compression_ratio = args.movi_temporal_compression_ratio
+        if movi_temporal_compression_ratio is None and not args.raw_xyz_diffusion:
+            movi_temporal_compression_ratio = 4
         train_dataset = MoviSimulationDataset(
             data_root=args.data_root,
             max_objects=args.max_objects,
+            temporal_compression_ratio=movi_temporal_compression_ratio,
+            prefer_physics_npz=True,
         )
     else:
         train_dataset = SimulationDataset(
@@ -390,9 +575,16 @@ def main():
     )
 
     # --- Noise scheduler ---
-    noise_scheduler = FlowMatchEulerDiscreteScheduler(
-        num_train_timesteps=args.train_sampling_steps,
-    )
+    if args.raw_xyz_diffusion:
+        noise_scheduler = DDPMScheduler(
+            num_train_timesteps=args.train_sampling_steps,
+            prediction_type=args.prediction_type,
+            clip_sample=args.clip_sample,
+        )
+    else:
+        noise_scheduler = FlowMatchEulerDiscreteScheduler(
+            num_train_timesteps=args.train_sampling_steps,
+        )
 
     # --- Accelerate prepare ---
     # All trainable modules are wrapped so DDP syncs their gradients across GPUs.
@@ -461,113 +653,216 @@ def main():
                     point_mask = None
                     T_raw_tensor = None
 
-                # --- Encode x_s_raw and c_force_raw once via frozen AE (LDM-style) ---
                 B_sz = x_s_raw.shape[0]
                 T_raw_dim = x_s_raw.shape[1]
                 N_sz = x_s_raw.shape[2]
                 bsz = B_sz
-                with torch.no_grad():
-                    pos_enc = ae.encode(x_s_raw[..., :3])        # (B, T, N, d_latent)
-                    vel_enc = ae.encode(x_s_raw[..., 3:6])       # (B, T, N, d_latent)
-                    # c_force_raw: force(3) and contact(3) each → d_latent via frozen AE
-                    force_enc   = ae.encode(c_force_raw[..., :3])
-                    contact_enc = ae.encode(c_force_raw[..., 3:6])
-                x_s_enc = torch.cat([pos_enc, vel_enc], dim=-1)  # (B, T, N, d_state)
-                c_force_enc = torch.cat([force_enc, contact_enc], dim=-1)  # (B, T, N, 2*d_latent)
-                T = x_s_enc.shape[1]
 
-                # --- Flow matching noise (in latent space) ---
-                noise = torch.randn_like(x_s_enc)   # (B, T, N, d_state)
+                loss_logs = {}
+                if args.raw_xyz_diffusion:
+                    # --- PhysCtrl-like raw xyz diffusion path ---
+                    xyz = _normalize_xyz(x_s_raw[..., :3], args.xyz_norm_fac)
+                    init_pc = xyz[:, 0]                                  # (B, N, 3)
+                    c_force_cond = _normalize_raw_force(c_force_raw, args.xyz_norm_fac)
+                    c_floor_norm = _normalize_xyz(c_floor.to(weight_dtype), args.xyz_norm_fac)
 
-                if not args.uniform_sampling:
-                    u = compute_density_for_timestep_sampling(
-                        weighting_scheme=args.weighting_scheme,
-                        batch_size=bsz,
-                        logit_mean=args.logit_mean,
-                        logit_std=args.logit_std,
-                        mode_scale=args.mode_scale,
+                    if args.padded_batch:
+                        t_idx = torch.arange(T_raw_dim, device=accelerator.device).unsqueeze(0)
+                        frame_valid = t_idx < T_raw_tensor.unsqueeze(1)    # (B, T_raw)
+                        xyz_mask = frame_valid.unsqueeze(2) & point_mask.unsqueeze(1)
+                    else:
+                        frame_valid = torch.ones(B_sz, T_raw_dim, device=accelerator.device, dtype=torch.bool)
+                        xyz_mask = None
+
+                    noise = torch.randn_like(xyz)
+                    timesteps = torch.randint(
+                        0,
+                        noise_scheduler.config.num_train_timesteps,
+                        (bsz,),
+                        device=accelerator.device,
+                    ).long()
+                    noisy_xyz = noise_scheduler.add_noise(xyz, noise, timesteps)
+
+                    c_sim = sim_cond_embedder(
+                        c_floor=c_floor_norm,
+                        c_id=c_id,
+                        c_mat=c_mat,
+                        c_mass=c_mass,
+                        c_static=c_static,
+                        c_force_enc=c_force_cond,
+                        point_obj_idx=point_obj_idx,
+                        T=T_raw_dim,
+                        point_mask=point_mask,
+                    )  # (B, T_raw, N, d_cond)
+
+                    frame_mask = frame_valid
+                    model_in = noisy_xyz
+                    if args.frame_cond:
+                        model_in = torch.cat([init_pc.unsqueeze(1), noisy_xyz], dim=1)
+                        c_sim = torch.cat([c_sim[:, :1], c_sim], dim=1)
+                        frame_mask = torch.cat([
+                            torch.ones(B_sz, 1, device=accelerator.device, dtype=torch.bool),
+                            frame_valid,
+                        ], dim=1)
+
+                    with torch.amp.autocast(
+                        "cuda",
+                        dtype=weight_dtype,
+                        enabled=accelerator.device.type == "cuda" and weight_dtype != torch.float32,
+                    ):
+                        pred_model = sim_transformer(
+                            model_in,
+                            c_sim,
+                            timesteps,
+                            dtype=weight_dtype,
+                            point_mask=point_mask,
+                            frame_mask=frame_mask,
+                        )
+
+                    if args.pred_offset:
+                        pred_xyz = pred_model + init_pc.unsqueeze(1)
+                    else:
+                        pred_xyz = pred_model
+
+                    xyz_loss = _masked_mean(
+                        F.mse_loss(pred_xyz.float(), xyz.float(), reduction="none"),
+                        xyz_mask,
                     )
-                    indices = (u * noise_scheduler.config.num_train_timesteps).long()
+
+                    pred_vel = pred_xyz[:, 1:] - pred_xyz[:, :-1]
+                    gt_vel = xyz[:, 1:] - xyz[:, :-1]
+                    vel_mask = None if xyz_mask is None else (xyz_mask[:, 1:] & xyz_mask[:, :-1])
+                    vel_loss = _masked_mean(
+                        F.mse_loss(pred_vel.float(), gt_vel.float(), reduction="none"),
+                        vel_mask,
+                    )
+
+                    floor_axis_idx = {"x": 0, "y": 1, "z": 2}[args.floor_axis]
+                    floor_coord = c_floor_norm.view(B_sz, 1, 1)
+                    floor_penalty = F.relu(
+                        floor_coord - pred_xyz[..., floor_axis_idx]
+                    ).pow(2).unsqueeze(-1)
+                    floor_loss = _masked_mean(floor_penalty.float(), xyz_mask)
+
+                    mask_loss = pred_xyz.new_tensor(0.0)
+                    if "drag_mask" in batch:
+                        drag_mask = batch["drag_mask"].to(accelerator.device).bool()
+                        if drag_mask.ndim == 2:
+                            drag_mask = drag_mask.unsqueeze(1).expand(-1, T_raw_dim, -1)
+                        drag_mask = drag_mask & xyz_mask if xyz_mask is not None else drag_mask
+                        mask_loss = _masked_mean(
+                            F.mse_loss(pred_xyz.float(), xyz.float(), reduction="none"),
+                            drag_mask,
+                        )
+
+                    loss = (
+                        args.lambda_xyz * xyz_loss
+                        + args.lambda_vel * vel_loss
+                        + args.lambda_floor * floor_loss
+                        + args.lambda_mask * mask_loss
+                    )
+                    loss_logs = {
+                        "loss_xyz": xyz_loss.detach().item(),
+                        "loss_vel": vel_loss.detach().item(),
+                        "loss_floor": floor_loss.detach().item(),
+                        "loss_mask": mask_loss.detach().item(),
+                    }
                 else:
-                    indices = idx_sampling(bsz, generator=torch_rng, device=accelerator.device)
-                    indices = indices.long().cpu()
+                    # --- Encode x_s_raw and c_force_raw once via frozen AE (LDM-style) ---
+                    with torch.no_grad():
+                        pos_enc = ae.encode(x_s_raw[..., :3])        # (B, T, N, d_latent)
+                        vel_enc = ae.encode(x_s_raw[..., 3:6])       # (B, T, N, d_latent)
+                        # c_force_raw: force(3) and contact(3) each -> d_latent via frozen AE
+                        force_enc = ae.encode(c_force_raw[..., :3])
+                        contact_enc = ae.encode(c_force_raw[..., 3:6])
+                    x_s_enc = torch.cat([pos_enc, vel_enc], dim=-1)  # (B, T, N, d_state)
+                    c_force_enc = torch.cat([force_enc, contact_enc], dim=-1)
+                    T = x_s_enc.shape[1]
 
-                timesteps = noise_scheduler.timesteps[indices].to(device=accelerator.device)
+                    # --- Flow matching noise (in latent space) ---
+                    noise = torch.randn_like(x_s_enc)   # (B, T, N, d_state)
 
-                # Get sigmas for flow matching
-                sigmas = noise_scheduler.sigmas.to(device=accelerator.device, dtype=weight_dtype)
-                schedule_timesteps = noise_scheduler.timesteps.to(accelerator.device)
-                step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
-                sigma = sigmas[step_indices].flatten()
-                while len(sigma.shape) < x_s_enc.ndim:
-                    sigma = sigma.unsqueeze(-1)
+                    if not args.uniform_sampling:
+                        u = compute_density_for_timestep_sampling(
+                            weighting_scheme=args.weighting_scheme,
+                            batch_size=bsz,
+                            logit_mean=args.logit_mean,
+                            logit_std=args.logit_std,
+                            mode_scale=args.mode_scale,
+                        )
+                        indices = (u * noise_scheduler.config.num_train_timesteps).long()
+                    else:
+                        indices = idx_sampling(bsz, generator=torch_rng, device=accelerator.device)
+                        indices = indices.long().cpu()
 
-                # Noisy latents: zt = (1 - sigma) * z + sigma * noise
-                noisy_x_s_enc = (1.0 - sigma) * x_s_enc + sigma * noise
+                    timesteps = noise_scheduler.timesteps[indices].to(device=accelerator.device)
 
-                # Flow matching target (latent space): velocity = noise - z
-                target = noise - x_s_enc
+                    sigmas = noise_scheduler.sigmas.to(device=accelerator.device, dtype=weight_dtype)
+                    schedule_timesteps = noise_scheduler.timesteps.to(accelerator.device)
+                    step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+                    sigma = sigmas[step_indices].flatten()
+                    while len(sigma.shape) < x_s_enc.ndim:
+                        sigma = sigma.unsqueeze(-1)
 
-                # --- Initial frame conditioning: first latent frame of x_s_enc ---
-                init_enc_1 = x_s_enc[:, :1]  # (B, 1, N, d_state) — already encoded, no grad
-                init_enc_padded = torch.cat([
-                    init_enc_1,
-                    torch.zeros(B_sz, T - 1, N_sz, args.d_state,
-                                device=accelerator.device, dtype=weight_dtype),
-                ], dim=1)                                                 # (B, T, N, d_state)
-                init_mask = torch.ones(B_sz, T, N_sz, 1,
-                                       device=accelerator.device, dtype=weight_dtype)
-                init_mask[:, 0, :, :] = 0.0  # first latent frame is given
+                    noisy_x_s_enc = (1.0 - sigma) * x_s_enc + sigma * noise
+                    target = noise - x_s_enc
 
-                # --- Build valid sequence mask for DiT attention (padded batch mode) ---
-                if args.padded_batch:
-                    t_latent = (T_raw_tensor - 1) // 4 + 1   # (B,)
-                    t_idx = torch.arange(T, device=accelerator.device).unsqueeze(0)  # (1, T)
-                    t_valid = t_idx < t_latent.unsqueeze(1)   # (B, T)
-                    latent_seq_mask = t_valid.unsqueeze(2) & point_mask.unsqueeze(1)
-                    valid_seq_mask = latent_seq_mask.view(B_sz, T * N_sz)
-                else:
-                    valid_seq_mask = None
+                    init_enc_1 = x_s_enc[:, :1]
+                    init_enc_padded = torch.cat([
+                        init_enc_1,
+                        torch.zeros(B_sz, T - 1, N_sz, args.d_state,
+                                    device=accelerator.device, dtype=weight_dtype),
+                    ], dim=1)
+                    init_mask = torch.ones(B_sz, T, N_sz, 1,
+                                           device=accelerator.device, dtype=weight_dtype)
+                    init_mask[:, 0, :, :] = 0.0
 
-                # --- Encode conditions ---
-                c_sim = sim_cond_embedder(
-                    c_floor=c_floor,
-                    c_id=c_id,
-                    c_mat=c_mat,
-                    c_mass=c_mass,
-                    c_static=c_static,
-                    c_force_enc=c_force_enc,
-                    point_obj_idx=point_obj_idx,
-                    T=T,
-                    point_mask=point_mask,
-                )  # (B, T, N, d_cond)
+                    if args.padded_batch:
+                        t_latent = (T_raw_tensor - 1) // 4 + 1
+                        t_idx = torch.arange(T, device=accelerator.device).unsqueeze(0)
+                        t_valid = t_idx < t_latent.unsqueeze(1)
+                        latent_seq_mask = t_valid.unsqueeze(2) & point_mask.unsqueeze(1)
+                        valid_seq_mask = latent_seq_mask.view(B_sz, T * N_sz)
+                    else:
+                        valid_seq_mask = None
 
-                # --- Forward pass: DiT in latent space (LDM-style) ---
-                # AE is fully detached — no decode needed during training.
-                with torch.amp.autocast("cuda", dtype=weight_dtype):
-                    pred_enc = sim_transformer(
-                        noisy_x_s_enc, init_enc_padded, init_mask, c_sim, timesteps,
-                        dtype=weight_dtype, valid_seq_mask=valid_seq_mask,
-                    )  # (B, T, N, d_state) — predicted latent velocity
+                    c_sim = sim_cond_embedder(
+                        c_floor=c_floor,
+                        c_id=c_id,
+                        c_mat=c_mat,
+                        c_mass=c_mass,
+                        c_static=c_static,
+                        c_force_enc=c_force_enc,
+                        point_obj_idx=point_obj_idx,
+                        T=T,
+                        point_mask=point_mask,
+                    )
 
-                # --- Loss computation (latent space) ---
-                weighting = compute_loss_weighting_for_sd3(
-                    weighting_scheme=args.weighting_scheme, sigmas=sigma,
-                )
-                loss_per_elem = F.mse_loss(pred_enc.float(), target.float(), reduction='none')
+                    with torch.amp.autocast(
+                        "cuda",
+                        dtype=weight_dtype,
+                        enabled=accelerator.device.type == "cuda" and weight_dtype != torch.float32,
+                    ):
+                        pred_enc = sim_transformer(
+                            noisy_x_s_enc, init_enc_padded, init_mask, c_sim, timesteps,
+                            dtype=weight_dtype, valid_seq_mask=valid_seq_mask,
+                        )
 
-                if args.padded_batch and point_mask is not None:
-                    # Build latent-space mask: (B, T, N). Padded positions are excluded
-                    # from both the numerator and denominator (zero contribution, not counted).
-                    t_latent = (T_raw_tensor - 1) // 4 + 1                 # (B,)
-                    t_idx = torch.arange(T, device=accelerator.device).unsqueeze(0)  # (1, T)
-                    t_valid = t_idx < t_latent.unsqueeze(1)                # (B, T)
-                    latent_mask = t_valid.unsqueeze(2) & point_mask.unsqueeze(1)  # (B, T, N)
-                    loss_per_elem = loss_per_elem * latent_mask.unsqueeze(-1).float()
-                    n_valid = latent_mask.float().sum() * args.d_state
-                    loss = (loss_per_elem * weighting.float()).sum() / n_valid.clamp(min=1)
-                else:
-                    loss = (loss_per_elem * weighting.float()).mean()
+                    weighting = compute_loss_weighting_for_sd3(
+                        weighting_scheme=args.weighting_scheme, sigmas=sigma,
+                    )
+                    loss_per_elem = F.mse_loss(pred_enc.float(), target.float(), reduction='none')
+
+                    if args.padded_batch and point_mask is not None:
+                        t_latent = (T_raw_tensor - 1) // 4 + 1
+                        t_idx = torch.arange(T, device=accelerator.device).unsqueeze(0)
+                        t_valid = t_idx < t_latent.unsqueeze(1)
+                        latent_mask = t_valid.unsqueeze(2) & point_mask.unsqueeze(1)
+                        loss_per_elem = loss_per_elem * latent_mask.unsqueeze(-1).float()
+                        n_valid = latent_mask.float().sum() * args.d_state
+                        loss = (loss_per_elem * weighting.float()).sum() / n_valid.clamp(min=1)
+                    else:
+                        loss = (loss_per_elem * weighting.float()).mean()
 
                 # --- Backward ---
                 avg_loss = accelerator.gather(loss.repeat(bsz)).mean()
@@ -586,7 +881,9 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
                 current_lr = lr_scheduler.get_last_lr()[0]
-                accelerator.log({"train_loss": train_loss / max(accum_count, 1), "lr": current_lr}, step=global_step)
+                log_payload = {"train_loss": train_loss / max(accum_count, 1), "lr": current_lr}
+                log_payload.update(loss_logs)
+                accelerator.log(log_payload, step=global_step)
                 train_loss = 0.0
                 accum_count = 0
 
@@ -603,11 +900,18 @@ def main():
                     unwrapped_sim.eval()
                     unwrapped_cond.eval()
                     try:
-                        _run_vis(
-                            vis_samples, unwrapped_sim, ae, unwrapped_cond,
-                            global_step, accelerator.device, weight_dtype,
-                            args.vis_num_inference_steps, args.vis_fps,
-                        )
+                        if args.raw_xyz_diffusion:
+                            _run_vis_raw_xyz(
+                                vis_samples, unwrapped_sim, unwrapped_cond, args,
+                                global_step, accelerator.device, weight_dtype,
+                                args.vis_num_inference_steps, args.vis_fps,
+                            )
+                        else:
+                            _run_vis(
+                                vis_samples, unwrapped_sim, ae, unwrapped_cond,
+                                global_step, accelerator.device, weight_dtype,
+                                args.vis_num_inference_steps, args.vis_fps,
+                            )
                     except Exception as e:
                         logger.warning(f"Visualization failed at step {global_step}: {e}")
                     finally:
@@ -636,6 +940,8 @@ def main():
                                    os.path.join(save_dir, "sim_transformer.pt"))
                         torch.save(accelerator.unwrap_model(sim_cond_embedder).state_dict(),
                                    os.path.join(save_dir, "sim_cond_embedder.pt"))
+                        with open(os.path.join(save_dir, "training_args.json"), "w") as f:
+                            json.dump(vars(args), f, indent=2, sort_keys=True)
                         logger.info(f"Saved checkpoint to {save_dir}")
 
                         gc.collect()
@@ -659,6 +965,8 @@ def main():
                    os.path.join(save_dir, "sim_transformer.pt"))
         torch.save(accelerator.unwrap_model(sim_cond_embedder).state_dict(),
                    os.path.join(save_dir, "sim_cond_embedder.pt"))
+        with open(os.path.join(save_dir, "training_args.json"), "w") as f:
+            json.dump(vars(args), f, indent=2, sort_keys=True)
         logger.info(f"Saved final model to {save_dir}")
 
     accelerator.end_training()

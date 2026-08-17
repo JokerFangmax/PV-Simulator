@@ -141,11 +141,14 @@ class SimulationDataset(Dataset):
 class MoviSimulationDataset(Dataset):
     """Dataset for the MOVI-AB style simulation data (directory-based format).
 
-    Each sample is a subdirectory containing:
+    Each sample is a subdirectory containing either:
+      - physics.npz: prepacked Stage 1 tensors, preferred when present
       - point_cloud_states.pkl: point states (T_raw_avail, N, 6), instance point ranges
       - metadata.json: per-instance friction, restitution, mass, positions, velocities
 
-    Frames are clipped to the largest valid T_raw = 4k+1 ≤ T_raw_available.
+    If temporal_compression_ratio is set, frames are clipped to the largest
+    valid T_raw = rk+1 <= T_raw_available. Set it to None or 0 for raw-xyz
+    training where no AE temporal compression is used.
 
     Each sample may have different n_objects and N (total points). When batching with
     batch_size > 1, all samples in a batch must have identical shapes — the DataLoader
@@ -162,10 +165,12 @@ class MoviSimulationDataset(Dataset):
         data_root: str,
         max_objects: int = 16,
         temporal_compression_ratio: int = 4,
+        prefer_physics_npz: bool = True,
     ):
         self.data_root = data_root
         self.max_objects = max_objects
-        self.temporal_compression_ratio = temporal_compression_ratio
+        self.temporal_compression_ratio = temporal_compression_ratio or None
+        self.prefer_physics_npz = prefer_physics_npz
 
         # Discover all subdirectories
         all_dirs = sorted([
@@ -177,9 +182,12 @@ class MoviSimulationDataset(Dataset):
         self.samples = []
         for d in all_dirs:
             sample_dir = os.path.join(data_root, d)
+            npz_path = os.path.join(sample_dir, 'physics.npz')
             pkl_path = os.path.join(sample_dir, 'point_cloud_states.pkl')
             meta_path = os.path.join(sample_dir, 'metadata.json')
-            if not os.path.exists(pkl_path) or not os.path.exists(meta_path):
+            has_npz = os.path.exists(npz_path)
+            has_legacy = os.path.exists(pkl_path) and os.path.exists(meta_path)
+            if not has_npz and not has_legacy:
                 continue
             self.samples.append(sample_dir)
 
@@ -192,8 +200,53 @@ class MoviSimulationDataset(Dataset):
         while True:
             try:
                 sample_dir = self.samples[idx]
+                npz_path = os.path.join(sample_dir, 'physics.npz')
                 pkl_path = os.path.join(sample_dir, 'point_cloud_states.pkl')
                 meta_path = os.path.join(sample_dir, 'metadata.json')
+
+                if self.prefer_physics_npz and os.path.exists(npz_path):
+                    data = np.load(npz_path, allow_pickle=True)
+                    x_s_raw = data['x_s_raw'].astype(np.float32)
+                    c_force_raw = data['c_force_raw'].astype(np.float32)
+                    T_avail = x_s_raw.shape[0]
+
+                    if self.temporal_compression_ratio is not None:
+                        r = self.temporal_compression_ratio
+                        k = (T_avail - 1) // r
+                        T_raw = k * r + 1
+                        assert T_raw >= r + 1, f"Too few frames in {sample_dir}: T_avail={T_avail}"
+                    else:
+                        T_raw = T_avail
+
+                    x_s_raw = x_s_raw[:T_raw]
+                    c_force_raw = c_force_raw[:T_raw]
+                    n_objects = data['c_mat'].shape[0]
+
+                    if n_objects > self.max_objects:
+                        raise ValueError(f"Too many objects ({n_objects}) in {sample_dir}")
+
+                    c_init = data['c_init'].astype(np.float32)
+                    if c_init.shape[-1] == 6:
+                        c_init = np.concatenate(
+                            [c_init, np.ones((c_init.shape[0], 1), dtype=np.float32)],
+                            axis=-1,
+                        )
+
+                    sample = {
+                        'x_s_raw': torch.from_numpy(x_s_raw),
+                        'c_force_raw': torch.from_numpy(c_force_raw),
+                        'c_floor': torch.tensor(float(data['c_floor']), dtype=torch.float32),
+                        'c_id': torch.arange(n_objects, dtype=torch.long),
+                        'c_mat': torch.from_numpy(data['c_mat'].astype(np.float32)),
+                        'c_mass': torch.from_numpy(data['c_mass'].astype(np.float32)),
+                        'c_static': torch.from_numpy(data['c_static'].astype(np.int64)),
+                        'c_init': torch.from_numpy(c_init),
+                        'point_obj_idx': torch.from_numpy(data['point_obj_idx'].astype(np.int64)),
+                        'T_raw': T_raw,
+                        'N': x_s_raw.shape[1],
+                        'n_objects': n_objects,
+                    }
+                    return sample
 
                 with open(pkl_path, 'rb') as f:
                     pkl = pickle.load(f)
@@ -204,11 +257,14 @@ class MoviSimulationDataset(Dataset):
                 point_states = pkl['point_states'].astype(np.float32)  # (T_avail, N, 6)
                 T_avail = point_states.shape[0]
 
-                # Clip to largest valid T_raw = 4k+1
-                r = self.temporal_compression_ratio
-                k = (T_avail - 1) // r
-                T_raw = k * r + 1
-                assert T_raw >= r + 1, f"Too few frames in {sample_dir}: T_avail={T_avail}"
+                if self.temporal_compression_ratio is not None:
+                    # Clip to largest valid T_raw = rk+1
+                    r = self.temporal_compression_ratio
+                    k = (T_avail - 1) // r
+                    T_raw = k * r + 1
+                    assert T_raw >= r + 1, f"Too few frames in {sample_dir}: T_avail={T_avail}"
+                else:
+                    T_raw = T_avail
                 point_states = point_states[:T_raw]  # (T_raw, N, 6)
                 T_raw, N, _ = point_states.shape
 

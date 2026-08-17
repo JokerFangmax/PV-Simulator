@@ -268,3 +268,203 @@ class SimTransformer(nn.Module):
         x = x.view(B, T, N, self.d_sim)
         x = self.head_proj(self.head_norm(x.to(self.head_proj.weight.dtype)))  # (B, T, N, d_state)
         return x
+
+
+class SimSTAttentionBlock(nn.Module):
+    """Spatial-then-temporal Transformer block for raw xyz diffusion.
+
+    Spatial attention runs across points inside each frame. Temporal attention
+    then runs across frames for each point trajectory.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        ffn_dim: int,
+        num_heads: int,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.norm_spatial = nn.LayerNorm(dim, eps=eps)
+        self.spatial_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.norm_temporal = nn.LayerNorm(dim, eps=eps)
+        self.temporal_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.norm_ffn = nn.LayerNorm(dim, eps=eps)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, ffn_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(ffn_dim, dim),
+        )
+        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim ** 0.5)
+
+    @staticmethod
+    def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        return x * (1 + scale) + shift
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        e: torch.Tensor,
+        point_mask: Optional[torch.Tensor] = None,
+        frame_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: (B, F, N, D)
+            e: (B, 6, D)
+            point_mask: optional (B, N) bool, True for valid points.
+            frame_mask: optional (B, F) bool, True for valid frames.
+        """
+        B, F, N, D = x.shape
+        shift_s, scale_s, gate_s, shift_t, scale_t, gate_t = (
+            self.modulation + e
+        ).chunk(6, dim=1)
+
+        # Spatial MHA: (B, F, N, D) -> (B*F, N, D)
+        h = self._modulate(
+            self.norm_spatial(x),
+            shift_s[:, None, :, :],
+            scale_s[:, None, :, :],
+        )
+        h = h.reshape(B * F, N, D)
+        spatial_key_padding_mask = None
+        if point_mask is not None:
+            spatial_key_padding_mask = (
+                ~point_mask[:, None, :].expand(B, F, N).reshape(B * F, N)
+            )
+        y, _ = self.spatial_attn(
+            h, h, h,
+            key_padding_mask=spatial_key_padding_mask,
+            need_weights=False,
+        )
+        y = y.reshape(B, F, N, D)
+        x = x + y * gate_s[:, None, :, :]
+
+        # Temporal MHA: (B, F, N, D) -> (B*N, F, D)
+        h = self._modulate(
+            self.norm_temporal(x),
+            shift_t[:, None, :, :],
+            scale_t[:, None, :, :],
+        )
+        h = h.permute(0, 2, 1, 3).reshape(B * N, F, D)
+        temporal_key_padding_mask = None
+        if frame_mask is not None:
+            temporal_key_padding_mask = (
+                ~frame_mask[:, None, :].expand(B, N, F).reshape(B * N, F)
+            )
+            if point_mask is not None:
+                invalid_point_rows = ~point_mask.reshape(B * N)
+                # Avoid all-masked rows inside MultiheadAttention. Invalid point
+                # outputs are zeroed by the caller through the loss mask.
+                temporal_key_padding_mask[invalid_point_rows] = False
+        y, _ = self.temporal_attn(
+            h, h, h,
+            key_padding_mask=temporal_key_padding_mask,
+            need_weights=False,
+        )
+        y = y.reshape(B, N, F, D).permute(0, 2, 1, 3)
+        x = x + y * gate_t[:, None, :, :]
+
+        x = x + self.ffn(self.norm_ffn(x))
+        return x
+
+
+class SimSTTransformer(nn.Module):
+    """PhysCtrl-style raw xyz denoiser with spatial-temporal attention.
+
+    The model operates directly on normalized xyz coordinates. When
+    ``frame_cond`` is true, the caller prepends the clean initial frame to the
+    noisy target sequence and this module drops that conditioning frame from
+    the returned prediction. When ``pred_offset`` is true, the returned value is
+    a residual relative to the initial point cloud.
+    """
+
+    def __init__(
+        self,
+        d_state: int = 3,
+        d_cond: int = 34,
+        d_sim: int = 256,
+        ffn_dim: int = 1024,
+        num_heads: int = 8,
+        num_layers: int = 10,
+        freq_dim: int = 256,
+        frame_cond: bool = True,
+        pred_offset: bool = True,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.d_state = d_state
+        self.d_cond = d_cond
+        self.d_sim = d_sim
+        self.num_layers = num_layers
+        self.freq_dim = freq_dim
+        self.frame_cond = frame_cond
+        self.pred_offset = pred_offset
+
+        self.input_proj = nn.Linear(d_state + d_cond, d_sim)
+        self.time_embedding = nn.Sequential(
+            nn.Linear(freq_dim, d_sim),
+            nn.SiLU(),
+            nn.Linear(d_sim, d_sim),
+        )
+        self.time_projection = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(d_sim, d_sim * 6),
+        )
+        self.blocks = nn.ModuleList([
+            SimSTAttentionBlock(d_sim, ffn_dim, num_heads, eps)
+            for _ in range(num_layers)
+        ])
+        self.head_norm = nn.LayerNorm(d_sim, eps=eps)
+        self.head_proj = nn.Linear(d_sim, d_state)
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.zeros_(self.head_proj.weight)
+        nn.init.zeros_(self.head_proj.bias)
+
+    def forward(
+        self,
+        x_xyz: torch.Tensor,
+        c_sim: torch.Tensor,
+        t: torch.Tensor,
+        dtype=torch.bfloat16,
+        point_mask: Optional[torch.Tensor] = None,
+        frame_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x_xyz: (B, F, N, 3) normalized noisy xyz plus optional frame_cond.
+            c_sim: (B, F, N, d_cond) condition features at the same frame count.
+            t: (B,) diffusion timestep.
+            point_mask: optional (B, N) bool.
+            frame_mask: optional (B, F) bool.
+        Returns:
+            (B, F, N, 3), or (B, F-1, N, 3) when frame_cond=True.
+        """
+        B, F, N, _ = x_xyz.shape
+        x = torch.cat([x_xyz, c_sim], dim=-1)
+        x = self.input_proj(x)
+
+        time_pos = sinusoidal_embedding_1d(
+            self.d_sim, torch.arange(F, device=x.device)
+        ).to(device=x.device, dtype=x.dtype)
+        point_pos = sinusoidal_embedding_1d(
+            self.d_sim, torch.arange(N, device=x.device)
+        ).to(device=x.device, dtype=x.dtype)
+        x = x + time_pos[None, :, None, :] + point_pos[None, None, :, :]
+
+        emb_dtype = self.time_embedding[0].weight.dtype
+        e = self.time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim, t).to(dtype=emb_dtype)
+        )
+        e = self.time_projection(e).unflatten(1, (6, self.d_sim))
+        e = e.to(x.dtype)
+
+        for block in self.blocks:
+            x = block(x, e, point_mask=point_mask, frame_mask=frame_mask)
+
+        x = self.head_proj(self.head_norm(x.to(self.head_proj.weight.dtype)))
+        if self.frame_cond:
+            x = x[:, 1:]
+        return x
